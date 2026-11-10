@@ -1,0 +1,17 @@
+version: 2
+
+# Bronze lives in Garage (S3) only and is never read by dbt or Dagster.
+# There is therefore exactly one Postgres source: the silver layer.
+#
+# No `database:` is declared on purpose, so the source follows the active target
+# (silver_wmata / silver_traffic / gold_wmata / gold_traffic). That keeps this
+# file domain-agnostic instead of duplicating a source per database.
+#
+# PLACEHOLDER_TABLE is a stand-in until the silver tables are named; it is inert
+# until a model references source('silver', '<table>').
+sources:
+  - name: silver
+    schema: public
+    description: "Silver layer; database follows the active dbt target."
+    tables:
+      - name: PLACEHOLDER_TABLE

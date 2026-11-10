@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir \
+  dagster \
+  dagster-graphql \
+  dagster-webserver \
+  dagster-postgres \
+  numpy
+
+RUN pip install --no-cache-dir --upgrade "protobuf>=5.28.0" "grpcio>=1.67.0"
+
+ENV DAGSTER_HOME=/opt/dagster/dagster_home
+
+RUN mkdir -p "$DAGSTER_HOME"
+
+COPY configs/dagster/dagster.yaml "$DAGSTER_HOME"
+COPY configs/dagster/workspace.yaml "$DAGSTER_HOME"
+
+WORKDIR "$DAGSTER_HOME"

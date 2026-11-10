@@ -1,0 +1,23 @@
+# Environment Variable
+.env
+.env*
+!.env.example
+
+# DLT
+.dlt/
+dlt/state/
+
+# Data storage
+storage/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# dbt
+dbt/target/
+dbt/logs/
+dbt/.user.yml
+
+reference/

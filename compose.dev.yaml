@@ -1,0 +1,716 @@
+name: wmata-lateness
+
+x-logging: &default-logging
+  logging:
+    driver: json-file
+
+services:
+  postgres-silver:
+    <<: *default-logging
+    image: docker.io/postgres:18.4-alpine3.24
+    restart: unless-stopped
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB_WMATA:-wmata}
+      POSTGRES_USER: ${POSTGRES_SILVER_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SILVER_PASSWORD:-postgres}
+    volumes:
+      - ./storage/postgres-silver:/var/lib/postgresql
+      - ./configs/postgres/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh
+    env_file:
+      - .env
+    ports:
+      - ${HOST_IP:-127.0.0.1}:${POSTGRES_SILVER_HOST_PORT:-5433}:5432
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U ${POSTGRES_SILVER_USER:-postgres} -d
+          ${POSTGRES_DB_WMATA:-wmata} && pg_isready -U
+          ${POSTGRES_SILVER_USER:-postgres} -d ${POSTGRES_DB_TRAFFIC:-traffic}"
+      interval: 5s
+      retries: 10
+      timeout: 5s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  postgres-gold:
+    <<: *default-logging
+    image: docker.io/postgres:18.4-alpine3.24
+    restart: unless-stopped
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB_WMATA:-wmata}
+      POSTGRES_USER: ${POSTGRES_GOLD_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_GOLD_PASSWORD:-postgres}
+    volumes:
+      - ./storage/postgres-gold:/var/lib/postgresql
+      - ./configs/postgres/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh
+    env_file:
+      - .env
+    ports:
+      - ${HOST_IP:-127.0.0.1}:${POSTGRES_GOLD_HOST_PORT:-5434}:5432
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U ${POSTGRES_GOLD_USER:-postgres} -d
+          ${POSTGRES_DB_WMATA:-wmata} && pg_isready -U
+          ${POSTGRES_GOLD_USER:-postgres} -d ${POSTGRES_DB_TRAFFIC:-traffic}"
+      interval: 5s
+      retries: 10
+      timeout: 5s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  postgres-infra:
+    <<: *default-logging
+    image: docker.io/postgres:18.4-alpine3.24
+    restart: unless-stopped
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB_INFRA:-infra}
+      POSTGRES_USER: ${POSTGRES_INFRA_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+    volumes:
+      - ./storage/postgres-infra:/var/lib/postgresql
+      - ./configs/postgres/init-dbs-infra.sh:/docker-entrypoint-initdb.d/init-dbs.sh
+    env_file:
+      - .env
+    ports:
+      - ${HOST_IP:-127.0.0.1}:${POSTGRES_INFRA_HOST_PORT:-5432}:5432
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_INFRA_USER:-postgres} -d
+            ${POSTGRES_DB_INFRA:-infra}",
+        ]
+      interval: 5s
+      retries: 10
+      timeout: 5s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  garage:
+    <<: *default-logging
+    image: docker.io/dxflrs/garage:v2.3.0
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:3900:3900
+      - ${HOST_IP:-127.0.0.1}:3902:3902
+    environment:
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-changeme}
+      GARAGE_ADMIN_SECRET: ${GARAGE_ADMIN_TOKEN:-changeme}
+      GARAGE_DEFAULT_BUCKET: mlflow
+      GARAGE_DEFAULT_ACCESS_KEY: mlflow-key-id
+      GARAGE_DEFAULT_SECRET_KEY: mlflow-secret-key
+    volumes:
+      - ./configs/garage/config.toml:/etc/garage.toml:ro
+      - ./storage/garage:/var/lib/garage
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  garage-init:
+    image: docker.io/curlimages/curl:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ADMIN_TOKEN="${GARAGE_ADMIN_TOKEN:-changeme}"
+        BASE="http://garage:3902"
+
+        until curl -sf "$$BASE/health" >/dev/null 2>&1; do sleep 2; done
+
+        create_bucket() {
+          name="$$1"
+          key_id="$$2"
+          secret="$$3"
+          key_name="$$4"
+
+          BUCKET_JSON="$$(curl -sf -X POST "$$BASE/v1/bucket" \
+            -H "Authorization: Bearer $$ADMIN_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"globalAlias\":\"$$name\"}")"
+          BUCKET_ID="$$(echo "$$BUCKET_JSON" | awk -F'"' '/"id"/{print $$4}')"
+
+          curl -sf -X POST "$$BASE/v1/key" \
+            -H "Authorization: Bearer $$ADMIN_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"id\":\"$$key_id\",\"secretKey\":\"$$secret\",\"name\":\"$$key_name\"}" >/dev/null
+
+          [ -n "$$BUCKET_ID" ] && \
+          curl -sf -X PUT "$$BASE/v1/bucket?id=$${BUCKET_ID}" \
+            -H "Authorization: Bearer $$ADMIN_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"keyId\":\"$$key_id\",\"permissions\":[\"read\",\"write\"]}" || true
+
+          echo "Bucket ready: $$name (key=$$key_id)"
+        }
+
+        create_bucket "wmata"   "wmata-key-id"   "wmata-secret-key"   "wmata-key"
+        create_bucket "traffic" "traffic-key-id" "traffic-secret-key" "traffic-key"
+    environment:
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-changeme}
+    depends_on:
+      garage:
+        condition: service_healthy
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  victoriametrics:
+    <<: *default-logging
+    image: docker.io/victoriametrics/victoria-metrics:v1.156.0
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:8428:8428
+    environment:
+      POSTGRES_USER: ${POSTGRES_INFRA_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+
+    volumes:
+      - ./storage/victoriametrics:/storage
+    command:
+      - "-storageDataPath=/storage"
+      - "-retentionPeriod=${VM_RETENTION:-3M}"
+      - "-httpListenAddr=:8428"
+      - "-selfScrapeInterval=10s"
+      - "-search.maxQueryDuration=30s"
+      - "-memory.allowedPercent=60"
+      - "-storage.minFreeDiskSpaceBytes=1GB"
+    healthcheck:
+      test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:8428/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  victorialogs:
+    <<: *default-logging
+    image: docker.io/victoriametrics/victoria-logs:v1.53.0
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:9428:9428
+    volumes:
+      - ./storage/victorialogs:/vlogs
+    command:
+      - "-storageDataPath=/vlogs"
+      - "-httpListenAddr=:9428"
+      - "-retentionPeriod=${VL_RETENTION:-3M}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:9428/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  vector:
+    <<: *default-logging
+    image: docker.io/timberio/vector:0.60.0-alpine
+    restart: unless-stopped
+    volumes:
+      - ./configs/vector/vector.yaml:/etc/vector/vector.yaml:ro
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    depends_on:
+      victorialogs:
+        condition: service_healthy
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  nats:
+    <<: *default-logging
+    image: docker.io/nats:2.15.2
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:4222:4222
+      - ${HOST_IP:-127.0.0.1}:8222:8222
+    command: ["-js", "-m", "8222"]
+    healthcheck:
+      test: ["CMD", "nats-server", "--check", "healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  nats-init:
+    image: docker.io/natsio/nats-box:latest
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo "Waiting for NATS..."
+        until nc -z nats 4222; do sleep 1; done
+        echo "Creating stream 'wmata' and 'traffic'..."
+        create_stream() {
+          name="$1"; subjects="$2"; max_age="$3"; max_bytes="$4"
+          nats -s nats:4222 stream info "$name" >/dev/null 2>&1 || \
+            nats -s nats:4222 stream add "$name" \
+              --subjects "$subjects" --storage file --retention limits \
+              --discard old --max-msgs=-1 --max-bytes="$max_bytes" \
+              --max-age "$max_age" --dupe-window 2m
+        }
+        create_stream wmata-data      "wmata.realtime.data,wmata.realtime.data.>"           3d 2GB
+        create_stream wmata-inference "wmata.realtime.inference,wmata.realtime.inference.>" 7d 1GB
+        create_stream traffic-data    "traffic.realtime.data,traffic.realtime.data.>"       2d 2GB
+        echo "NATS init complete"
+    depends_on:
+      nats:
+        condition: service_started
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  nats-nui:
+    image: ghcr.io/nats-nui/nui:0.10
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:31311:31311
+    volumes:
+      - ./storage/nui:/db
+    depends_on:
+      nats:
+        condition: service_started
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  # debezium-server:
+  #   <<: *default-logging
+  #   image: docker.io/debezium/server:3.0.0.Final
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: ${POSTGRES_INFRA_USER:-postgres}
+  #     POSTGRES_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+  #   volumes:
+  #     - ./configs/debezium:/debezium/config:ro
+  #     - ./storage/debezium:/debezium/data
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     nats:
+  #       condition: service_started
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "curl -sf http://localhost:8080/q/health/ready || exit 1"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 30s
+  #   networks:
+  #     - devnet
+  #   profiles: ["dev"]
+
+  dagster-user-code:
+    <<: *default-logging
+    build:
+      context: .
+      dockerfile: dagster/etl/Containerfile
+    restart: unless-stopped
+    environment:
+      DAGSTER_POSTGRES_USER: ${POSTGRES_INFRA_USER:-postgres}
+      DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+      DAGSTER_POSTGRES_DB: dagster_db
+      DAGSTER_POSTGRES_HOST: postgres-infra
+      DAGSTER_POSTGRES_PORT: ${POSTGRES_INFRA_PORT:-5432}
+      DESTINATION__POSTGRES__CREDENTIALS__PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+      DLT_PROJECT_DIR: /opt/dagster/dlt
+    env_file:
+      - .env
+    volumes:
+      - ./dagster:/opt/dagster/app
+      - ./dlt:/opt/dagster/dlt
+      - ./dbt:/opt/dagster/dbt
+      - ./gx_quality:/opt/dagster/app/gx_quality
+      - ./shared:/opt/dagster/app/shared:ro
+    depends_on:
+      postgres-infra:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.socket(); s.settimeout(5);
+            s.connect(('127.0.0.1',4000)); s.close()",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  dagster-webserver:
+    <<: *default-logging
+    build:
+      context: .
+      dockerfile: ./dagster/daemon/Containerfile
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:3000:3000
+    environment:
+      DAGSTER_POSTGRES_USER: ${POSTGRES_INFRA_USER:-postgres}
+      DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+      DAGSTER_POSTGRES_DB: dagster_db
+      DAGSTER_POSTGRES_HOST: postgres-infra
+      DAGSTER_POSTGRES_PORT: ${POSTGRES_INFRA_PORT:-5432}
+    entrypoint:
+      - dagster-webserver
+      - -h
+      - "0.0.0.0"
+      - -p
+      - "3000"
+      - -w
+      - /opt/dagster/dagster_home/workspace.yaml
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request;
+            urllib.request.urlopen('http://localhost:3000/dagit_info')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      postgres-infra:
+        condition: service_healthy
+      dagster-user-code:
+        condition: service_healthy
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  dagster-daemon:
+    <<: *default-logging
+    build:
+      context: .
+      dockerfile: ./dagster/daemon/Containerfile
+    restart: unless-stopped
+    environment:
+      DAGSTER_POSTGRES_USER: ${POSTGRES_INFRA_USER:-postgres}
+      DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+      DAGSTER_POSTGRES_DB: dagster_db
+      DAGSTER_POSTGRES_HOST: postgres-infra
+      DAGSTER_POSTGRES_PORT: ${POSTGRES_INFRA_PORT:-5432}
+    entrypoint:
+      - dagster-daemon
+      - run
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os; c=open('/proc/1/cmdline').read(); exit(0 if
+            'dagster-daemon' in c else 1)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      postgres-infra:
+        condition: service_healthy
+      dagster-user-code:
+        condition: service_healthy
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  mlflow:
+    <<: *default-logging
+    build:
+      context: .
+      dockerfile: configs/mlflow/Containerfile
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:5000:5000
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_INFRA_USER:-postgres}:${POSTGRES_INFRA_PASSWORD:-postgres}@postgres-infra:${POSTGRES_INFRA_PORT:-5432}/mlflow_db
+      MLFLOW_S3_ENDPOINT_URL: http://garage:3900
+      MLFLOW_ARTIFACTS_DESTINATION: s3://mlflow/
+      AWS_ACCESS_KEY_ID: mlflow-key-id
+      AWS_SECRET_ACCESS_KEY: mlflow-secret-key
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      MLFLOW_ALLOWED_HOSTS: "*"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; assert
+            urllib.request.urlopen('http://localhost:5000/health').status ==
+            200",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3000
+      start_period: 30s
+    depends_on:
+      postgres-infra:
+        condition: service_healthy
+      garage-init:
+        condition: service_completed_successfully
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  # inference:
+  #   <<: *default-logging
+  #   build:
+  #     context: .
+  #     dockerfile: inference/Containerfile
+  #   restart: unless-stopped
+  #   environment:
+  #     MLFLOW_TRACKING_URI: http://mlflow:5000
+  #     MLFLOW_S3_ENDPOINT_URL: http://garage:3900
+  #     AWS_ACCESS_KEY_ID: mlflow-key-id
+  #     AWS_SECRET_ACCESS_KEY: mlflow-secret-key
+  #     AWS_DEFAULT_REGION: us-east-1
+  #     AWS_S3_FORCE_PATH_STYLE: "true"
+  #     PG_HOST: postgres-infra
+  #     PG_PORT: 5432
+  #     PG_USER: ${POSTGRES_INFRA_USER:-postgres}
+  #     PG_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+  #     PG_DB: ${POSTGRES_INFRA_DB:-electricity}
+  #     NATS_URL: nats://nats:4222
+  #     NATS_SUBJECT: electricity.silver.demand_5min
+  #     TELEGRAM_BOT_API_KEY: ${TELEGRAM_BOT_API_KEY:-}
+  #     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+  #   depends_on:
+  #     debezium-server:
+  #       condition: service_healthy
+  #     postgres:
+  #       condition: service_healthy
+  #     mlflow:
+  #       condition: service_healthy
+  #     nats:
+  #       condition: service_started
+  #     nats-init:
+  #       condition: service_completed_successfully
+  #   networks:
+  #     - devnet
+  #   profiles: ["dev"]
+
+  dbt:
+    <<: *default-logging
+    image: ghcr.io/dbt-labs/dbt-postgres:1.9.0
+    restart: "no"
+    environment:
+      DBT_PROFILES_DIR: /usr/app
+    env_file:
+      - .env
+    depends_on:
+      postgres-silver:
+        condition: service_healthy
+    volumes:
+      - ./dbt:/usr/app
+    entrypoint: ["dbt"]
+    working_dir: /usr/app
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  dlt:
+    <<: *default-logging
+    build:
+      context: ./dlt
+      dockerfile: Containerfile
+    restart: "no"
+    environment:
+      POSTGRES_INFRA_USER: ${POSTGRES_INFRA_USER:-postgres-infra}
+      POSTGRES_INFRA_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres-infra}
+      DESTINATION__POSTGRES__CREDENTIALS__PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres-infra}
+    volumes:
+      - ./dlt:/app
+      - ./shared:/app/shared:ro
+    working_dir: /app
+    networks:
+      - devnet
+    profiles: ["dev"]
+  # dlt-demand-nemweb:
+  #   <<: *default-logging
+  #   build:
+  #     context: ./dlt
+  #     dockerfile: Containerfile
+  #   restart: unless-stopped
+  #   command: ["run_demand_nemweb.py"]
+  #   environment:
+  #     POSTGRES_HOST: postgres-infra
+  #     POSTGRES_PORT: 5432
+  #     POSTGRES_DB: ${POSTGRES_DB:-electricity}
+  #     POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  #   volumes:
+  #     - ./dlt:/app
+  #     - ./shared:/app/shared:ro
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - devnet
+  #   profiles: ["dev"]
+
+  # dlt-wmata-poller
+  #   <<: *default-logging
+  #   build:
+  #     context: ./dlt
+  #     dockerfile: Containerfile
+  #   restart: unless-stopped
+  #   command: ["run_wmata_poller.py"]
+  #   environment:
+  #     POSTGRES_HOST: postgres-infra
+  #     POSTGRES_PORT: 5432
+  #     POSTGRES_DB: ${POSTGRES_DB:-wmata}
+  #     POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  #   volumes:
+  #     - ./dlt:/app
+  #     - ./shared:/app/shared:ro
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - devnet
+  #   profiles: ["dev"]
+
+  # dashboard-backend:
+  #   <<: *default-logging
+  #   build:
+  #     context: ./dashboard/backend
+  #     dockerfile: Containerfile
+  #   restart: unless-stopped
+  #   ports:
+  #     - ${HOST_IP:-127.0.0.1}:8000:8000
+  #   environment:
+  #     NATS_URL: nats://nats:4222
+  #     DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:${POSTGRES_PORT:-5432}/electricity
+  #     VM_URL: http://victoriametrics:8428
+  #     MLFLOW_URL: http://mlflow:5000
+  #   volumes:
+  #     - ./dashboard/backend:/app:ro
+  #     - ./shared:/app/shared:ro
+  #   depends_on:
+  #     debezium-server:
+  #       condition: service_healthy
+  #     nats:
+  #       condition: service_started
+  #     nats-init:
+  #       condition: service_completed_successfully
+  #     postgres:
+  #       condition: service_healthy
+  #     victoriametrics:
+  #       condition: service_started
+  #   healthcheck:
+  #     test:
+  #       [
+  #         "CMD",
+  #         "python",
+  #         "-c",
+  #         "import urllib.request;
+  #           urllib.request.urlopen('http://localhost:8000/health')",
+  #       ]
+  #     interval: 30s
+  #     timeout: 5s
+  #     retries: 3
+  #     start_period: 30s
+  #   networks:
+  #     - devnet
+  #   profiles: ["dev"]
+
+  # dashboard-frontend:
+  #   <<: *default-logging
+  #   build:
+  #     context: ./dashboard/frontend
+  #     dockerfile: Containerfile
+  #     target: development
+  #     args:
+  #       VITE_API_BASE_URL: http://localhost:8000
+  #   restart: unless-stopped
+  #   ports:
+  #     - ${HOST_IP:-127.0.0.1}:5173:5173
+  #   depends_on:
+  #     dashboard-backend:
+  #       condition: service_started
+  #   volumes:
+  #     - ./dashboard/frontend:/app
+  #     - /app/node_modules
+  #   networks:
+  #     - devnet
+  #   environment:
+  #     - NODE_ENV=development
+  #   profiles: ["dev"]
+
+  # dashboard-webserver:
+  #   <<: *default-logging
+  #   build:
+  #     context: ./dashboard/webserver
+  #     dockerfile: Containerfile
+  #   restart: unless-stopped
+  #   ports:
+  #     - ${HOST_IP:-127.0.0.1}:8080:80
+  #   volumes:
+  #     - ./configs/dashboard/Caddyfile:/etc/caddy/Caddyfile:ro
+  #   networks:
+  #     - devnet
+  #   profiles: ["dev"]
+
+  # monitor:
+  #   <<: *default-logging
+  #   build:
+  #     context: .
+  #     dockerfile: monitor/Containerfile
+  #   restart: unless-stopped
+  #   environment:
+  #     PG_HOST: postgres-infra
+  #     PG_PORT: 5432
+  #     PG_DB: ${POSTGRES_DB:-electricity}
+  #     PG_USER: ${POSTGRES_USER:-postgres}
+  #     PG_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  #     NATS_URL: nats://nats:8222
+  #     DEBEZIUM_URL: http://debezium-server:8080
+  #     VM_URL: http://victoriametrics:8428
+  #     CHECK_INTERVAL: "60"
+  #     TELEGRAM_BOT_API_KEY: ${TELEGRAM_BOT_API_KEY:-}
+  #     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+  #   volumes:
+  #     - ./shared:/app/shared:ro
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     victoriametrics:
+  #       condition: service_healthy
+  #   networks:
+  #     - devnet
+  #   profiles: ["dev"]
+
+networks:
+  devnet:
+    name: devnet
+    driver: bridge

@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir psycopg2-binary psutil
+
+WORKDIR /app
+COPY shared/ /app/shared/
+COPY monitor/ /app/monitor/
+
+CMD ["python", "-m", "monitor.health_monitor"]

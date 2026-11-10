@@ -1,0 +1,4 @@
+{
+  "description": "Traffic NATS JetStream - traffic.realtime.data",
+  "url": "nats://nats:4222"
+}

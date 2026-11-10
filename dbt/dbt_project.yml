@@ -1,0 +1,14 @@
+name: wmata
+version: "1.0.0"
+profile: wmata_postgres
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+models:
+  wmata:
+    silver:
+      +materialized: incremental
+    gold:
+      +materialized: table
+

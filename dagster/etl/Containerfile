@@ -1,0 +1,32 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir \
+  dagster \
+  "dagster-dbt>=0.24" \
+  dagster-postgres \
+  dagster-docker \
+  "dbt-postgres==1.9.0" \
+  "dlt[postgres]" \
+  great_expectations \
+  boto3 \
+  httpx \
+  xgboost \
+  scikit-learn \
+  mlflow \
+  pandas \
+  numpy \
+  matplotlib \
+  seaborn \
+  joblib \
+  psycopg2-binary \
+  sqlalchemy
+
+RUN pip install --no-cache-dir --upgrade "protobuf>=5.28.0" "grpcio>=1.67.0"
+
+RUN mkdir -p /opt/dagster/app /opt/dagster/dlt /opt/dagster/dbt
+
+WORKDIR /opt/dagster/app
+
+EXPOSE 4000
+
+CMD ["sh", "-c", "dbt parse --project-dir /opt/dagster/dbt --profiles-dir /opt/dagster/dbt && exec dagster code-server start -h 0.0.0.0 -p 4000 -f /opt/dagster/app/definitions.py"]

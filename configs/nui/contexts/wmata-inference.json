@@ -1,0 +1,4 @@
+{
+  "description": "WMATA RealTime Lateness Inference NATS JetStream - wmata.realtime.inference",
+  "url": "nats://nats:4222"
+}
