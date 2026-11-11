@@ -1,0 +1,9 @@
+FROM docker.io/python:3.12-alpine
+
+RUN pip install --no-cache-dir "nats-py==2.16.0"
+
+WORKDIR /app
+COPY app.py /app/app.py
+
+EXPOSE 8080
+CMD ["python", "-u", "/app/app.py"]

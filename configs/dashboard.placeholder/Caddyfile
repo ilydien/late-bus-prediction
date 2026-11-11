@@ -24,7 +24,7 @@
   }
 
   handle_path /nats* {
-    reverse_proxy nats:31311
+    reverse_proxy nats-nui:31311
   }
 
   handle {
@@ -33,7 +33,7 @@
 
 }
 
-:433 {
+:443 {
 	rate_limit {
 		zone global_zone {
 			key {remote_host}
@@ -59,7 +59,7 @@
   }
 
   handle_path /nats* {
-    reverse_proxy nats:31311
+    reverse_proxy nats-nui:31311
   }
 
   handle {

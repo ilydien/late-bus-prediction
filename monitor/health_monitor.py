@@ -35,13 +35,13 @@ POSTGRES_GOLD_PORT = int(os.environ.get("POSTGRES_GOLD_PORT", "5434"))
 POSTGRES_GOLD_USER = os.environ.get("POSTGRES_GOLD_USER", "postgres")
 POSTGRES_GOLD_PASSWORD = os.environ.get("POSTGRES_GOLD_PASSWORD", "postgres")
 NATS_URL = os.environ.get("NATS_URL", "nats://nats:8222")
-DEBEZIUM_URL = os.environ.get("DEBEZIUM_URL", "http://debezium-server:8080")
+DEBEZIUM_URL = os.environ.get("DEBEZIUM_URL", "http://debezium-wmata:8080")
 VM_URL = os.environ.get("VM_URL", "http://victoriametrics:8428")
 VL_URL = os.environ.get("VL_URL", "http://victorialogs:9428")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000")
 MLFLOW_URL = os.environ.get("MLFLOW_URL", "http://mlflow:5000")
 INFERENCE_URL = os.environ.get("INFERENCE_URL", "http://inference:8001")
-GARAGE_URL = os.environ.get("GARAGE_URL", "http://garage:3902")
+SEAWEEDFS_URL = os.environ.get("SEAWEEDFS_URL", "http://seaweedfs:9333")
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://dashboard-backend:8000")
 VM_API_URL = f"{VM_URL}/api/v1/import/prometheus"
 
@@ -180,8 +180,8 @@ def _check_inference() -> bool:
         return False
 
 
-def _check_garage() -> bool:
-    return _http_get(f"{GARAGE_URL}/health")
+def _check_seaweedfs() -> bool:
+    return _http_get(f"{SEAWEEDFS_URL}/cluster/status")
 
 
 def _check_dashboard() -> bool:
@@ -400,7 +400,7 @@ def run_checks() -> list[tuple[str, bool]]:
         ("Dagster", _check_dagster),
         ("MLflow", _check_mlflow),
         ("Inference", _check_inference),
-        ("Garage", _check_garage),
+        ("SeaweedFS", _check_seaweedfs),
         ("Dashboard Backend", _check_dashboard),
     ]
     results = []

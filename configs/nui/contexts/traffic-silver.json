@@ -1,0 +1,4 @@
+{
+  "description": "Traffic Silver NATS JetStream - traffic.realtime.silver_data",
+  "url": "nats://nats:4222"
+}

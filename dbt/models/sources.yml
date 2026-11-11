@@ -1,6 +1,6 @@
 version: 2
 
-# Bronze lives in Garage (S3) only and is never read by dbt or Dagster.
+# Bronze lives in SeaweedFS (S3) only and is never read by dbt or Dagster.
 # There is therefore exactly one Postgres source: the silver layer.
 #
 # No `database:` is declared on purpose, so the source follows the active target

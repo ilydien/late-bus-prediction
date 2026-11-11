@@ -1,0 +1,24 @@
+# SeaweedFS filer notifications -> webhook bridge.
+#
+# The filer auto-discovers this file at /etc/seaweedfs/notification.toml.
+# Only one notification queue type may be enabled at a time, so the webhook
+# target is the sole provider here.
+#
+# Events under the two bronze buckets are pushed to seaweedfs-bridge, which
+# maps the leading path to a NATS subject:
+#   /buckets/wmata/...   -> wmata.realtime.bronze_data
+#   /buckets/traffic/... -> traffic.realtime.bronze_data
+#
+# The S3 PutBucketNotificationConfiguration API is not used; filtering is done
+# here with path_prefixes at the filer level.
+[notification.webhook]
+enabled = true
+endpoint = "http://seaweedfs-bridge:8080/events"
+timeout_seconds = 10
+max_retries = 5
+backoff_seconds = 2
+max_backoff_seconds = 60
+workers = 5
+buffer_size = 20000
+event_types = ["create", "update", "delete"]
+path_prefixes = ["/buckets/wmata/", "/buckets/traffic/"]

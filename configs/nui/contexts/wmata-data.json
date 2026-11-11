@@ -1,4 +1,0 @@
-{
-  "description": "WMATA RealTime Data NATS JetStream - wmata.realtime.data",
-  "url": "nats://nats:4222"
-}

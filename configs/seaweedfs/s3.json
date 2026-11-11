@@ -1,0 +1,32 @@
+{
+  "identities": [
+    {
+      "name": "admin",
+      "credentials": [
+        { "accessKey": "seaweedfs-access-key", "secretKey": "seaweedfs-secret-key" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    },
+    {
+      "name": "wmata",
+      "credentials": [
+        { "accessKey": "wmata-key-id", "secretKey": "wmata-secret-key" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    },
+    {
+      "name": "traffic",
+      "credentials": [
+        { "accessKey": "traffic-key-id", "secretKey": "traffic-secret-key" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    },
+    {
+      "name": "mlflow",
+      "credentials": [
+        { "accessKey": "mlflow-key-id", "secretKey": "mlflow-secret-key" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

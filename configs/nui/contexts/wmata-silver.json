@@ -1,0 +1,4 @@
+{
+  "description": "WMATA Silver NATS JetStream - wmata.realtime.silver_data",
+  "url": "nats://nats:4222"
+}

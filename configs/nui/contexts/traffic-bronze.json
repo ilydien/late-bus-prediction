@@ -1,0 +1,4 @@
+{
+  "description": "Traffic Bronze NATS JetStream - traffic.realtime.bronze_data",
+  "url": "nats://nats:4222"
+}

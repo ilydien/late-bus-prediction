@@ -93,76 +93,80 @@ services:
       - devnet
     profiles: ["dev"]
 
-  garage:
+  seaweedfs:
     <<: *default-logging
-    image: docker.io/dxflrs/garage:v2.3.0
+    image: docker.io/chrislusf/seaweedfs:4.53
     restart: unless-stopped
+    command:
+      - server
+      - -ip=seaweedfs
+      - -ip.bind=0.0.0.0
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/s3.json
     ports:
-      - ${HOST_IP:-127.0.0.1}:3900:3900
-      - ${HOST_IP:-127.0.0.1}:3902:3902
-    environment:
-      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-changeme}
-      GARAGE_ADMIN_SECRET: ${GARAGE_ADMIN_TOKEN:-changeme}
-      GARAGE_DEFAULT_BUCKET: mlflow
-      GARAGE_DEFAULT_ACCESS_KEY: mlflow-key-id
-      GARAGE_DEFAULT_SECRET_KEY: mlflow-secret-key
+      - ${HOST_IP:-127.0.0.1}:8333:8333
+      - ${HOST_IP:-127.0.0.1}:8888:8888
     volumes:
-      - ./configs/garage/config.toml:/etc/garage.toml:ro
-      - ./storage/garage:/var/lib/garage
-    command: ["/garage", "server", "--single-node", "--default-bucket"]
+      - ./storage/seaweedfs:/data
+      - ./configs/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+      - ./configs/seaweedfs/notification.toml:/etc/seaweedfs/notification.toml:ro
     healthcheck:
-      test: ["CMD", "/garage", "status"]
-      interval: 30s
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9333/cluster/status"]
+      interval: 15s
       timeout: 5s
-      retries: 3
-      start_period: 10s
+      retries: 10
+      start_period: 20s
     networks:
       - devnet
     profiles: ["dev"]
 
-  garage-init:
-    image: docker.io/curlimages/curl:latest
+  seaweedfs-init:
+    image: docker.io/chrislusf/seaweedfs:4.53
+    restart: "no"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        ADMIN_TOKEN="${GARAGE_ADMIN_TOKEN:-changeme}"
-        BASE="http://garage:3902"
-
-        until curl -sf "$$BASE/health" >/dev/null 2>&1; do sleep 2; done
-
-        create_bucket() {
-          name="$$1"
-          key_id="$$2"
-          secret="$$3"
-          key_name="$$4"
-
-          BUCKET_JSON="$$(curl -sf -X POST "$$BASE/v1/bucket" \
-            -H "Authorization: Bearer $$ADMIN_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"globalAlias\":\"$$name\"}")"
-          BUCKET_ID="$$(echo "$$BUCKET_JSON" | awk -F'"' '/"id"/{print $$4}')"
-
-          curl -sf -X POST "$$BASE/v1/key" \
-            -H "Authorization: Bearer $$ADMIN_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"id\":\"$$key_id\",\"secretKey\":\"$$secret\",\"name\":\"$$key_name\"}" >/dev/null
-
-          [ -n "$$BUCKET_ID" ] && \
-          curl -sf -X PUT "$$BASE/v1/bucket?id=$${BUCKET_ID}" \
-            -H "Authorization: Bearer $$ADMIN_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"keyId\":\"$$key_id\",\"permissions\":[\"read\",\"write\"]}" || true
-
-          echo "Bucket ready: $$name (key=$$key_id)"
-        }
-
-        create_bucket "wmata"   "wmata-key-id"   "wmata-secret-key"   "wmata-key"
-        create_bucket "traffic" "traffic-key-id" "traffic-secret-key" "traffic-key"
-    environment:
-      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-changeme}
+        until curl -sf http://seaweedfs:9333/cluster/status >/dev/null 2>&1; do sleep 1; done
+        # Let the embedded filer/S3 gateway finish starting; weed shell also
+        # waits on its own connect timeout.
+        sleep 5
+        for bucket in wmata traffic mlflow; do
+          echo "s3.bucket.create -name $${bucket} -owner $${bucket%}" \
+            | /usr/bin/weed shell -master=seaweedfs:9333 -filer=seaweedfs:8888 || true
+        done
+        echo "SeaweedFS buckets ready"
     depends_on:
-      garage:
+      seaweedfs:
+        condition: service_started
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  seaweedfs-bridge:
+    <<: *default-logging
+    build:
+      context: ./seaweedfs/bridge
+      dockerfile: Containerfile
+    restart: unless-stopped
+    environment:
+      NATS_URL: nats://nats:4222
+      BRIDGE_PORT: "8080"
+    ports:
+      - ${HOST_IP:-127.0.0.1}:8081:8080
+    depends_on:
+      nats:
         condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+      seaweedfs:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     networks:
       - devnet
     profiles: ["dev"]
@@ -235,14 +239,20 @@ services:
 
   nats:
     <<: *default-logging
-    image: docker.io/nats:2.15.2
+    # The plain `nats:2.15.2` tag is scratch-based (no shell/wget), which makes
+    # a container healthcheck impossible. The alpine variant lets us probe the
+    # monitoring endpoint instead of the nonexistent `nats-server --check` flag.
+    image: docker.io/nats:2.15.2-alpine3.22
     restart: unless-stopped
     ports:
       - ${HOST_IP:-127.0.0.1}:4222:4222
       - ${HOST_IP:-127.0.0.1}:8222:8222
-    command: ["-js", "-m", "8222"]
+    # -sd keeps JetStream state across container recreation.
+    command: ["-js", "-m", "8222", "-sd", "/data"]
+    volumes:
+      - ./storage/nats:/data
     healthcheck:
-      test: ["CMD", "nats-server", "--check", "healthz"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -259,7 +269,7 @@ services:
       - |
         echo "Waiting for NATS..."
         until nc -z nats 4222; do sleep 1; done
-        echo "Creating stream 'wmata' and 'traffic'..."
+        echo "Creating bronze/silver/inference streams..."
         create_stream() {
           name="$1"; subjects="$2"; max_age="$3"; max_bytes="$4"
           nats -s nats:4222 stream info "$name" >/dev/null 2>&1 || \
@@ -268,13 +278,15 @@ services:
               --discard old --max-msgs=-1 --max-bytes="$max_bytes" \
               --max-age "$max_age" --dupe-window 2m
         }
-        create_stream wmata-data      "wmata.realtime.data,wmata.realtime.data.>"           3d 2GB
-        create_stream wmata-inference "wmata.realtime.inference,wmata.realtime.inference.>" 7d 1GB
-        create_stream traffic-data    "traffic.realtime.data,traffic.realtime.data.>"       2d 2GB
+        create_stream wmata-bronze    "wmata.realtime.bronze_data,wmata.realtime.bronze_data.>"       3d 2GB
+        create_stream traffic-bronze  "traffic.realtime.bronze_data,traffic.realtime.bronze_data.>"   3d 2GB
+        create_stream wmata-silver    "wmata.realtime.silver_data,wmata.realtime.silver_data.>"      7d 5GB
+        create_stream traffic-silver  "traffic.realtime.silver_data,traffic.realtime.silver_data.>"  7d 5GB
+        create_stream wmata-inference "wmata.realtime.inference,wmata.realtime.inference.>"          7d 1GB
         echo "NATS init complete"
     depends_on:
       nats:
-        condition: service_started
+        condition: service_healthy
     networks:
       - devnet
     profiles: ["dev"]
@@ -286,6 +298,8 @@ services:
       - ${HOST_IP:-127.0.0.1}:31311:31311
     volumes:
       - ./storage/nui:/db
+      - ./configs/nui/contexts:/nui-contexts:ro
+    command: ["--nats-cli-contexts=/nui-contexts"]
     depends_on:
       nats:
         condition: service_started
@@ -293,30 +307,58 @@ services:
       - devnet
     profiles: ["dev"]
 
-  # debezium-server:
-  #   <<: *default-logging
-  #   image: docker.io/debezium/server:3.0.0.Final
-  #   restart: unless-stopped
-  #   environment:
-  #     POSTGRES_USER: ${POSTGRES_INFRA_USER:-postgres}
-  #     POSTGRES_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
-  #   volumes:
-  #     - ./configs/debezium:/debezium/config:ro
-  #     - ./storage/debezium:/debezium/data
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     nats:
-  #       condition: service_started
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "curl -sf http://localhost:8080/q/health/ready || exit 1"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #     start_period: 30s
-  #   networks:
-  #     - devnet
-  #   profiles: ["dev"]
+  # Two Debezium Server instances: each instance runs exactly one connector.
+  # They tail the silver cluster's WAL and publish to the silver_data streams.
+  debezium-wmata:
+    <<: *default-logging
+    image: docker.io/debezium/server:3.0.0.Final
+    restart: unless-stopped
+    # Root so the bind-mounted offsets file is writable in dev.
+    user: "0"
+    env_file:
+      - .env
+    volumes:
+      - ./configs/debezium/wmata.properties:/debezium/config/application.properties:ro
+      - ./storage/debezium/wmata:/debezium/data
+    depends_on:
+      postgres-silver:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/q/health/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  debezium-traffic:
+    <<: *default-logging
+    image: docker.io/debezium/server:3.0.0.Final
+    restart: unless-stopped
+    user: "0"
+    env_file:
+      - .env
+    volumes:
+      - ./configs/debezium/traffic.properties:/debezium/config/application.properties:ro
+      - ./storage/debezium/traffic:/debezium/data
+    depends_on:
+      postgres-silver:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/q/health/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - devnet
+    profiles: ["dev"]
 
   dagster-user-code:
     <<: *default-logging
@@ -451,10 +493,10 @@ services:
       - ${HOST_IP:-127.0.0.1}:5000:5000
     environment:
       MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_INFRA_USER:-postgres}:${POSTGRES_INFRA_PASSWORD:-postgres}@postgres-infra:${POSTGRES_INFRA_PORT:-5432}/mlflow_db
-      MLFLOW_S3_ENDPOINT_URL: http://garage:3900
+      MLFLOW_S3_ENDPOINT_URL: ${SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs:8333}
       MLFLOW_ARTIFACTS_DESTINATION: s3://mlflow/
-      AWS_ACCESS_KEY_ID: mlflow-key-id
-      AWS_SECRET_ACCESS_KEY: mlflow-secret-key
+      AWS_ACCESS_KEY_ID: ${MLFLOW_KEY_ID:-mlflow-key-id}
+      AWS_SECRET_ACCESS_KEY: ${MLFLOW_SECRET_KEY:-mlflow-secret-key}
       AWS_DEFAULT_REGION: us-east-1
       AWS_S3_FORCE_PATH_STYLE: "true"
       MLFLOW_ALLOWED_HOSTS: "*"
@@ -475,7 +517,7 @@ services:
     depends_on:
       postgres-infra:
         condition: service_healthy
-      garage-init:
+      seaweedfs-init:
         condition: service_completed_successfully
     networks:
       - devnet
@@ -489,7 +531,7 @@ services:
   #   restart: unless-stopped
   #   environment:
   #     MLFLOW_TRACKING_URI: http://mlflow:5000
-  #     MLFLOW_S3_ENDPOINT_URL: http://garage:3900
+  #     MLFLOW_S3_ENDPOINT_URL: http://seaweedfs:8333
   #     AWS_ACCESS_KEY_ID: mlflow-key-id
   #     AWS_SECRET_ACCESS_KEY: mlflow-secret-key
   #     AWS_DEFAULT_REGION: us-east-1

@@ -1,0 +1,4 @@
+{
+  "description": "WMATA Bronze NATS JetStream - wmata.realtime.bronze_data",
+  "url": "nats://nats:4222"
+}
