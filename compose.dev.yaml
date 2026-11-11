@@ -4,6 +4,11 @@ x-logging: &default-logging
   logging:
     driver: json-file
 
+x-spark: &spark-image
+  build:
+    context: ./spark
+    dockerfile: Containerfile
+
 services:
   postgres-silver:
     <<: *default-logging
@@ -128,8 +133,6 @@ services:
     command:
       - |
         until curl -sf http://seaweedfs:9333/cluster/status >/dev/null 2>&1; do sleep 1; done
-        # Let the embedded filer/S3 gateway finish starting; weed shell also
-        # waits on its own connect timeout.
         sleep 5
         for bucket in wmata traffic mlflow; do
           echo "s3.bucket.create -name $${bucket} -owner $${bucket%}" \
@@ -239,15 +242,11 @@ services:
 
   nats:
     <<: *default-logging
-    # The plain `nats:2.15.2` tag is scratch-based (no shell/wget), which makes
-    # a container healthcheck impossible. The alpine variant lets us probe the
-    # monitoring endpoint instead of the nonexistent `nats-server --check` flag.
     image: docker.io/nats:2.15.2-alpine3.22
     restart: unless-stopped
     ports:
       - ${HOST_IP:-127.0.0.1}:4222:4222
       - ${HOST_IP:-127.0.0.1}:8222:8222
-    # -sd keeps JetStream state across container recreation.
     command: ["-js", "-m", "8222", "-sd", "/data"]
     volumes:
       - ./storage/nats:/data
@@ -307,13 +306,10 @@ services:
       - devnet
     profiles: ["dev"]
 
-  # Two Debezium Server instances: each instance runs exactly one connector.
-  # They tail the silver cluster's WAL and publish to the silver_data streams.
   debezium-wmata:
     <<: *default-logging
     image: docker.io/debezium/server:3.0.0.Final
     restart: unless-stopped
-    # Root so the bind-mounted offsets file is writable in dev.
     user: "0"
     env_file:
       - .env
@@ -593,6 +589,129 @@ services:
       - ./dlt:/app
       - ./shared:/app/shared:ro
     working_dir: /app
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  trino:
+    <<: *default-logging
+    image: docker.io/trinodb/trino:484
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:8080:8080
+    environment:
+      POSTGRES_SILVER_USER: ${POSTGRES_SILVER_USER:-postgres}
+      POSTGRES_SILVER_PASSWORD: ${POSTGRES_SILVER_PASSWORD:-postgres}
+      POSTGRES_GOLD_USER: ${POSTGRES_GOLD_USER:-postgres}
+      POSTGRES_GOLD_PASSWORD: ${POSTGRES_GOLD_PASSWORD:-postgres}
+    volumes:
+      - ./configs/trino:/etc/trino:ro
+    depends_on:
+      postgres-silver:
+        condition: service_healthy
+      postgres-gold:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  # Standalone Spark cluster. All three services share one image (x-spark) with
+  # the S3A + PostgreSQL JDBC jars baked in.
+  spark-master:
+    <<: [*default-logging, *spark-image]
+    restart: unless-stopped
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --webui-port
+      - "8080"
+    environment:
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedfs-access-key}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfs-secret-key}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    ports:
+      - ${HOST_IP:-127.0.0.1}:7077:7077
+      - ${HOST_IP:-127.0.0.1}:8082:8080
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    healthcheck:
+      # The official image has no curl, so probe the UI port with bash.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  spark-worker:
+    <<: [*default-logging, *spark-image]
+    restart: unless-stopped
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --webui-port
+      - "8081"
+      - --cores
+      - "2"
+      - --memory
+      - 2g
+    environment:
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedfs-access-key}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfs-secret-key}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    ports:
+      - ${HOST_IP:-127.0.0.1}:8083:8081
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  # One-shot submitter. Example:
+  #   docker compose -f compose.dev.yaml --profile dev run --rm spark-submit \
+  #     --master spark://spark-master:7077 /opt/spark/jobs/bronze_check.py
+  spark-submit:
+    <<: [*default-logging, *spark-image]
+    restart: "no"
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedfs-access-key}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfs-secret-key}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      POSTGRES_SILVER_USER: ${POSTGRES_SILVER_USER:-postgres}
+      POSTGRES_SILVER_PASSWORD: ${POSTGRES_SILVER_PASSWORD:-postgres}
+      SPARK_BRONZE_BUCKET: ${SEAWEEDFS_BUCKET_WMATA_BRONZE:-wmata}
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark/jobs:/opt/spark/jobs:ro
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      postgres-silver:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_started
     networks:
       - devnet
     profiles: ["dev"]

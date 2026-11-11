@@ -1,0 +1,17 @@
+FROM docker.io/apache/spark:4.3.0-scala2.13-java17-python3-ubuntu
+
+USER root
+
+ARG HADOOP_AWS_VERSION=3.5.0
+ARG AWS_SDK_VERSION=2.35.4
+ARG POSTGRES_JDBC_VERSION=42.7.14
+
+ADD https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar /opt/spark/jars/
+ADD https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_VERSION}/bundle-${AWS_SDK_VERSION}.jar /opt/spark/jars/
+ADD https://repo1.maven.org/maven2/org/postgresql/postgresql/${POSTGRES_JDBC_VERSION}/postgresql-${POSTGRES_JDBC_VERSION}.jar /opt/spark/jars/
+
+RUN chmod 0644 /opt/spark/jars/hadoop-aws-*.jar \
+  /opt/spark/jars/bundle-*.jar \
+  /opt/spark/jars/postgresql-*.jar
+
+USER 185

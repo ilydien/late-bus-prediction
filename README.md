@@ -16,6 +16,7 @@ A medallion-architecture data platform for **WMATA** (Washington Metropolitan Ar
 - [Debezium CDC](#debezium-cdc)
 - [SeaweedFS and the Event Bridge](#seaweedfs-and-the-event-bridge)
 - [NATS NUI](#nats-nui)
+- [Spark & Trino](#spark--trino)
 - [Tech Stack](#tech-stack)
 - [Prerequisites](#prerequisites)
 - [Setup & Run](#setup--run)
@@ -65,6 +66,10 @@ The infrastructure database (`postgres-infra`) is separate: it holds `dagster_db
 │   └── bridge/                 # Filer webhook -> NATS JetStream
 │       ├── app.py
 │       └── Containerfile
+├── spark/
+│   ├── Containerfile           # Spark 4.3 + S3A/AWS SDK/Postgres JDBC jars
+│   ├── conf/spark-defaults.conf
+│   └── jobs/                   # bronze_check.py
 ├── configs/
 │   ├── postgres/               # init-dbs.sh, init-dbs-infra.sh
 │   ├── seaweedfs/              # s3.json, notification.toml
@@ -73,6 +78,7 @@ The infrastructure database (`postgres-infra`) is separate: it holds `dagster_db
 │   ├── dagster/                # dagster.yaml, workspace.yaml
 │   ├── vector/                 # vector.yaml
 │   ├── mlflow/                 # Containerfile
+│   ├── trino/                  # config + catalog/*.properties
 │   └── dashboard.placeholder/  # Caddyfile (not wired to a service yet)
 ├── monitor/
 │   ├── health_monitor.py
@@ -205,6 +211,59 @@ Open <http://localhost:31311> and the connections are already listed.
 
 ---
 
+## Spark & Trino
+
+### Apache Spark (standalone)
+
+`spark-master`, `spark-worker` and the one-shot `spark-submit` share one image built from `spark/Containerfile`. The image adds the jars the dev stack needs on top of `apache/spark:4.3.0`:
+
+| Jar | Why |
+|-----|-----|
+| `hadoop-aws:3.5.0` | S3A filesystem (matches the Hadoop bundled with Spark 4.3) |
+| `software.amazon.awssdk:bundle:2.35.4` | AWS SDK v2 used by `hadoop-aws` |
+| `postgresql:42.7.14` | JDBC driver for the silver/gold clusters |
+
+`spark/conf/spark-defaults.conf` points S3A at `http://seaweedfs:8333` (path-style, no TLS) and takes credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, which compose sets from the `SEAWEEDFS_*` variables. No secrets are stored in the config file.
+
+```bash
+# Connectivity check: SeaweedFS over S3A + PostgreSQL over JDBC
+docker compose -f compose.dev.yaml --profile dev run --rm spark-submit \
+  --master spark://spark-master:7077 /opt/spark/jobs/bronze_check.py
+
+# Run any other job the same way
+docker compose -f compose.dev.yaml --profile dev run --rm spark-submit \
+  --master spark://spark-master:7077 /opt/spark/jobs/<job>.py
+```
+
+Master UI: <http://localhost:8082> · Worker UI: <http://localhost:8083>.
+
+### Trino
+
+Single-node Trino (`trinodb/trino:484`) with one catalog per Postgres database:
+
+| Catalog | Connector target |
+|---------|------------------|
+| `silver_wmata` | `postgres-silver:5432/wmata` |
+| `silver_traffic` | `postgres-silver:5432/traffic` |
+| `gold_wmata` | `postgres-gold:5432/wmata` |
+| `gold_traffic` | `postgres-gold:5432/traffic` |
+
+Catalog files use `${ENV:POSTGRES_*_USER}` / `${ENV:POSTGRES_*_PASSWORD}` substitution. Trino is read-only against these catalogs and is meant for ad-hoc SQL and cross-database checks.
+
+```bash
+# Interactive CLI
+docker compose -f compose.dev.yaml --profile dev exec trino \
+  trino --catalog silver_wmata --schema public
+
+# SHOW CATALOGS;
+# SHOW TABLES FROM silver_wmata.public;
+# SELECT * FROM gold_wmata.public.<table> LIMIT 10;
+```
+
+Trino UI: <http://localhost:8080>. Bronze (SeaweedFS) is **not** exposed as a Trino catalog; querying it would require an Iceberg/Hive catalog and a metastore.
+
+---
+
 ## Tech Stack
 
 | Area | Technology |
@@ -216,6 +275,8 @@ Open <http://localhost:31311> and the connections are already listed.
 | Object storage | SeaweedFS `4.53` (S3 gateway + filer) |
 | Messaging | NATS `2.15.2-alpine3.22` with JetStream |
 | CDC | Debezium Server `3.0.0.Final` |
+| Batch compute | Apache Spark `4.3.0` (standalone master + worker) |
+| Federated SQL | Trino `484` (one catalog per Postgres database) |
 | ML tracking | MLflow `3.14.0` (Postgres backend, SeaweedFS artifacts) |
 | Metrics | VictoriaMetrics |
 | Logs | VictoriaLogs + Vector |
@@ -289,7 +350,21 @@ docker compose -f compose.dev.yaml --profile dev run --rm dbt run --target silve
 
 Available targets: `silver_wmata` (default), `gold_wmata`, `silver_traffic`, `gold_traffic`.
 
-### 5. Dagster
+### 5. Trino
+
+```bash
+docker compose -f compose.dev.yaml --profile dev exec trino \
+  trino --catalog silver_wmata --schema public
+```
+
+### 6. Spark
+
+```bash
+docker compose -f compose.dev.yaml --profile dev run --rm spark-submit \
+  --master spark://spark-master:7077 /opt/spark/jobs/bronze_check.py
+```
+
+### 7. Dagster
 
 Open <http://localhost:3000>. `dagster/definitions.py` currently registers four IO managers and **no assets or schedules**.
 
@@ -309,6 +384,10 @@ Open <http://localhost:3000>. `dagster/definitions.py` currently registers four 
 | `nats` | `4222` | `4222` | Client connections |
 | `nats` | `8222` | `8222` | Monitoring HTTP |
 | `nats-nui` | `31311` | `31311` | Web GUI |
+| `trino` | `8080` | `8080` | Trino UI + `/v1/info` |
+| `spark-master` | `7077` | `7077` | Cluster RPC |
+| `spark-master` | `8082` | `8080` | Master UI |
+| `spark-worker` | `8083` | `8081` | Worker UI |
 | `dagster-webserver` | `3000` | `3000` | Dagster UI |
 | `mlflow` | `5000` | `5000` | Tracking UI |
 | `victoriametrics` | `8428` | `8428` | Metrics HTTP |
@@ -335,6 +414,10 @@ All host ports bind to `${HOST_IP:-127.0.0.1}`.
 | `configs/dagster/workspace.yaml` | gRPC user-code location |
 | `configs/vector/vector.yaml` | Container log collection |
 | `configs/mlflow/Containerfile` | MLflow image with Postgres + S3 drivers |
+| `configs/trino/*` | Trino config + one Postgres catalog per database |
+| `spark/Containerfile` | Spark image with S3A + JDBC jars |
+| `spark/conf/spark-defaults.conf` | S3A endpoint/credentials provider, shuffle |
+| `spark/jobs/*` | Spark jobs (example: `bronze_check.py`) |
 | `configs/dashboard.placeholder/Caddyfile` | Reverse-proxy plan (no service yet) |
 
 ---
@@ -362,6 +445,13 @@ docker compose -f compose.dev.yaml --profile dev \
 
 # 5. dbt project parses
 docker compose -f compose.dev.yaml --profile dev run --rm dbt parse --target silver_wmata
+
+# 6. Trino lists its catalogs
+docker compose -f compose.dev.yaml --profile dev exec trino trino --execute 'SHOW CATALOGS'
+
+# 7. Spark reaches SeaweedFS (S3A) and Postgres (JDBC)
+docker compose -f compose.dev.yaml --profile dev run --rm spark-submit \
+  --master spark://spark-master:7077 /opt/spark/jobs/bronze_check.py
 ```
 
 Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also appear on the stream as a `delete` event.
@@ -377,6 +467,8 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 | Stream bootstrap (`nats-init`) | Implemented |
 | Bronze webhook bridge | Implemented |
 | NUI context import | Implemented |
+| Spark standalone cluster (`spark-master`, `spark-worker`, `spark-submit`) | Implemented (example job included) |
+| Trino catalogs over silver/gold Postgres | Implemented |
 | Silver CDC configuration | Configured; needs real silver tables |
 | dbt models | Placeholder (`.gitkeep` only, `sources.yml` has `PLACEHOLDER_TABLE`) |
 | Dagster assets, jobs, schedules | Placeholder (`assets=[]`, no schedules) |
@@ -401,6 +493,10 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 - The SeaweedFS master UI on `9333` is not published to the host.
 - There is no authentication or TLS on NATS, SeaweedFS, or the databases. This stack is for local development only.
 - `monitor`, `inference`, `dashboard-*`, `dlt-*`, and `dbt` run only when invoked explicitly; the `dbt` service is a one-shot task, not a long-running service.
+- Trino has no catalog for bronze; querying SeaweedFS requires an Iceberg/Hive catalog plus a metastore.
+- The Spark image downloads `hadoop-aws`, the AWS SDK bundle and the JDBC driver from Maven Central at build time, so the first `build` needs network access and is large (~500 MB).
+- Spark executors inherit `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from `spark-worker`; rotating the SeaweedFS keys means recreating the Spark containers.
+- `spark-submit` is a one-shot task (like `dbt`); use `docker compose run --rm` rather than `up`.
 
 ---
 
@@ -415,3 +511,6 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 | Need to reset CDC state | Stop the stack, remove `storage/debezium/*`, and drop the replication slots/publications in `postgres-silver`. |
 | Need a clean slate | `docker compose --profile dev down` removes containers but not bind mounts; delete `storage/` to reset all state. |
 | dbt connects to the wrong port | `POSTGRES_*_PORT` must be `5432` inside the network. Only `POSTGRES_*_HOST_PORT` is `5433`/`5434`. |
+| Trino stays unhealthy | Catalogs fail if the `POSTGRES_*` env vars are missing; check `docker compose logs trino` for `${ENV:...}` resolution errors. |
+| Spark worker never registers | It waits for the `spark-master` healthcheck on port `8080`; check the master UI at <http://localhost:8082>. |
+| Spark job cannot read `s3a://` | `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` must be set on `spark-worker` and `spark-submit`, and `fs.s3a.endpoint` must point at `seaweedfs:8333`. |
