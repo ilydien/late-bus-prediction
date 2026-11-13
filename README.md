@@ -1,8 +1,8 @@
 # WMATA Real-Time Lateness Platform
 
-A medallion-architecture data platform for **WMATA** (Washington Metropolitan Area Transit Authority) transit and traffic data. Bronze objects live in **SeaweedFS** (S3), silver and gold tables live in dedicated **PostgreSQL** clusters, and changes are streamed into **NATS JetStream** through **Debezium** and SeaweedFS filer webhooks.
+A medallion-architecture data platform for **WMATA** (Washington Metropolitan Area Transit Authority) transit and traffic data. Bronze objects live in **SeaweedFS** (S3), silver and gold tables live in two-node **PostgreSQL + Spock** multi-master clusters, and changes are streamed into **NATS JetStream** through **Debezium** and SeaweedFS filer webhooks. Every database client reaches the silver and gold clusters through **HAProxy**.
 
-> **Status:** infrastructure scaffold. Containers, databases, buckets, streams and CDC wiring are in place. dbt models, Dagster assets, dlt pipelines, ML inference and the dashboard are still placeholders — see [Status & Roadmap](#status--roadmap).
+> **Status:** infrastructure scaffold. Containers, databases, buckets, streams, CDC wiring, Spock replication and HAProxy routing are in place. dbt models, Dagster assets, dlt pipelines, ML inference and the dashboard are still placeholders — see [Status & Roadmap](#status--roadmap).
 
 ---
 
@@ -29,15 +29,75 @@ A medallion-architecture data platform for **WMATA** (Washington Metropolitan Ar
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart LR
+    src[WMATA + traffic sources] -->|dlt, planned| s3[(SeaweedFS bronze S3)]
+
+    s3 -->|filer webhook| bridge[seaweedfs-bridge]
+    bridge -->|bronze events| nats[[NATS JetStream]]
+
+    subgraph silver_cluster[Silver: Spock multi-master]
+        silver[(spock-silver-1)]
+        silver2[(spock-silver-2)]
+        silver <-->|bidirectional replication| silver2
+    end
+
+    haproxy[HAProxy] -->|RW 5433 / RO 5435| silver_cluster
+    dbt[dbt] -->|RW 5433| haproxy
+    debezium[Debezium Server x2] -->|RW 5433| haproxy
+    debezium -->|silver CDC| nats
+
+    subgraph gold_cluster[Gold: Spock multi-master]
+        gold[(spock-gold-1)]
+        gold2[(spock-gold-2)]
+        gold <-->|bidirectional replication| gold2
+    end
+
+    haproxy -->|RW 5434 / RO 5436| gold_cluster
+    dagster[Dagster assets] -->|RW 5434| haproxy
+    trino[Trino] -->|RO 5435 / 5436| haproxy
+    spark[Spark] -->|RW 5433| haproxy
+
+    nats --> consumers[inference + dashboard, planned]
+    gold --> consumers
+```
+
+The silver and gold layers are each a **two-node Spock active-active cluster**: both nodes accept writes, both hold the full dataset, and there is no sharding or partitioning. Spock replicates changes in both directions. HAProxy is the only network entry point; application containers never resolve `spock-*` hostnames directly.
+
+HAProxy uses **Mode A pinned failover** for write traffic. `balance first` sends every RW connection to node 1 while it is healthy; node 2 is a hot `backup` and takes over automatically when node 1 fails its health check. Pinning batch writers avoids two nodes running the same DDL or bulk load concurrently. Read-only frontends use `balance roundrobin` across both nodes.
+
+| Frontend | Port | Backends | Balance |
+|----------|------|----------|---------|
+| `silver_rw` | `5433` | `spock-silver-1`, `spock-silver-2` (backup) | `first` |
+| `silver_ro` | `5435` | both silver nodes | `roundrobin` |
+| `gold_rw` | `5434` | `spock-gold-1`, `spock-gold-2` (backup) | `first` |
+| `gold_ro` | `5436` | both gold nodes | `roundrobin` |
+| HAProxy stats | `8404` | — | — |
+
+Spock is configured in `configs/spock/init/` (per-node Postgres settings, databases, extensions, `pg_hba.conf`) and `configs/spock/wire/` (one-shot node definitions and bidirectional subscriptions). The wiring job is idempotent and waits for each subscription to reach `replicating`.
+
+**Spock caveats for this stack:**
+
+- Every replicated table needs a primary key or a unique index used as replica identity. Spock does not support standalone `REPLICA IDENTITY FULL`, and `spock.repset_add_all_tables` silently skips tables that lack an index-based identity. dbt models must therefore define a primary key.
+- DDL is replicated only when `spock.enable_ddl_replication` and the `ddl_sql` replication set are active. Keep DDL writes on one node at a time (HAProxy Mode A does this) or wrap them with `spock.replicate_ddl`.
+- Sequences are not conflict-free across nodes. `snowflake` is installed where available; otherwise use explicit IDs rather than `serial`.
+- `UNLOGGED` and `TEMPORARY` tables are not replicated.
+- Replication is asynchronous. A conflict is resolved by the configured `last_update_wins` policy; check `spock.resolutions` when investigating divergence.
+- Debezium replication slots are node-bound. After an HAProxy failover, the new node may not have the same slot/LSN, so expect to re-snapshot. See [Known Issues](#known-issues).
+
+---
+
 ## Layer Model
 
 | Layer | Store | Written by | Read by | Databases / buckets | Schema |
 |-------|-------|------------|---------|---------------------|--------|
 | **Bronze** | SeaweedFS S3 | dlt (planned) | nobody in dbt/Dagster | `wmata`, `traffic` buckets | n/a |
-| **Silver** | `postgres-silver` | dbt | Debezium, Dagster | `wmata`, `traffic` | `public` |
-| **Gold** | `postgres-gold` | Dagster assets | dashboard / consumers (planned) | `wmata`, `traffic` | `public` |
+| **Silver** | Spock cluster `spock-silver-1` + `spock-silver-2` (via `haproxy`) | dbt | Debezium, Dagster, Trino, Spark | `wmata`, `traffic` | `public` |
+| **Gold** | Spock cluster `spock-gold-1` + `spock-gold-2` (via `haproxy`) | Dagster assets | dashboard / consumers (planned), Trino | `wmata`, `traffic` | `public` |
 
-The infrastructure database (`postgres-infra`) is separate: it holds `dagster_db` and `mlflow_db`.
+The infrastructure database (`postgres-infra`) is separate and remains a single node: it holds `dagster_db` and `mlflow_db`. It is not part of the Spock replication topology.
 
 ---
 
@@ -71,7 +131,10 @@ The infrastructure database (`postgres-infra`) is separate: it holds `dagster_db
 │   ├── conf/spark-defaults.conf
 │   └── jobs/                   # bronze_check.py
 ├── configs/
-│   ├── postgres/               # init-dbs.sh, init-dbs-infra.sh
+│   ├── postgres/               # init-dbs-infra.sh (infra only)
+│   ├── spock/init/             # per-node config, databases, extensions, pg_hba
+│   ├── spock/wire/             # one-shot node + subscription wiring
+│   ├── haproxy/haproxy.cfg     # silver/gold RW+RO frontends
 │   ├── seaweedfs/              # s3.json, notification.toml
 │   ├── debezium/               # wmata.properties, traffic.properties
 │   ├── nui/contexts/           # NATS NUI connection contexts
@@ -96,10 +159,10 @@ The infrastructure database (`postgres-infra`) is separate: it holds `dagster_db
 
 1. **Ingestion (planned).** dlt pipelines write raw objects into the SeaweedFS buckets.
 2. **Bronze events.** The SeaweedFS filer emits a webhook for every create/update/delete under the two bronze buckets. `seaweedfs-bridge` maps the object path to a subject and publishes the raw envelope to JetStream.
-3. **Silver.** dbt models build the silver tables in `postgres-silver` (one database per domain).
-4. **Silver CDC.** Two Debezium Server instances tail the silver WAL with `pgoutput` and publish change events to the silver streams.
-5. **Gold.** Dagster assets read silver and write gold tables in `postgres-gold` through the layer-specific IO managers.
-6. **Consumers (planned).** Inference and dashboard services consume the NATS streams.
+3. **Silver.** dbt models build the silver tables through HAProxy RW (`haproxy:5433`, one database per domain). Spock replicates each committed change to the other silver node.
+4. **Silver CDC.** Two Debezium Server instances tail the silver WAL with `pgoutput` through HAProxy and publish change events to the silver streams.
+5. **Gold.** Dagster assets read silver and write gold tables through HAProxy RW (`haproxy:5434`) using the layer-specific IO managers. Spock replicates gold changes to the other gold node.
+6. **Consumers (planned).** Inference and dashboard services consume the NATS streams and read gold through HAProxy.
 
 ### Event payloads
 
@@ -142,7 +205,7 @@ Debezium Server runs **one connector per instance**, so there are two containers
 
 | Setting | `debezium-wmata` | `debezium-traffic` |
 |---------|------------------|--------------------|
-| Source | `postgres-silver:5432` | `postgres-silver:5432` |
+| Source | `haproxy:5433` | `haproxy:5433` |
 | Database | `wmata` | `traffic` |
 | Slot | `wmata_silver` | `traffic_silver` |
 | Publication | `wmata_silver_pub` | `traffic_silver_pub` |
@@ -152,6 +215,13 @@ Debezium Server runs **one connector per instance**, so there are two containers
 Both use `plugin.name=pgoutput`, `schema.include.list=public`, and `create-stream=false`. The sink subject list must contain **both** the bare prefix and `<prefix>.>` because schema-change events are emitted at the bare prefix.
 
 `table.include.list` is still a placeholder, so every table in the `public` schema is currently captured. Debezium tails the Postgres WAL only; it never reads SeaweedFS.
+
+**Slot failover.** A logical replication slot belongs to one physical node and stores its own LSN. Under normal operation Debezium connects to HAProxy and lands on `spock-silver-1`. If node 1 fails, HAProxy moves the connection to `spock-silver-2`, which does not have that slot. Debezium will either recreate the publication/slot from its saved offset (if the slot exists and the LSN is valid there) or require a reset. The accepted fallback for this dev stack is:
+
+1. Pre-create the same slot and publication on both silver nodes, or
+2. Reset the Debezium offset and let it **re-snapshot** the captured tables.
+
+Both behaviours must be verified at runtime; see [Known Issues](#known-issues).
 
 ---
 
@@ -243,12 +313,12 @@ Single-node Trino (`trinodb/trino:484`) with one catalog per Postgres database:
 
 | Catalog | Connector target |
 |---------|------------------|
-| `silver_wmata` | `postgres-silver:5432/wmata` |
-| `silver_traffic` | `postgres-silver:5432/traffic` |
-| `gold_wmata` | `postgres-gold:5432/wmata` |
-| `gold_traffic` | `postgres-gold:5432/traffic` |
+| `silver_wmata` | `haproxy:5435/wmata` |
+| `silver_traffic` | `haproxy:5435/traffic` |
+| `gold_wmata` | `haproxy:5436/wmata` |
+| `gold_traffic` | `haproxy:5436/traffic` |
 
-Catalog files use `${ENV:POSTGRES_*_USER}` / `${ENV:POSTGRES_*_PASSWORD}` substitution. Trino is read-only against these catalogs and is meant for ad-hoc SQL and cross-database checks.
+Catalog files use `${ENV:POSTGRES_*_USER}` / `${ENV:POSTGRES_*_PASSWORD}` substitution. They point at the HAProxy read-only frontends, which round-robin both Spock nodes; Trino is meant for ad-hoc SQL and cross-database checks.
 
 ```bash
 # Interactive CLI
@@ -271,7 +341,9 @@ Trino UI: <http://localhost:8080>. Bronze (SeaweedFS) is **not** exposed as a Tr
 | Orchestration | Dagster (webserver, daemon, gRPC user code) |
 | Transformations | dbt-postgres `1.9.0` |
 | Ingestion | dlt (`dlt[postgres]`) |
-| Databases | PostgreSQL `18.4-alpine3.24` (infra, silver, gold) |
+| Databases (infra) | PostgreSQL `18.4-alpine3.24` (single node) |
+| Databases (silver/gold) | pgEdge Postgres `18.7` + Spock `5.0.14`, two-node multi-master per layer |
+| Database proxy | HAProxy `3.2-alpine` (RW pinned failover, RO round-robin) |
 | Object storage | SeaweedFS `4.53` (S3 gateway + filer) |
 | Messaging | NATS `2.15.2-alpine3.22` with JetStream |
 | CDC | Debezium Server `3.0.0.Final` |
@@ -308,12 +380,12 @@ Environment groups:
 | Group | Variables |
 |-------|-----------|
 | Host binding | `HOST_IP` |
-| Databases | `POSTGRES_DB_{INFRA,WMATA,TRAFFIC}`, `POSTGRES_{INFRA,SILVER,GOLD}_{HOST,USER,PASSWORD,PORT,HOST_PORT}` |
+| Databases | `POSTGRES_DB_{INFRA,WMATA,TRAFFIC}`, `POSTGRES_{INFRA,SILVER,GOLD}_{HOST,USER,PASSWORD,PORT,READ_PORT,HOST_PORT}` |
 | Retention | `VM_RETENTION`, `VL_RETENTION` |
 | SeaweedFS | `SEAWEEDFS_S3_ENDPOINT`, `SEAWEEDFS_ACCESS_KEY`, `SEAWEEDFS_SECRET_KEY`, bucket names, per-domain keys |
 | Alerts | `TELEGRAM_BOT_API_KEY`, `TELEGRAM_CHAT_ID` |
 
-Inside the Compose network every PostgreSQL cluster listens on **5432**; the host-only ports are `5433` (silver) and `5434` (gold). Do not put the host ports in `POSTGRES_*_PORT`.
+Silver and gold clients must use `POSTGRES_SILVER_HOST=haproxy` / `POSTGRES_GOLD_HOST=haproxy` with the RW ports `5433` / `5434`. Read-only consumers use `POSTGRES_*_READ_PORT` (`5435` / `5436`). These are HAProxy ports and are the same inside the compose network and on the host. `postgres-infra` keeps `POSTGRES_INFRA_HOST=postgres-infra` and port `5432`.
 
 ### 2. Start services
 
@@ -323,12 +395,14 @@ docker compose -f compose.dev.yaml --profile dev up -d
 
 Startup order is enforced with health and completion checks:
 
-1. `postgres-infra`, `postgres-silver`, `postgres-gold` become healthy.
-2. `seaweedfs` becomes healthy, then `seaweedfs-init` creates the buckets.
-3. `nats` becomes healthy, then `nats-init` creates the streams.
-4. `seaweedfs-bridge` starts after the streams exist.
-5. `debezium-wmata` / `debezium-traffic` start after `postgres-silver` is healthy and `nats-init` completes.
-6. `mlflow` starts after `postgres-infra` and `seaweedfs-init`.
+1. `postgres-infra` becomes healthy; all four `spock-*` nodes become healthy (image init scripts configure Spock and create `wmata` + `traffic`).
+2. `spock-wire-silver` and `spock-wire-gold` create node definitions and bidirectional subscriptions, then exit.
+3. `haproxy` becomes healthy; `db-ready` confirms both RW frontends answer `pg_isready`, then exits.
+4. `seaweedfs` becomes healthy, then `seaweedfs-init` creates the buckets.
+5. `nats` becomes healthy, then `nats-init` creates the streams.
+6. `seaweedfs-bridge` starts after the streams exist.
+7. `debezium-*`, `dbt`, `trino` and `spark-submit` wait for `db-ready` and the relevant `spock-wire-*` job.
+8. `mlflow` starts after `postgres-infra` and `seaweedfs-init`.
 
 ### 3. Verify
 
@@ -374,9 +448,12 @@ Open <http://localhost:3000>. `dagster/definitions.py` currently registers four 
 
 | Service | Host port | Container port | Notes |
 |---------|-----------|----------------|-------|
-| `postgres-infra` | `5432` | `5432` | `dagster_db`, `mlflow_db` |
-| `postgres-silver` | `5433` | `5432` | `wmata`, `traffic` |
-| `postgres-gold` | `5434` | `5432` | `wmata`, `traffic` |
+| `postgres-infra` | `5432` | `5432` | `dagster_db`, `mlflow_db`; single node |
+| `haproxy` (silver RW) | `5433` | `5433` | `wmata`, `traffic`; pinned to node 1 |
+| `haproxy` (gold RW) | `5434` | `5434` | `wmata`, `traffic`; pinned to node 1 |
+| `haproxy` (silver RO) | `5435` | `5435` | Round-robin both silver nodes |
+| `haproxy` (gold RO) | `5436` | `5436` | Round-robin both gold nodes |
+| `haproxy` (stats) | `8404` | `8404` | Backend health dashboard |
 | `seaweedfs` (S3) | `8333` | `8333` | S3 gateway |
 | `seaweedfs` (filer) | `8888` | `8888` | Filer HTTP |
 | `seaweedfs` (master) | — | `9333` | Internal only |
@@ -403,8 +480,10 @@ All host ports bind to `${HOST_IP:-127.0.0.1}`.
 
 | Path | Purpose |
 |------|---------|
-| `configs/postgres/init-dbs.sh` | Creates `wmata` + `traffic` in each layer cluster |
 | `configs/postgres/init-dbs-infra.sh` | Creates `dagster_db` + `mlflow_db` |
+| `configs/spock/init/*.sh` | Per-node Postgres/Spock config, databases, extensions, `pg_hba.conf` |
+| `configs/spock/wire/run.sh` | Idempotent Spock node definitions and bidirectional subscriptions |
+| `configs/haproxy/haproxy.cfg` | Silver/gold RW+RO frontends and stats |
 | `configs/seaweedfs/s3.json` | S3 identities and credentials |
 | `configs/seaweedfs/notification.toml` | Filer webhook target, filters, retry policy |
 | `configs/debezium/wmata.properties` | Silver CDC for the `wmata` database |
@@ -449,9 +528,26 @@ docker compose -f compose.dev.yaml --profile dev run --rm dbt parse --target sil
 # 6. Trino lists its catalogs
 docker compose -f compose.dev.yaml --profile dev exec trino trino --execute 'SHOW CATALOGS'
 
-# 7. Spark reaches SeaweedFS (S3A) and Postgres (JDBC)
+# 7. Spark reaches SeaweedFS (S3A) and Postgres (JDBC via HAProxy)
 docker compose -f compose.dev.yaml --profile dev run --rm spark-submit \
   --master spark://spark-master:7077 /opt/spark/jobs/bronze_check.py
+
+# 8. HAProxy sees both backends on each cluster
+curl -s http://localhost:8404/ | grep -E 'spock-(silver|gold)-[12]'
+
+# 9. Spock nodes and subscriptions are replicating
+docker compose -f compose.dev.yaml --profile dev exec spock-silver-1 \
+  psql -U postgres -d wmata -c 'SELECT * FROM spock.node;' \
+  -c 'SELECT subscription_name, status FROM spock.sub_show_status();'
+
+# 10. Writes replicate in both directions (run on node 1, read on node 2)
+docker compose -f compose.dev.yaml --profile dev exec spock-silver-1 \
+  psql -U postgres -d wmata -c \
+  'CREATE TABLE IF NOT EXISTS public.spock_probe (id int PRIMARY KEY, note text);
+   INSERT INTO public.spock_probe VALUES (1, $$from-node-1$$)
+   ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note;'
+docker compose -f compose.dev.yaml --profile dev exec spock-silver-2 \
+  psql -U postgres -d wmata -c 'TABLE public.spock_probe;'
 ```
 
 Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also appear on the stream as a `delete` event.
@@ -462,7 +558,10 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 
 | Area | State |
 |------|-------|
-| Compose infrastructure (Postgres x3, SeaweedFS, NATS, Debezium x2, MLflow, VictoriaMetrics, VictoriaLogs) | Implemented |
+| Compose infrastructure (Spock silver x2, Spock gold x2, postgres-infra, SeaweedFS, NATS, Debezium x2, MLflow, VictoriaMetrics, VictoriaLogs) | Implemented |
+| Spock multi-master bootstrap (`configs/spock/init`) | Implemented |
+| Spock bidirectional wiring (`spock-wire-silver`, `spock-wire-gold`) | Implemented; runtime validation pending |
+| HAProxy RW/RO routing and stats | Implemented; failover validation pending |
 | Bucket bootstrap (`seaweedfs-init`) | Implemented |
 | Stream bootstrap (`nats-init`) | Implemented |
 | Bronze webhook bridge | Implemented |
@@ -484,11 +583,18 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 
 ## Known Issues
 
+- Spock requires an index-based replica identity (primary key or unique index) for `UPDATE`/`DELETE` replication. Tables created by dbt without a PK are skipped by `spock.repset_add_all_tables` and will diverge. Always define a primary key in dbt models.
+- Spock does not support `REPLICA IDENTITY FULL` on its own; do not rely on it for keyless tables.
+- dbt table materializations use `CREATE TABLE AS`. Whether the initial rows replicate depends on Spock's DDL handling and must be verified. If they do not, switch the model to `incremental`/`append` so the data load is a replicated `INSERT`. This test is still pending.
+- Debezium logical replication slots are node-bound. Under HAProxy Mode A a failover to node 2 can lose the slot or its LSN. The fallback is a pre-created slot on both nodes or a Debezium re-snapshot. This test is still pending.
+- Spock replication is asynchronous and conflict resolution is `last_update_wins`; concurrent writes to the same row on both nodes can lose an update. HAProxy Mode A reduces this by pinning batch writers to node 1.
+- DDL should be applied on one node at a time. HAProxy Mode A pins RW traffic, but manual `psql` sessions that bypass HAProxy can still race.
+- Sequences are not cluster-safe; `snowflake` is installed only if the image provides it. Prefer explicit IDs over `serial`.
+- `postgres-infra` is a single node with no replication; it is not covered by Spock.
 - `dbt/models/silver/wmata/` does not exist yet (only `silver/traffic/`).
 - `dbt_project.yml` declares `macro-paths: ["macros"]`, but `dbt/macros/` is missing.
 - `dbt/models/sources.yml` still references `PLACEHOLDER_TABLE`.
 - Debezium has no `table.include.list`, so all `public` tables are captured; add one before production use.
-- A stale local `.env` may still use `wmata-bronze` / `traffic-bronze` as bucket names. `.env.example` (and the compose bootstrap) use `wmata` / `traffic`; treat `.env.example` as authoritative.
 - `seaweedfs-init` ends each `weed shell` call with `|| true`, so a failed bucket creation can pass silently. Check the logs and the bucket list.
 - The SeaweedFS master UI on `9333` is not published to the host.
 - There is no authentication or TLS on NATS, SeaweedFS, or the databases. This stack is for local development only.
@@ -508,9 +614,13 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 | SeaweedFS healthcheck fails | `-ip.bind=0.0.0.0` must be set so `127.0.0.1:9333` responds inside the container. |
 | `seaweedfs-bridge` returns `503` | NATS is down or the stream does not exist yet; check `nats-init` logs. |
 | Debezium cannot write offsets | The dev service runs as `user: "0"` so the `storage/debezium/*` bind mounts are writable. |
-| Need to reset CDC state | Stop the stack, remove `storage/debezium/*`, and drop the replication slots/publications in `postgres-silver`. |
-| Need a clean slate | `docker compose --profile dev down` removes containers but not bind mounts; delete `storage/` to reset all state. |
-| dbt connects to the wrong port | `POSTGRES_*_PORT` must be `5432` inside the network. Only `POSTGRES_*_HOST_PORT` is `5433`/`5434`. |
+| Need to reset CDC state | Stop the stack, remove `storage/debezium/*`, and drop the replication slots/publications on both silver nodes. |
+| Spock subscription is `down` or `initializing` | Check `spock.sub_show_status()`; inspect `docker compose logs spock-wire-silver` and the node logs. Verify `PGEDGE_USER`/`PGEDGE_PASSWORD` match on every node. |
+| Spock table is missing or diverged | The table likely lacks a primary key/unique index; add one, then re-run the wiring job or call `spock.repset_add_all_tables`. |
+| HAProxy marks a backend `DOWN` | Check `http://localhost:8404/`; verify the node healthcheck (`pg_isready`) and that both databases exist. |
+| `db-ready` never completes | HAProxy cannot reach the RW backend; inspect `docker compose logs haproxy` and the Spock node health. |
+| Need a clean slate | `docker compose --profile dev down -v` removes the named Spock volumes. Deleting `storage/` resets the bind-mounted Debezium/SeaweedFS state. |
+| dbt connects to the wrong port | Use `POSTGRES_*_HOST=haproxy` and `POSTGRES_*_PORT=5433`/`5434`. `POSTGRES_*_READ_PORT` is only for read-only consumers. |
 | Trino stays unhealthy | Catalogs fail if the `POSTGRES_*` env vars are missing; check `docker compose logs trino` for `${ENV:...}` resolution errors. |
 | Spark worker never registers | It waits for the `spark-master` healthcheck on port `8080`; check the master UI at <http://localhost:8082>. |
 | Spark job cannot read `s3a://` | `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` must be set on `spark-worker` and `spark-submit`, and `fs.s3a.endpoint` must point at `seaweedfs:8333`. |

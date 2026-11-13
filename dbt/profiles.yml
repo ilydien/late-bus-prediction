@@ -4,7 +4,7 @@ wmata_postgres:
     silver_wmata:
       type: postgres
       threads: 4
-      host: "{{ env_var('POSTGRES_SILVER_HOST', 'postgres-silver') }}"
+      host: "{{ env_var('POSTGRES_SILVER_HOST', 'haproxy') }}"
       port: "{{ env_var('POSTGRES_SILVER_PORT', '5433') | int }}"
       user: "{{ env_var('POSTGRES_SILVER_USER', 'postgres') }}"
       password: "{{ env_var('POSTGRES_SILVER_PASSWORD', 'postgres') }}"
@@ -14,7 +14,7 @@ wmata_postgres:
     gold_wmata:
       type: postgres
       threads: 4
-      host: "{{ env_var('POSTGRES_GOLD_HOST', 'postgres-gold') }}"
+      host: "{{ env_var('POSTGRES_GOLD_HOST', 'haproxy') }}"
       port: "{{ env_var('POSTGRES_GOLD_PORT', '5434') | int }}"
       user: "{{ env_var('POSTGRES_GOLD_USER', 'postgres') }}"
       password: "{{ env_var('POSTGRES_GOLD_PASSWORD', 'postgres') }}"
@@ -24,7 +24,7 @@ wmata_postgres:
     silver_traffic:
       type: postgres
       threads: 4
-      host: "{{ env_var('POSTGRES_SILVER_HOST', 'postgres-silver') }}"
+      host: "{{ env_var('POSTGRES_SILVER_HOST', 'haproxy') }}"
       port: "{{ env_var('POSTGRES_SILVER_PORT', '5433') | int }}"
       user: "{{ env_var('POSTGRES_SILVER_USER', 'postgres') }}"
       password: "{{ env_var('POSTGRES_SILVER_PASSWORD', 'postgres') }}"
@@ -34,7 +34,7 @@ wmata_postgres:
     gold_traffic:
       type: postgres
       threads: 4
-      host: "{{ env_var('POSTGRES_GOLD_HOST', 'postgres-gold') }}"
+      host: "{{ env_var('POSTGRES_GOLD_HOST', 'haproxy') }}"
       port: "{{ env_var('POSTGRES_GOLD_PORT', '5434') | int }}"
       user: "{{ env_var('POSTGRES_GOLD_USER', 'postgres') }}"
       password: "{{ env_var('POSTGRES_GOLD_PASSWORD', 'postgres') }}"

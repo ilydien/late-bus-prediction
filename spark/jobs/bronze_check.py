@@ -18,7 +18,7 @@ import os
 from pyspark.sql import SparkSession
 
 BRONZE_BUCKET = os.environ.get("SPARK_BRONZE_BUCKET", "wmata")
-PG_URL = os.environ.get("SPARK_PG_URL", "jdbc:postgresql://postgres-silver:5432/wmata")
+PG_URL = os.environ.get("SPARK_PG_URL", "jdbc:postgresql://haproxy:5433/wmata")
 PG_USER = os.environ.get("POSTGRES_SILVER_USER", "postgres")
 PG_PASSWORD = os.environ.get("POSTGRES_SILVER_PASSWORD", "postgres")
 

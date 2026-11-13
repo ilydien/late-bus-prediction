@@ -10,60 +10,226 @@ x-spark: &spark-image
     dockerfile: Containerfile
 
 services:
-  postgres-silver:
+  spock-silver-1:
     <<: *default-logging
-    image: docker.io/postgres:18.4-alpine3.24
+    image: ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-standard
     restart: unless-stopped
-    command: ["postgres", "-c", "wal_level=logical"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB_WMATA:-wmata}
+      POSTGRES_DB_TRAFFIC: ${POSTGRES_DB_TRAFFIC:-traffic}
       POSTGRES_USER: ${POSTGRES_SILVER_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_SILVER_PASSWORD:-postgres}
+      PGEDGE_USER: ${PGEDGE_USER:-pgedge}
+      PGEDGE_PASSWORD: ${PGEDGE_PASSWORD:-pgedge}
+      NODE_NAME: silver1
+      NODE_ORDINAL: "1"
     volumes:
-      - ./storage/postgres-silver:/var/lib/postgresql
-      - ./configs/postgres/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh
-    env_file:
-      - .env
-    ports:
-      - ${HOST_IP:-127.0.0.1}:${POSTGRES_SILVER_HOST_PORT:-5433}:5432
+      - spock-silver-1-data:/var/lib/pgsql
+      - ./configs/spock/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test:
         - "CMD-SHELL"
-        - "pg_isready -U ${POSTGRES_SILVER_USER:-postgres} -d
-          ${POSTGRES_DB_WMATA:-wmata} && pg_isready -U
-          ${POSTGRES_SILVER_USER:-postgres} -d ${POSTGRES_DB_TRAFFIC:-traffic}"
+        - "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1 &&
+          pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB_TRAFFIC} -h
+          127.0.0.1"
       interval: 5s
-      retries: 10
+      retries: 20
       timeout: 5s
+      start_period: 30s
     networks:
       - devnet
     profiles: ["dev"]
 
-  postgres-gold:
+  spock-silver-2:
     <<: *default-logging
-    image: docker.io/postgres:18.4-alpine3.24
+    image: ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-standard
     restart: unless-stopped
-    command: ["postgres", "-c", "wal_level=logical"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB_WMATA:-wmata}
-      POSTGRES_USER: ${POSTGRES_GOLD_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_GOLD_PASSWORD:-postgres}
+      POSTGRES_DB_TRAFFIC: ${POSTGRES_DB_TRAFFIC:-traffic}
+      POSTGRES_USER: ${POSTGRES_SILVER_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SILVER_PASSWORD:-postgres}
+      PGEDGE_USER: ${PGEDGE_USER:-pgedge}
+      PGEDGE_PASSWORD: ${PGEDGE_PASSWORD:-pgedge}
+      NODE_NAME: silver2
+      NODE_ORDINAL: "2"
     volumes:
-      - ./storage/postgres-gold:/var/lib/postgresql
-      - ./configs/postgres/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh
-    env_file:
-      - .env
-    ports:
-      - ${HOST_IP:-127.0.0.1}:${POSTGRES_GOLD_HOST_PORT:-5434}:5432
+      - spock-silver-2-data:/var/lib/pgsql
+      - ./configs/spock/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test:
         - "CMD-SHELL"
-        - "pg_isready -U ${POSTGRES_GOLD_USER:-postgres} -d
-          ${POSTGRES_DB_WMATA:-wmata} && pg_isready -U
-          ${POSTGRES_GOLD_USER:-postgres} -d ${POSTGRES_DB_TRAFFIC:-traffic}"
+        - "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1 &&
+          pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB_TRAFFIC} -h
+          127.0.0.1"
       interval: 5s
-      retries: 10
+      retries: 20
       timeout: 5s
+      start_period: 30s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  spock-gold-1:
+    <<: *default-logging
+    image: $ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-standard
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB_WMATA:-wmata}
+      POSTGRES_DB_TRAFFIC: ${POSTGRES_DB_TRAFFIC:-traffic}
+      POSTGRES_USER: ${POSTGRES_GOLD_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_GOLD_PASSWORD:-postgres}
+      PGEDGE_USER: ${PGEDGE_USER:-pgedge}
+      PGEDGE_PASSWORD: ${PGEDGE_PASSWORD:-pgedge}
+      NODE_NAME: gold1
+      NODE_ORDINAL: "1"
+    volumes:
+      - spock-gold-1-data:/var/lib/pgsql
+      - ./configs/spock/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1 &&
+          pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB_TRAFFIC} -h
+          127.0.0.1"
+      interval: 5s
+      retries: 20
+      timeout: 5s
+      start_period: 30s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  spock-gold-2:
+    <<: *default-logging
+    image: ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-standard
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB_WMATA:-wmata}
+      POSTGRES_DB_TRAFFIC: ${POSTGRES_DB_TRAFFIC:-traffic}
+      POSTGRES_USER: ${POSTGRES_GOLD_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_GOLD_PASSWORD:-postgres}
+      PGEDGE_USER: ${PGEDGE_USER:-pgedge}
+      PGEDGE_PASSWORD: ${PGEDGE_PASSWORD:-pgedge}
+      NODE_NAME: gold2
+      NODE_ORDINAL: "2"
+    volumes:
+      - spock-gold-2-data:/var/lib/pgsql
+      - ./configs/spock/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1 &&
+          pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB_TRAFFIC} -h
+          127.0.0.1"
+      interval: 5s
+      retries: 20
+      timeout: 5s
+      start_period: 30s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  spock-wire-silver:
+    <<: *default-logging
+    image: ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-standard
+    restart: "no"
+    entrypoint: ["/bin/bash", "/wire/run.sh"]
+    environment:
+      NODES: silver1:spock-silver-1,silver2:spock-silver-2
+      DATABASES: "${POSTGRES_DB_WMATA:-wmata} ${POSTGRES_DB_TRAFFIC:-traffic}"
+      ADMIN_USER: ${POSTGRES_SILVER_USER:-postgres}
+      ADMIN_PASSWORD: ${POSTGRES_SILVER_PASSWORD:-postgres}
+      REPL_USER: ${PGEDGE_USER:-pgedge}
+      REPL_PASSWORD: ${PGEDGE_PASSWORD:-pgedge}
+    volumes:
+      - ./configs/spock/wire:/wire:ro
+    depends_on:
+      spock-silver-1:
+        condition: service_healthy
+      spock-silver-2:
+        condition: service_healthy
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  spock-wire-gold:
+    <<: *default-logging
+    image: ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-standard
+    restart: "no"
+    entrypoint: ["/bin/bash", "/wire/run.sh"]
+    environment:
+      NODES: gold1:spock-gold-1,gold2:spock-gold-2
+      DATABASES: "${POSTGRES_DB_WMATA:-wmata} ${POSTGRES_DB_TRAFFIC:-traffic}"
+      ADMIN_USER: ${POSTGRES_GOLD_USER:-postgres}
+      ADMIN_PASSWORD: ${POSTGRES_GOLD_PASSWORD:-postgres}
+      REPL_USER: ${PGEDGE_USER:-pgedge}
+      REPL_PASSWORD: ${PGEDGE_PASSWORD:-pgedge}
+    volumes:
+      - ./configs/spock/wire:/wire:ro
+    depends_on:
+      spock-gold-1:
+        condition: service_healthy
+      spock-gold-2:
+        condition: service_healthy
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  # Single entry point for both clusters. Mode A routes writes to node 1 and
+  # keeps node 2 as a hot backup; read-only ports round-robin both nodes.
+  haproxy:
+    <<: *default-logging
+    image: docker.io/haproxy:3.2-alpine
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:5433:5433
+      - ${HOST_IP:-127.0.0.1}:5434:5434
+      - ${HOST_IP:-127.0.0.1}:5435:5435
+      - ${HOST_IP:-127.0.0.1}:5436:5436
+      - ${HOST_IP:-127.0.0.1}:8404:8404
+    volumes:
+      - ./configs/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      spock-silver-1:
+        condition: service_started
+      spock-silver-2:
+        condition: service_started
+      spock-gold-1:
+        condition: service_started
+      spock-gold-2:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8404/ || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - devnet
+    profiles: ["dev"]
+
+  # Gate for one-shot clients: wait until HAProxy has a reachable backend.
+  db-ready:
+    <<: *default-logging
+    image: docker.io/postgres:18.4-alpine3.24
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $(seq 1 90); do
+          pg_isready -h haproxy -p 5433 -U ${POSTGRES_SILVER_USER:-postgres} >/dev/null 2>&1 && break
+          sleep 2
+        done
+        pg_isready -h haproxy -p 5433 -U ${POSTGRES_SILVER_USER:-postgres} || exit 1
+        for i in $(seq 1 90); do
+          pg_isready -h haproxy -p 5434 -U ${POSTGRES_GOLD_USER:-postgres} >/dev/null 2>&1 && break
+          sleep 2
+        done
+        pg_isready -h haproxy -p 5434 -U ${POSTGRES_GOLD_USER:-postgres} || exit 1
+    depends_on:
+      haproxy:
+        condition: service_healthy
     networks:
       - devnet
     profiles: ["dev"]
@@ -317,8 +483,10 @@ services:
       - ./configs/debezium/wmata.properties:/debezium/config/application.properties:ro
       - ./storage/debezium/wmata:/debezium/data
     depends_on:
-      postgres-silver:
-        condition: service_healthy
+      db-ready:
+        condition: service_completed_successfully
+      spock-wire-silver:
+        condition: service_completed_successfully
       nats-init:
         condition: service_completed_successfully
     healthcheck:
@@ -342,8 +510,10 @@ services:
       - ./configs/debezium/traffic.properties:/debezium/config/application.properties:ro
       - ./storage/debezium/traffic:/debezium/data
     depends_on:
-      postgres-silver:
-        condition: service_healthy
+      db-ready:
+        condition: service_completed_successfully
+      spock-wire-silver:
+        condition: service_completed_successfully
       nats-init:
         condition: service_completed_successfully
     healthcheck:
@@ -565,8 +735,10 @@ services:
     env_file:
       - .env
     depends_on:
-      postgres-silver:
-        condition: service_healthy
+      db-ready:
+        condition: service_completed_successfully
+      spock-wire-silver:
+        condition: service_completed_successfully
     volumes:
       - ./dbt:/usr/app
     entrypoint: ["dbt"]
@@ -582,9 +754,9 @@ services:
       dockerfile: Containerfile
     restart: "no"
     environment:
-      POSTGRES_INFRA_USER: ${POSTGRES_INFRA_USER:-postgres-infra}
-      POSTGRES_INFRA_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres-infra}
-      DESTINATION__POSTGRES__CREDENTIALS__PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres-infra}
+      POSTGRES_INFRA_USER: ${POSTGRES_INFRA_USER:-postgres}
+      POSTGRES_INFRA_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+      DESTINATION__POSTGRES__CREDENTIALS__PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
     volumes:
       - ./dlt:/app
       - ./shared:/app/shared:ro
@@ -607,10 +779,12 @@ services:
     volumes:
       - ./configs/trino:/etc/trino:ro
     depends_on:
-      postgres-silver:
-        condition: service_healthy
-      postgres-gold:
-        condition: service_healthy
+      db-ready:
+        condition: service_completed_successfully
+      spock-wire-silver:
+        condition: service_completed_successfully
+      spock-wire-gold:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/usr/lib/trino/bin/health-check"]
       interval: 15s
@@ -621,8 +795,6 @@ services:
       - devnet
     profiles: ["dev"]
 
-  # Standalone Spark cluster. All three services share one image (x-spark) with
-  # the S3A + PostgreSQL JDBC jars baked in.
   spark-master:
     <<: [*default-logging, *spark-image]
     restart: unless-stopped
@@ -687,9 +859,6 @@ services:
       - devnet
     profiles: ["dev"]
 
-  # One-shot submitter. Example:
-  #   docker compose -f compose.dev.yaml --profile dev run --rm spark-submit \
-  #     --master spark://spark-master:7077 /opt/spark/jobs/bronze_check.py
   spark-submit:
     <<: [*default-logging, *spark-image]
     restart: "no"
@@ -708,13 +877,16 @@ services:
     depends_on:
       spark-master:
         condition: service_healthy
-      postgres-silver:
-        condition: service_healthy
+      db-ready:
+        condition: service_completed_successfully
+      spock-wire-silver:
+        condition: service_completed_successfully
       seaweedfs:
         condition: service_started
     networks:
       - devnet
     profiles: ["dev"]
+
   # dlt-demand-nemweb:
   #   <<: *default-logging
   #   build:
@@ -875,3 +1047,9 @@ networks:
   devnet:
     name: devnet
     driver: bridge
+
+volumes:
+  spock-silver-1-data:
+  spock-silver-2-data:
+  spock-gold-1-data:
+  spock-gold-2-data:

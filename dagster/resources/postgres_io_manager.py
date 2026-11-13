@@ -8,10 +8,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 class PostgresIOManager(ConfigurableIOManager):
     host: str = os.environ.get(
-        "PG_HOST", os.environ.get("POSTGRES_SILVER_HOST", "postgres-silver")
+        "PG_HOST", os.environ.get("POSTGRES_SILVER_HOST", "haproxy")
     )
     port: int = int(
-        os.environ.get("PG_PORT", os.environ.get("POSTGRES_SILVER_PORT", "5432"))
+        os.environ.get("PG_PORT", os.environ.get("POSTGRES_SILVER_PORT", "5433"))
     )
     user: str = os.environ.get(
         "PG_USER", os.environ.get("POSTGRES_SILVER_USER", "postgres")
