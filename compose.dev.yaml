@@ -37,7 +37,7 @@ services:
       timeout: 5s
       start_period: 30s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   spock-silver-2:
@@ -67,7 +67,7 @@ services:
       timeout: 5s
       start_period: 30s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   spock-gold-1:
@@ -97,7 +97,7 @@ services:
       timeout: 5s
       start_period: 30s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   spock-gold-2:
@@ -127,7 +127,7 @@ services:
       timeout: 5s
       start_period: 30s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   spock-wire-silver:
@@ -150,7 +150,7 @@ services:
       spock-silver-2:
         condition: service_healthy
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   spock-wire-gold:
@@ -173,7 +173,7 @@ services:
       spock-gold-2:
         condition: service_healthy
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   # Single entry point for both clusters. Mode A routes writes to node 1 and
@@ -206,7 +206,7 @@ services:
       retries: 12
       start_period: 10s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   # Gate for one-shot clients: wait until HAProxy has a reachable backend.
@@ -231,7 +231,7 @@ services:
       haproxy:
         condition: service_healthy
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   postgres-infra:
@@ -261,7 +261,7 @@ services:
       retries: 10
       timeout: 5s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   seaweedfs:
@@ -289,7 +289,7 @@ services:
       retries: 10
       start_period: 20s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   seaweedfs-init:
@@ -309,7 +309,7 @@ services:
       seaweedfs:
         condition: service_started
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   seaweedfs-bridge:
@@ -337,7 +337,7 @@ services:
       retries: 10
       start_period: 10s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   victoriametrics:
@@ -367,7 +367,7 @@ services:
       retries: 10
       start_period: 5s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   victorialogs:
@@ -389,7 +389,7 @@ services:
       retries: 10
       start_period: 5s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   vector:
@@ -403,7 +403,7 @@ services:
       victorialogs:
         condition: service_healthy
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   nats:
@@ -423,7 +423,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   nats-init:
@@ -453,7 +453,7 @@ services:
       nats:
         condition: service_healthy
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   nats-nui:
@@ -469,7 +469,7 @@ services:
       nats:
         condition: service_started
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   debezium-wmata:
@@ -496,7 +496,7 @@ services:
       retries: 3
       start_period: 30s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   debezium-traffic:
@@ -523,7 +523,7 @@ services:
       retries: 3
       start_period: 30s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   dagster-user-code:
@@ -565,7 +565,7 @@ services:
       retries: 10
       start_period: 60s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   dagster-webserver:
@@ -609,7 +609,7 @@ services:
       dagster-user-code:
         condition: service_healthy
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   dagster-daemon:
@@ -646,7 +646,7 @@ services:
       dagster-user-code:
         condition: service_healthy
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   mlflow:
@@ -686,7 +686,7 @@ services:
       seaweedfs-init:
         condition: service_completed_successfully
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   # inference:
@@ -723,7 +723,7 @@ services:
   #     nats-init:
   #       condition: service_completed_successfully
   #   networks:
-  #     - devnet
+  #     - wmata-lateness-dev
   #   profiles: ["dev"]
 
   dbt:
@@ -744,7 +744,7 @@ services:
     entrypoint: ["dbt"]
     working_dir: /usr/app
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   dlt:
@@ -762,7 +762,7 @@ services:
       - ./shared:/app/shared:ro
     working_dir: /app
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   trino:
@@ -792,7 +792,7 @@ services:
       retries: 10
       start_period: 30s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   spark-master:
@@ -821,7 +821,7 @@ services:
       retries: 10
       start_period: 20s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   spark-worker:
@@ -856,7 +856,7 @@ services:
       retries: 10
       start_period: 20s
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
 
   spark-submit:
@@ -884,9 +884,8 @@ services:
       seaweedfs:
         condition: service_started
     networks:
-      - devnet
+      - wmata-lateness-dev
     profiles: ["dev"]
-
   # dlt-demand-nemweb:
   #   <<: *default-logging
   #   build:
@@ -907,7 +906,7 @@ services:
   #     postgres:
   #       condition: service_healthy
   #   networks:
-  #     - devnet
+  #     - wmata-lateness-dev
   #   profiles: ["dev"]
 
   # dlt-wmata-poller
@@ -930,7 +929,7 @@ services:
   #     postgres:
   #       condition: service_healthy
   #   networks:
-  #     - devnet
+  #     - wmata-lateness-dev
   #   profiles: ["dev"]
 
   # dashboard-backend:
@@ -974,7 +973,7 @@ services:
   #     retries: 3
   #     start_period: 30s
   #   networks:
-  #     - devnet
+  #     - wmata-lateness-dev
   #   profiles: ["dev"]
 
   # dashboard-frontend:
@@ -995,7 +994,7 @@ services:
   #     - ./dashboard/frontend:/app
   #     - /app/node_modules
   #   networks:
-  #     - devnet
+  #     - wmata-lateness-dev
   #   environment:
   #     - NODE_ENV=development
   #   profiles: ["dev"]
@@ -1011,7 +1010,7 @@ services:
   #   volumes:
   #     - ./configs/dashboard/Caddyfile:/etc/caddy/Caddyfile:ro
   #   networks:
-  #     - devnet
+  #     - wmata-lateness-dev
   #   profiles: ["dev"]
 
   # monitor:
@@ -1040,12 +1039,11 @@ services:
   #     victoriametrics:
   #       condition: service_healthy
   #   networks:
-  #     - devnet
+  #     - wmata-lateness-dev
   #   profiles: ["dev"]
 
 networks:
-  devnet:
-    name: devnet
+  wmata-lateness-dev:
     driver: bridge
 
 volumes:
