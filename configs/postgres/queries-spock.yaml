@@ -1,0 +1,43 @@
+pg_table_live_tuples:
+  query: |
+    SELECT
+      current_database() AS datname,
+      schemaname,
+      relname,
+      n_live_tup,
+      n_dead_tup
+    FROM pg_stat_user_tables
+  metrics:
+    - datname:
+        usage: "LABEL"
+        description: "Database name"
+    - schemaname:
+        usage: "LABEL"
+        description: "Schema name"
+    - relname:
+        usage: "LABEL"
+        description: "Table name"
+    - n_live_tup:
+        usage: "GAUGE"
+        description: "Estimated live rows in table"
+    - n_dead_tup:
+        usage: "GAUGE"
+        description: "Estimated dead rows in table"
+
+spock_subscription:
+  query: |
+    SELECT
+      current_database() AS datname,
+      subscription_name,
+      CASE WHEN status = 'replicating' THEN 1 ELSE 0 END AS is_replicating
+    FROM spock.sub_show_status()
+  metrics:
+    - datname:
+        usage: "LABEL"
+        description: "Database name"
+    - subscription_name:
+        usage: "LABEL"
+        description: "Spock subscription name"
+    - is_replicating:
+        usage: "GAUGE"
+        description: "1 if Spock subscription status is replicating, else 0"

@@ -1,0 +1,25 @@
+pg_table_live_tuples:
+  query: |
+    SELECT
+      current_database() AS datname,
+      schemaname,
+      relname,
+      n_live_tup,
+      n_dead_tup
+    FROM pg_stat_user_tables
+  metrics:
+    - datname:
+        usage: "LABEL"
+        description: "Database name"
+    - schemaname:
+        usage: "LABEL"
+        description: "Schema name"
+    - relname:
+        usage: "LABEL"
+        description: "Table name"
+    - n_live_tup:
+        usage: "GAUGE"
+        description: "Estimated live rows in table"
+    - n_dead_tup:
+        usage: "GAUGE"
+        description: "Estimated dead rows in table"
