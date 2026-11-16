@@ -2,7 +2,7 @@
 
 A medallion-architecture data platform for **WMATA** (Washington Metropolitan Area Transit Authority) transit and traffic data. Bronze objects live in **SeaweedFS** (S3), silver and gold tables live in two-node **PostgreSQL + Spock** multi-master clusters, and changes are streamed into **NATS JetStream** through **Debezium** and SeaweedFS filer webhooks. Every database client reaches the silver and gold clusters through **HAProxy**.
 
-> **Status:** infrastructure scaffold, validated end to end on a local Docker host. Containers, databases, buckets, streams, CDC wiring, Spock replication and HAProxy routing are in place and smoke-tested. dbt models, Dagster assets, dlt pipelines, ML inference and the dashboard are still placeholders — see [Status & Roadmap](#status--roadmap).
+> **Status:** infrastructure scaffold, validated end to end on a local Docker host. Containers, databases, buckets, streams, CDC wiring, Spock replication and HAProxy routing are in place and smoke-tested. Batch bronze/silver/gold, ML training and the weekly retraining scaffold are implemented; the retraining schedule is intentionally **STOPPED** until live 2026 data exists. dbt models, dlt pipelines, ML inference and the dashboard are still placeholders — see [Status & Roadmap](#status--roadmap) and [docs/retraining.md](docs/retraining.md).
 
 ---
 
@@ -576,10 +576,11 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 | Trino catalogs over silver/gold Postgres | Implemented; four catalogs verified |
 | Silver CDC configuration | Implemented; change event validated on a probe table |
 | dbt models | Placeholder (`.gitkeep` only, `sources.yml` has `PLACEHOLDER_TABLE`); project parses |
-| Dagster assets, jobs, schedules | Placeholder (`assets=[]`, no schedules); webserver, daemon and user code healthy |
+| Dagster assets, jobs, schedules | Weekly retrain assets/job implemented; schedule **STOPPED** until live 2026 data exists |
 | MLflow tracking | Implemented (healthy; Postgres backend, SeaweedFS artifacts) |
 | dlt pipelines | Placeholder (image only) |
-| ML training / MLflow experiments | Not started |
+| ML training / MLflow experiments | Implemented; M2/M3 logged, champion v1, challenger v2; artifacts in `s3://mlflow/` |
+| Weekly retraining | Implemented in [docs/retraining.md](docs/retraining.md); incremental gold + MLflow promotion gate |
 | Inference service | Commented out in `compose.dev.yaml` |
 | Dashboard backend / frontend | Commented out; source not present |
 | Great Expectations suites | Library installed, no suites |
