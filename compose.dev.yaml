@@ -380,12 +380,6 @@ services:
       - "-storageDataPath=/vlogs"
       - "-httpListenAddr=:9428"
       - "-retentionPeriod=${VL_RETENTION:-3M}"
-    healthcheck:
-      test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:9428/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
     networks:
       - wmata-lateness-dev
     profiles: ["dev"]
@@ -399,7 +393,7 @@ services:
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
     depends_on:
       victorialogs:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:8686/health"]
       interval: 15s
@@ -436,16 +430,18 @@ services:
     entrypoint: ["sh", "-c"]
     command:
       - |
+        set -e
         echo "Waiting for NATS..."
         until nc -z nats 4222; do sleep 1; done
         echo "Creating bronze/silver/inference streams..."
         create_stream() {
-          name="$1"; subjects="$2"; max_age="$3"; max_bytes="$4"
-          nats -s nats:4222 stream info "$name" >/dev/null 2>&1 || \
-            nats -s nats:4222 stream add "$name" \
-              --subjects "$subjects" --storage file --retention limits \
-              --discard old --max-msgs=-1 --max-bytes="$max_bytes" \
-              --max-age "$max_age" --dupe-window 2m
+          name="$$1"; subjects="$$2"; max_age="$$3"; max_bytes="$$4"
+          nats -s nats:4222 stream info "$$name" >/dev/null 2>&1 || \
+            nats -s nats:4222 stream add "$$name" \
+              --defaults \
+              --subjects "$$subjects" --storage file --retention limits \
+              --discard old --max-msgs=-1 --max-bytes="$$max_bytes" \
+              --max-age "$$max_age" --dupe-window 2m
         }
         create_stream wmata-bronze    "wmata.realtime.bronze_data,wmata.realtime.bronze_data.>"       3d 2GB
         create_stream traffic-bronze  "traffic.realtime.bronze_data,traffic.realtime.bronze_data.>"   3d 2GB
@@ -1094,6 +1090,9 @@ services:
     <<: *default-logging
     image: ghcr.io/google/cadvisor:v0.60.6
     restart: unless-stopped
+    command:
+      - "--docker_only=true"
+      - "--disable_metrics=advtcp,cpu_topology,cpuset,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp"
     volumes:
       - /:/rootfs:ro
       - /var/run:/var/run:ro
@@ -1147,7 +1146,7 @@ services:
       victoriametrics:
         condition: service_healthy
       victorialogs:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test:
         [
@@ -1208,7 +1207,7 @@ services:
       victoriametrics:
         condition: service_healthy
       victorialogs:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:3000/api/health"]
       interval: 15s
