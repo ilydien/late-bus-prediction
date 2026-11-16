@@ -1,6 +1,6 @@
 # Standar Observability: Log, Metrik & Healthcheck
 
-Dokumen ini adalah kontrak bersama seluruh tim (`late-bus-prediction`) agar log, metrik, dan healthcheck dari setiap komponen (ingestion, batch/dbt, MLflow/inference, API/serving, infra) seragam dan dapat ditelusuri di **VictoriaMetrics**, **VictoriaLogs**, dan **Grafana**.
+Dokumen ini adalah kontrak bersama seluruh tim (`late-bus-prediction`) agar log, metrik, dan healthcheck dari setiap komponen (ingestion, batch/dbt, MLflow/inference, API/serving, infra) seragam dan dapat ditelusuri di **VictoriaMetrics**, **VictoriaLogs**, dan **React Monitoring Dashboard**.
 
 ---
 

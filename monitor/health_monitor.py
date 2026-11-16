@@ -11,6 +11,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +49,7 @@ TRINO_URL = os.environ.get("TRINO_URL", "http://trino:8080")
 VM_URL = os.environ.get("VM_URL", "http://victoriametrics:8428")
 VL_URL = os.environ.get("VL_URL", "http://victorialogs:9428")
 VECTOR_URL = os.environ.get("VECTOR_URL", "http://vector:8686")
+VMALERT_URL = os.environ.get("VMALERT_URL", "http://vmalert:8880")
 
 _STATE_LOCK = threading.Lock()
 _latest_checks: dict[str, dict[str, object]] = {}
@@ -270,8 +272,94 @@ def handle_alertmanager_payload(payload: object) -> int:
     return processed
 
 
+def _fetch_json(url: str, timeout: int = 5) -> object | None:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _query_vm(promql: str) -> list[dict[str, object]]:
+    encoded = urllib.parse.urlencode({"query": promql})
+    data = _fetch_json(f"{VM_URL.rstrip('/')}/api/v1/query?{encoded}")
+    if not isinstance(data, dict):
+        return []
+    result = data.get("data", {}).get("result", [])
+    rows: list[dict[str, object]] = []
+    for item in result:
+        val = item.get("value", [None, None])
+        try:
+            num = float(val[1])
+        except (TypeError, ValueError, IndexError):
+            num = 0.0
+        rows.append({"labels": item.get("metric", {}), "value": num})
+    return rows
+
+
+def build_monitoring_summary() -> dict[str, object]:
+    """Build a unified monitoring JSON snapshot for the React dashboard."""
+    with _STATE_LOCK:
+        services = dict(_latest_checks)
+        host = dict(_latest_host_metrics)
+        last_run = _last_run_ts
+
+    alerts_raw = _fetch_json(f"{VMALERT_URL.rstrip('/')}/api/v1/alerts")
+    alerts = alerts_raw.get("data", {}).get("alerts", []) if isinstance(alerts_raw, dict) else []
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "last_probe_ts": last_run,
+        "services": services,
+        "host": host,
+        "alerts": alerts,
+        "metrics": {
+            "container_cpu_pct": _query_vm('sum by (name) (rate(container_cpu_usage_seconds_total{name!=""}[1m])) * 100'),
+            "container_memory_bytes": _query_vm('container_memory_working_set_bytes{name!=""}'),
+            "nats_stream_messages": _query_vm("jetstream_stream_total_messages"),
+            "nats_consumer_pending": _query_vm("jetstream_consumer_num_pending"),
+            "pg_up": _query_vm("pg_up"),
+            "spock_replicating": _query_vm("spock_subscription_is_replicating"),
+        },
+    }
+
+
+def query_logs(
+    service: str = "",
+    level: str = "",
+    run_id: str = "",
+    limit: int = 50,
+) -> dict[str, object]:
+    """Query structured logs from VictoriaLogs for dashboard log exploration."""
+    terms: list[str] = []
+    for key, val in (("service", service), ("level", level), ("run_id", run_id)):
+        clean = val.strip().replace('"', "")
+        if clean:
+            terms.append(f'{key}:"{clean}"')
+    logsql = " ".join(terms) if terms else "*"
+    bounded_limit = max(1, min(int(limit), 200))
+    params = urllib.parse.urlencode({"query": logsql, "limit": str(bounded_limit)})
+    url = f"{VL_URL.rstrip('/')}/select/logsql/query?{params}"
+
+    entries: list[dict[str, object]] = []
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            for raw_line in resp.read().decode("utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as exc:
+        logger.warning("VictoriaLogs query failed: %s", exc)
+
+    return {"query": logsql, "count": len(entries), "logs": entries}
+
+
 class MonitorHandler(BaseHTTPRequestHandler):
-    """HTTP handler serving /health, /metrics, and /api/v2/alerts for vmalert."""
+    """HTTP handler serving /health, /metrics, /api/monitoring/*, and /api/v2/alerts."""
 
     server_version = "wmata-health-monitor/1.0"
 
@@ -282,11 +370,19 @@ class MonitorHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(data)
 
+    def do_OPTIONS(self) -> None:
+        self._send_bytes(204, "text/plain; charset=utf-8", b"")
+
     def do_GET(self) -> None:
-        if self.path == "/health":
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path == "/health":
             with _STATE_LOCK:
                 checks = {k: v["status"] for k, v in _latest_checks.items()}
                 last_run = _last_run_ts
@@ -300,9 +396,26 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 }
             ).encode("utf-8")
             self._send_bytes(200, "application/json", body)
-        elif self.path == "/metrics":
+        elif path == "/metrics":
             body = render_prometheus_metrics().encode("utf-8")
             self._send_bytes(200, "text/plain; version=0.0.4; charset=utf-8", body)
+        elif path == "/api/monitoring/summary":
+            body = json.dumps(build_monitoring_summary()).encode("utf-8")
+            self._send_bytes(200, "application/json", body)
+        elif path == "/api/monitoring/logs":
+            qs = urllib.parse.parse_qs(parsed.query)
+            limit_raw = qs.get("limit", ["50"])[0]
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                limit = 50
+            result = query_logs(
+                service=qs.get("service", [""])[0],
+                level=qs.get("level", [""])[0],
+                run_id=qs.get("run_id", [""])[0],
+                limit=limit,
+            )
+            self._send_bytes(200, "application/json", json.dumps(result).encode("utf-8"))
         else:
             self._send_bytes(404, "text/plain; charset=utf-8", b"not found")
 

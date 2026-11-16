@@ -76,3 +76,30 @@ def test_handle_alertmanager_firing_and_resolved_lifecycle():
         # A duplicate resolved when not firing should not spam Telegram
         assert health_monitor.handle_alertmanager_payload(resolved_payload) == 1
         assert mock_send.call_count == 2
+
+
+def test_build_monitoring_summary_and_query_logs():
+    def fake_fetch(url: str, timeout: int = 5):
+        if "/api/v1/alerts" in url:
+            return {"data": {"alerts": [{"name": "ServiceDown", "state": "inactive"}]}}
+        if "/api/v1/query" in url:
+            return {"data": {"result": [{"metric": {"layer": "silver"}, "value": [1700000000, "1"]}]}}
+        return None
+
+    with patch("monitor.health_monitor._fetch_json", side_effect=fake_fetch):
+        summary = health_monitor.build_monitoring_summary()
+
+    assert "services" in summary
+    assert "metrics" in summary
+    assert len(summary["alerts"]) == 1
+    assert summary["metrics"]["spock_replicating"][0]["value"] == 1.0
+
+    ndjson = b'{"_msg":"ok","run_id":"run-123","service":"health-monitor"}\n'
+    with patch("monitor.health_monitor.urllib.request.urlopen") as mock_open:
+        mock_open.return_value.__enter__.return_value.read.return_value = ndjson
+        logs = health_monitor.query_logs(service="health-monitor", run_id="run-123", limit=10)
+
+    assert logs["count"] == 1
+    assert logs["logs"][0]["run_id"] == "run-123"
+    assert 'service:"health-monitor"' in logs["query"]
+    assert 'run_id:"run-123"' in logs["query"]

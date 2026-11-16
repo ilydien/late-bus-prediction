@@ -46,8 +46,5 @@ set_conf spock.save_resolutions on
 # per database by 40-extensions.sh.
 set_conf snowflake.node "${NODE_ORDINAL}"
 
-# CVE-2026-6471 added output_plugin_libraries; only set it when the server
-# actually knows the parameter, otherwise PostgreSQL refuses to start.
-if postgres --describe-config 2>/dev/null | grep -q '^output_plugin_libraries'; then
-  set_conf output_plugin_libraries "'pgoutput, test_decoding, spock_output'"
-fi
+# CVE-2026-6471 added output_plugin_libraries; spock_output must be trusted for Spock replication slots.
+set_conf output_plugin_libraries "'pgoutput, test_decoding, spock_output'"

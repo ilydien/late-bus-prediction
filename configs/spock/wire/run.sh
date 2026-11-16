@@ -60,6 +60,14 @@ read -r -a DB_ENTRIES <<<"${DATABASES}"
 
 for entry in "${NODE_ENTRIES[@]}"; do
   wait_for_node "${entry#*:}"
+  host="${entry#*:}"
+  opl="$(query_admin "${host}" "postgres" "SHOW output_plugin_libraries" || true)"
+  if [ -n "${opl}" ] && ([[ "${opl}" != *"spock_output"* ]] || [[ "${opl}" == *'"'* ]]); then
+    echo "enabling spock_output in output_plugin_libraries on ${host}"
+    psql_admin "${host}" "postgres" \
+      "ALTER SYSTEM SET output_plugin_libraries = pgoutput, test_decoding, spock_output"
+    psql_admin "${host}" "postgres" "SELECT pg_reload_conf()"
+  fi
 done
 
 for db in "${DB_ENTRIES[@]}"; do
@@ -113,7 +121,7 @@ for db in "${DB_ENTRIES[@]}"; do
 
       sub_name="sub_${local_name}_${peer_name}_${db}"
       status_count="$(query_admin "${local_host}" "${db}" \
-        "SELECT count(*) FROM spock.sub_show_status('${sub_name}')")"
+        "SELECT count(*) FROM spock.subscription WHERE sub_name = '${sub_name}'")"
 
       if [ "${status_count}" = "0" ]; then
         dsn="host=${peer_host} port=5432 dbname=${db} user=${REPL_USER} password=${REPL_PASSWORD}"
