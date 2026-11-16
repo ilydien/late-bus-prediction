@@ -1,0 +1,7 @@
+FROM wmata-lateness-spark-master:latest
+
+USER root
+RUN pip install --no-cache-dir nats-py boto3
+USER 185
+
+WORKDIR /app

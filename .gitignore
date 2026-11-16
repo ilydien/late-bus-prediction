@@ -8,7 +8,8 @@
 dlt/state/
 
 # Data storage
-storage/
+storage
+data/
 
 # Python
 __pycache__/

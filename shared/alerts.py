@@ -41,7 +41,7 @@ def send_alert(
         return False
 
     emoji = {"CRITICAL": "\u26a0\ufe0f", "WARNING": "\u26a0\ufe0f", "INFO": "\U0001f514"}.get(level, "\U0001f514")
-    text = f"{emoji} *[{level}]* VoltaicAlert\n\n{message}"
+    text = f"{emoji} *[{level}]* WMATALateness\n\n{message}"
 
     payload = urllib.parse.urlencode(
         {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}

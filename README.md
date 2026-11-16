@@ -2,7 +2,7 @@
 
 A medallion-architecture data platform for **WMATA** (Washington Metropolitan Area Transit Authority) transit and traffic data. Bronze objects live in **SeaweedFS** (S3), silver and gold tables live in two-node **PostgreSQL + Spock** multi-master clusters, and changes are streamed into **NATS JetStream** through **Debezium** and SeaweedFS filer webhooks. Every database client reaches the silver and gold clusters through **HAProxy**.
 
-> **Status:** infrastructure scaffold. Containers, databases, buckets, streams, CDC wiring, Spock replication and HAProxy routing are in place. dbt models, Dagster assets, dlt pipelines, ML inference and the dashboard are still placeholders — see [Status & Roadmap](#status--roadmap).
+> **Status:** infrastructure scaffold, validated end to end on a local Docker host. Containers, databases, buckets, streams, CDC wiring, Spock replication and HAProxy routing are in place and smoke-tested. dbt models, Dagster assets, dlt pipelines, ML inference and the dashboard are still placeholders — see [Status & Roadmap](#status--roadmap).
 
 ---
 
@@ -116,9 +116,10 @@ The infrastructure database (`postgres-infra`) is separate and remains a single 
 ├── dbt/
 │   ├── dbt_project.yml
 │   ├── profiles.yml            # Four targets: silver/gold x wmata/traffic
+│   ├── macros/                 # Empty; declared in macro-paths
 │   └── models/
 │       ├── sources.yml         # Single `silver` source, no fixed database
-│       ├── silver/traffic/
+│       ├── silver/{wmata,traffic}/
 │       └── gold/{wmata,traffic}/
 ├── dlt/
 │   └── Containerfile           # Ingestion image only (no pipelines yet)
@@ -166,10 +167,10 @@ The infrastructure database (`postgres-infra`) is separate and remains a single 
 
 ### Event payloads
 
-- **Bronze:** the raw SeaweedFS envelope
+- **Bronze:** the raw SeaweedFS envelope (SeaweedFS 4.53 uses `message`, which holds the filer `old_entry`/`new_entry`)
 
   ```json
-  {"key": "/buckets/wmata/...", "event_type": "create", "message_data": {...}}
+  {"event_type": "create", "key": "/buckets/wmata/...", "message": {...}}
   ```
 
 - **Silver:** Debezium change events on `<domain>.realtime.silver_data.public.<table>`.
@@ -290,10 +291,11 @@ Open <http://localhost:31311> and the connections are already listed.
 | Jar | Why |
 |-----|-----|
 | `hadoop-aws:3.5.0` | S3A filesystem (matches the Hadoop bundled with Spark 4.3) |
+| `analyticsaccelerator-s3:1.3.1` | Required by hadoop-aws 3.5; S3A fails with `ClassNotFoundException` without it |
 | `software.amazon.awssdk:bundle:2.35.4` | AWS SDK v2 used by `hadoop-aws` |
 | `postgresql:42.7.14` | JDBC driver for the silver/gold clusters |
 
-`spark/conf/spark-defaults.conf` points S3A at `http://seaweedfs:8333` (path-style, no TLS) and takes credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, which compose sets from the `SEAWEEDFS_*` variables. No secrets are stored in the config file.
+`spark/conf/spark-defaults.conf` points S3A at `http://seaweedfs:8333` (path-style, no TLS) and takes credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, which compose sets from the `SEAWEEDFS_*` variables. No secrets are stored in the config file. The explicit credential-provider class was removed because hadoop-aws 3.5 dropped `EnvironmentVariableCredentialsProvider`; the SDK v2 default chain reads the same environment variables.
 
 ```bash
 # Connectivity check: SeaweedFS over S3A + PostgreSQL over JDBC
@@ -362,6 +364,7 @@ The Dagster user-code image also installs `great_expectations`, `xgboost`, `scik
 ## Prerequisites
 
 - Docker or Podman with Compose v2 (`docker compose`, not `docker-compose`)
+- A POSIX filesystem for `storage/` (ext4, xfs, btrfs, ...). `postgres-infra` runs `initdb`, which cannot `chmod` its data directory on NTFS/exFAT/SMB mounts; if the repo lives on one, point `storage/` at a POSIX path with a symlink
 - (Optional) AWS CLI or any S3 client for the smoke tests
 - (Optional) Telegram bot token + chat ID for alerts
 
@@ -381,9 +384,12 @@ Environment groups:
 |-------|-----------|
 | Host binding | `HOST_IP` |
 | Databases | `POSTGRES_DB_{INFRA,WMATA,TRAFFIC}`, `POSTGRES_{INFRA,SILVER,GOLD}_{HOST,USER,PASSWORD,PORT,READ_PORT,HOST_PORT}` |
+| Host ports | `POSTGRES_SILVER_READ_HOST_PORT`, `POSTGRES_GOLD_READ_HOST_PORT`, `HAPROXY_STATS_HOST_PORT`, `MLFLOW_HOST_PORT` |
 | Retention | `VM_RETENTION`, `VL_RETENTION` |
 | SeaweedFS | `SEAWEEDFS_S3_ENDPOINT`, `SEAWEEDFS_ACCESS_KEY`, `SEAWEEDFS_SECRET_KEY`, bucket names, per-domain keys |
 | Alerts | `TELEGRAM_BOT_API_KEY`, `TELEGRAM_CHAT_ID` |
+
+`POSTGRES_*_HOST_PORT` and the other `*_HOST_PORT` variables only change the **host** binding; the in-network ports (`5433`-`5436`, `8404`, `5000`) stay the same for every container. Override them in `.env` when another local stack already owns the default ports. With the defaults the host ports match the table in [Service Ports](#service-ports).
 
 Silver and gold clients must use `POSTGRES_SILVER_HOST=haproxy` / `POSTGRES_GOLD_HOST=haproxy` with the RW ports `5433` / `5434`. Read-only consumers use `POSTGRES_*_READ_PORT` (`5435` / `5436`). These are HAProxy ports and are the same inside the compose network and on the host. `postgres-infra` keeps `POSTGRES_INFRA_HOST=postgres-infra` and port `5432`.
 
@@ -558,25 +564,26 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 
 | Area | State |
 |------|-------|
-| Compose infrastructure (Spock silver x2, Spock gold x2, postgres-infra, SeaweedFS, NATS, Debezium x2, MLflow, VictoriaMetrics, VictoriaLogs) | Implemented |
-| Spock multi-master bootstrap (`configs/spock/init`) | Implemented |
-| Spock bidirectional wiring (`spock-wire-silver`, `spock-wire-gold`) | Implemented; runtime validation pending |
-| HAProxy RW/RO routing and stats | Implemented; failover validation pending |
-| Bucket bootstrap (`seaweedfs-init`) | Implemented |
-| Stream bootstrap (`nats-init`) | Implemented |
-| Bronze webhook bridge | Implemented |
-| NUI context import | Implemented |
-| Spark standalone cluster (`spark-master`, `spark-worker`, `spark-submit`) | Implemented (example job included) |
-| Trino catalogs over silver/gold Postgres | Implemented |
-| Silver CDC configuration | Configured; needs real silver tables |
-| dbt models | Placeholder (`.gitkeep` only, `sources.yml` has `PLACEHOLDER_TABLE`) |
-| Dagster assets, jobs, schedules | Placeholder (`assets=[]`, no schedules) |
+| Compose infrastructure (Spock silver x2, Spock gold x2, postgres-infra, SeaweedFS, NATS, Debezium x2, MLflow, VictoriaMetrics, VictoriaLogs) | Implemented; all services healthy |
+| Spock multi-master bootstrap (`configs/spock/init`) | Implemented; `output_plugin_libraries` includes `spock_output` and the replication role can call Spock control functions |
+| Spock bidirectional wiring (`spock-wire-silver`, `spock-wire-gold`) | Implemented; validated, all subscriptions `replicating`, idempotent on rerun |
+| HAProxy RW/RO routing and stats | Implemented; both backends per frontend report `UP` |
+| Bucket bootstrap (`seaweedfs-init`) | Implemented; fails if a bucket is missing after creation |
+| Stream bootstrap (`nats-init`) | Implemented; creates the five streams through the JetStream API |
+| Bronze webhook bridge | Implemented; create/update/delete validated end to end |
+| NUI context import | Implemented; five connections imported |
+| Spark standalone cluster (`spark-master`, `spark-worker`, `spark-submit`) | Implemented; S3A + JDBC smoke test passes |
+| Trino catalogs over silver/gold Postgres | Implemented; four catalogs verified |
+| Silver CDC configuration | Implemented; change event validated on a probe table |
+| dbt models | Placeholder (`.gitkeep` only, `sources.yml` has `PLACEHOLDER_TABLE`); project parses |
+| Dagster assets, jobs, schedules | Placeholder (`assets=[]`, no schedules); webserver, daemon and user code healthy |
+| MLflow tracking | Implemented (healthy; Postgres backend, SeaweedFS artifacts) |
 | dlt pipelines | Placeholder (image only) |
 | ML training / MLflow experiments | Not started |
 | Inference service | Commented out in `compose.dev.yaml` |
 | Dashboard backend / frontend | Commented out; source not present |
 | Great Expectations suites | Library installed, no suites |
-| Health monitor | Code present, service commented out |
+| Health monitor | Code fixed (valid Postgres helpers, project-specific checks); service commented out |
 | Caddy reverse proxy | Config placeholder, no service |
 
 ---
@@ -591,18 +598,23 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 - DDL should be applied on one node at a time. HAProxy Mode A pins RW traffic, but manual `psql` sessions that bypass HAProxy can still race.
 - Sequences are not cluster-safe; `snowflake` is installed only if the image provides it. Prefer explicit IDs over `serial`.
 - `postgres-infra` is a single node with no replication; it is not covered by Spock.
-- `dbt/models/silver/wmata/` does not exist yet (only `silver/traffic/`).
-- `dbt_project.yml` declares `macro-paths: ["macros"]`, but `dbt/macros/` is missing.
-- `dbt/models/sources.yml` still references `PLACEHOLDER_TABLE`.
-- Debezium has no `table.include.list`, so all `public` tables are captured; add one before production use.
-- `seaweedfs-init` ends each `weed shell` call with `|| true`, so a failed bucket creation can pass silently. Check the logs and the bucket list.
+- `dbt/models/sources.yml` still references `PLACEHOLDER_TABLE`; silver/gold models are not written yet.
+- Debezium runs with `publication.autocreate.mode=all_tables` because there is no `table.include.list` yet. Set `filtered` plus an explicit list before production use.
+- `seaweedfs-init` still tolerates per-bucket `weed shell` errors (`|| true`) for idempotency, but now verifies every bucket through the filer and fails if one is missing.
 - The SeaweedFS master UI on `9333` is not published to the host.
 - There is no authentication or TLS on NATS, SeaweedFS, or the databases. This stack is for local development only.
 - `monitor`, `inference`, `dashboard-*`, `dlt-*`, and `dbt` run only when invoked explicitly; the `dbt` service is a one-shot task, not a long-running service.
 - Trino has no catalog for bronze; querying SeaweedFS requires an Iceberg/Hive catalog plus a metastore.
-- The Spark image downloads `hadoop-aws`, the AWS SDK bundle and the JDBC driver from Maven Central at build time, so the first `build` needs network access and is large (~500 MB).
+- The Spark image downloads `hadoop-aws`, `analyticsaccelerator-s3`, the AWS SDK bundle and the JDBC driver from Maven Central at build time, so the first `build` needs network access and is large (the AWS SDK bundle alone is ~686 MB).
 - Spark executors inherit `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from `spark-worker`; rotating the SeaweedFS keys means recreating the Spark containers.
 - `spark-submit` is a one-shot task (like `dbt`); use `docker compose run --rm` rather than `up`.
+- `storage/` must be on a POSIX filesystem. `postgres-infra` runs `initdb`, which fails with `could not change permissions` on NTFS/exFAT/SMB; keep the repo there only if `storage/` is a symlink to a POSIX path.
+- Host port bindings can collide with other local stacks. Override `POSTGRES_*_HOST_PORT`, `POSTGRES_*_READ_HOST_PORT`, `HAPROXY_STATS_HOST_PORT` and `MLFLOW_HOST_PORT` in `.env`; in-network ports are unchanged.
+- `nats-init` talks to the JetStream API instead of `nats stream add`, which always prompts and fails without a TTY.
+- The SeaweedFS bridge runs `nats-py` on a private asyncio loop; `/health` only proves the HTTP server is up, not that NATS is reachable.
+- VictoriaLogs 1.53 is a distroless image (no shell, no `wget`), so its healthcheck invokes the binary with `-version`.
+- `docker compose up -d` also starts the one-shot `dbt` service with no arguments, which exits non-zero after printing usage. Use `docker compose run --rm dbt ...` for real work.
+- HAProxy failover (node 1 down -> node 2) and Debezium slot survival after failover have not been drilled yet.
 
 ---
 
@@ -624,3 +636,9 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 | Trino stays unhealthy | Catalogs fail if the `POSTGRES_*` env vars are missing; check `docker compose logs trino` for `${ENV:...}` resolution errors. |
 | Spark worker never registers | It waits for the `spark-master` healthcheck on port `8080`; check the master UI at <http://localhost:8082>. |
 | Spark job cannot read `s3a://` | `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` must be set on `spark-worker` and `spark-submit`, and `fs.s3a.endpoint` must point at `seaweedfs:8333`. |
+| `postgres-infra` restarts with `initdb: could not change permissions` | `storage/` is on NTFS/exFAT/SMB. Point it at a POSIX path (symlink) and recreate the container. |
+| Debezium fails with `No table filters found for filtered publication` | `publication.autocreate.mode=filtered` requires `table.include.list`; use `all_tables` until the silver tables are named. |
+| `nats-init` logs `cannot ask for confirmation without a terminal` | An older `nats stream add` path; this repo creates streams through the JetStream API instead. |
+| Spock subscription stays `down` | Check `SHOW output_plugin_libraries` includes `spock_output` and that `pgedge` can execute functions in schema `spock`; inspect the node log at `$PGDATA/log/postgresql-*.log`. |
+| Spark fails with `ClassNotFoundException: ...analyticsaccelerator...` | Rebuild **all three** Spark images (`spark-master`, `spark-worker`, `spark-submit`) after a `Containerfile` change; compose tags them separately. |
+| `Bind for 0.0.0.0:5433 failed: port is already allocated` | Another stack owns the port. Override `POSTGRES_*_HOST_PORT` / `*_READ_HOST_PORT` / `HAPROXY_STATS_HOST_PORT` / `MLFLOW_HOST_PORT` in `.env`. |

@@ -113,7 +113,7 @@ for db in "${DB_ENTRIES[@]}"; do
 
       sub_name="sub_${local_name}_${peer_name}_${db}"
       status_count="$(query_admin "${local_host}" "${db}" \
-        "SELECT count(*) FROM spock.sub_show_status('${sub_name}')")"
+        "SELECT count(*) FROM spock.sub_show_status() WHERE subscription_name = '${sub_name}'")"
 
       if [ "${status_count}" = "0" ]; then
         dsn="host=${peer_host} port=5432 dbname=${db} user=${REPL_USER} password=${REPL_PASSWORD}"
@@ -130,17 +130,21 @@ for db in "${DB_ENTRIES[@]}"; do
         echo "subscription ${sub_name} already exists"
       fi
 
-      # Give the apply worker a moment to reach `replicating`; do not fail the
-      # bootstrap if the initial catch-up takes longer.
-      for attempt in $(seq 1 30); do
+      # Give the apply worker a moment to reach `replicating`; fail loudly if it
+      # never does so dependent services do not start against a broken cluster.
+      for attempt in $(seq 1 90); do
         status="$(query_admin "${local_host}" "${db}" \
-          "SELECT status FROM spock.sub_show_status('${sub_name}')" || true)"
+          "SELECT status FROM spock.sub_show_status() WHERE subscription_name = '${sub_name}'" || true)"
         if [ "${status}" = "replicating" ]; then
           break
         fi
         sleep 2
       done
       echo "subscription ${sub_name} status: ${status:-unknown}"
+      if [ "${status}" != "replicating" ]; then
+        echo "ERROR: subscription ${sub_name} did not reach replicating" >&2
+        exit 1
+      fi
     done
   done
 done

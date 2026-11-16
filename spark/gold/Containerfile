@@ -1,0 +1,6 @@
+FROM wmata-lateness-spark-master:latest
+
+USER root
+COPY jobs /opt/spark/jobs
+COPY conf/spark-defaults.conf /opt/spark/conf/spark-defaults.conf
+USER 185

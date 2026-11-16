@@ -183,11 +183,11 @@ services:
     image: docker.io/haproxy:3.2-alpine
     restart: unless-stopped
     ports:
-      - ${HOST_IP:-127.0.0.1}:5433:5433
-      - ${HOST_IP:-127.0.0.1}:5434:5434
-      - ${HOST_IP:-127.0.0.1}:5435:5435
-      - ${HOST_IP:-127.0.0.1}:5436:5436
-      - ${HOST_IP:-127.0.0.1}:8404:8404
+      - ${HOST_IP:-127.0.0.1}:${POSTGRES_SILVER_HOST_PORT:-5433}:5433
+      - ${HOST_IP:-127.0.0.1}:${POSTGRES_GOLD_HOST_PORT:-5434}:5434
+      - ${HOST_IP:-127.0.0.1}:${POSTGRES_SILVER_READ_HOST_PORT:-5435}:5435
+      - ${HOST_IP:-127.0.0.1}:${POSTGRES_GOLD_READ_HOST_PORT:-5436}:5436
+      - ${HOST_IP:-127.0.0.1}:${HAPROXY_STATS_HOST_PORT:-8404}:8404
     volumes:
       - ./configs/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     depends_on:
@@ -304,6 +304,12 @@ services:
           echo "s3.bucket.create -name $${bucket} -owner $${bucket%}" \
             | /usr/bin/weed shell -master=seaweedfs:9333 -filer=seaweedfs:8888 || true
         done
+        for bucket in wmata traffic mlflow; do
+          if ! curl -sf "http://seaweedfs:8888/buckets/$${bucket}/" >/dev/null; then
+            echo "ERROR: SeaweedFS bucket $${bucket} is missing" >&2
+            exit 1
+          fi
+        done
         echo "SeaweedFS buckets ready"
     depends_on:
       seaweedfs:
@@ -383,7 +389,8 @@ services:
       - "-httpListenAddr=:9428"
       - "-retentionPeriod=${VL_RETENTION:-3M}"
     healthcheck:
-      test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:9428/health"]
+      # The VictoriaLogs image is distroless (no shell, no wget).
+      test: ["CMD", "/victoria-logs-prod", "-version"]
       interval: 10s
       timeout: 3s
       retries: 10
@@ -432,22 +439,33 @@ services:
     entrypoint: ["sh", "-c"]
     command:
       - |
+        set -e
         echo "Waiting for NATS..."
         until nc -z nats 4222; do sleep 1; done
         echo "Creating bronze/silver/inference streams..."
         create_stream() {
           name="$1"; subjects="$2"; max_age="$3"; max_bytes="$4"
-          nats -s nats:4222 stream info "$name" >/dev/null 2>&1 || \
-            nats -s nats:4222 stream add "$name" \
-              --subjects "$subjects" --storage file --retention limits \
-              --discard old --max-msgs=-1 --max-bytes="$max_bytes" \
-              --max-age "$max_age" --dupe-window 2m
+          if nats -s nats:4222 stream info "$$name" >/dev/null 2>&1; then
+            echo "stream $${name} already exists"
+            return 0
+          fi
+          # `nats stream add` always asks for confirmation and fails without a
+          # TTY, so talk to the JetStream API directly instead.
+          payload="$$(printf '{"name":"%s","subjects":%s,"retention":"limits","max_msgs":-1,"max_bytes":%s,"max_age":%s,"storage":"file","discard":"old","duplicate_window":120000000000}' \
+            "$$name" "$$subjects" "$$max_bytes" "$$max_age")"
+          resp="$$(nats -s nats:4222 request '$$JS.API.STREAM.CREATE.'"$$name" "$$payload")"
+          if printf '%s' "$$resp" | grep -q '"error"'; then
+            echo "ERROR: failed to create stream $${name}: $$resp" >&2
+            return 1
+          fi
+          echo "created stream $${name}"
         }
-        create_stream wmata-bronze    "wmata.realtime.bronze_data,wmata.realtime.bronze_data.>"       3d 2GB
-        create_stream traffic-bronze  "traffic.realtime.bronze_data,traffic.realtime.bronze_data.>"   3d 2GB
-        create_stream wmata-silver    "wmata.realtime.silver_data,wmata.realtime.silver_data.>"      7d 5GB
-        create_stream traffic-silver  "traffic.realtime.silver_data,traffic.realtime.silver_data.>"  7d 5GB
-        create_stream wmata-inference "wmata.realtime.inference,wmata.realtime.inference.>"          7d 1GB
+        create_stream wmata-bronze    '["wmata.realtime.bronze_data","wmata.realtime.bronze_data.>"]'     259200000000000 2147483648
+        create_stream traffic-bronze  '["traffic.realtime.bronze_data","traffic.realtime.bronze_data.>"]' 259200000000000 2147483648
+        create_stream wmata-silver    '["wmata.realtime.silver_data","wmata.realtime.silver_data.>"]'     604800000000000 5368709120
+        create_stream traffic-silver  '["traffic.realtime.silver_data","traffic.realtime.silver_data.>"]' 604800000000000 5368709120
+        create_stream wmata-inference '["wmata.realtime.inference","wmata.realtime.inference.>"]'         604800000000000 1073741824
+        nats -s nats:4222 stream ls
         echo "NATS init complete"
     depends_on:
       nats:
@@ -540,6 +558,11 @@ services:
       DAGSTER_POSTGRES_PORT: ${POSTGRES_INFRA_PORT:-5432}
       DESTINATION__POSTGRES__CREDENTIALS__PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
       DLT_PROJECT_DIR: /opt/dagster/dlt
+      WMATA_NETWORK: wmata-lateness_wmata-lateness-dev
+      SPARK_GOLD_IMAGE: wmata-spark-gold:latest
+      ML_IMAGE: wmata-ml:latest
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: ${SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs:8333}
     env_file:
       - .env
     volumes:
@@ -548,6 +571,7 @@ services:
       - ./dbt:/opt/dagster/dbt
       - ./gx_quality:/opt/dagster/app/gx_quality
       - ./shared:/opt/dagster/app/shared:ro
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     depends_on:
       postgres-infra:
         condition: service_healthy
@@ -656,7 +680,7 @@ services:
       dockerfile: configs/mlflow/Containerfile
     restart: unless-stopped
     ports:
-      - ${HOST_IP:-127.0.0.1}:5000:5000
+      - ${HOST_IP:-127.0.0.1}:${MLFLOW_HOST_PORT:-5000}:5000
     environment:
       MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_INFRA_USER:-postgres}:${POSTGRES_INFRA_PASSWORD:-postgres}@postgres-infra:${POSTGRES_INFRA_PORT:-5432}/mlflow_db
       MLFLOW_S3_ENDPOINT_URL: ${SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs:8333}

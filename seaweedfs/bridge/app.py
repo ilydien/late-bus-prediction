@@ -13,6 +13,7 @@ SeaweedFS retries (it already has retry/backoff and a dead-letter log).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -41,25 +42,61 @@ log = logging.getLogger("seaweedfs-bridge")
 
 
 class Publisher:
-    """Lazy, thread-safe JetStream publisher."""
+    """Lazy, thread-safe JetStream publisher.
+
+    nats-py is asyncio-only, so the client lives on a private event loop that
+    runs in a background thread. HTTP handler threads submit coroutines to it
+    and block until the publish completes.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._nc = None
         self._js = None
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _call(self, coro, timeout: float = 10):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
 
     def _connect(self) -> None:
         if self._nc is not None and not self._nc.is_closed:
             return
-        self._nc = nats.connect(NATS_URL)
-        self._js = self._nc.jetstream()
+
+        async def connect() -> None:
+            self._nc = await nats.connect(NATS_URL)
+            self._js = self._nc.jetstream()
+
+        self._call(connect())
         log.info("connected to NATS at %s", NATS_URL)
 
     def publish(self, subject: str, payload: bytes, msg_id: str) -> None:
         with self._lock:
             self._connect()
-            self._js.publish(subject, payload, headers={"Nats-Msg-Id": msg_id})
-            self._nc.flush(timeout=5)
+
+            async def publish() -> None:
+                await self._js.publish(
+                    subject, payload, headers={"Nats-Msg-Id": msg_id}
+                )
+                await self._nc.flush(timeout=5)
+
+            self._call(publish())
+
+    def close(self) -> None:
+        async def drain() -> None:
+            if self._nc is not None and not self._nc.is_closed:
+                await self._nc.drain()
+
+        try:
+            self._call(drain(), timeout=5)
+        except Exception:
+            log.warning("NATS connection did not drain cleanly", exc_info=True)
+        self._loop.call_soon_threadsafe(self._loop.stop)
 
 
 publisher = Publisher()
@@ -149,6 +186,7 @@ def main() -> None:
         server.serve_forever()
     finally:
         server.server_close()
+        publisher.close()
 
 
 if __name__ == "__main__":

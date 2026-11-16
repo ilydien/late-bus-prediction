@@ -47,8 +47,6 @@ VM_API_URL = f"{VM_URL}/api/v1/import/prometheus"
 
 _failures: dict[str, int] = {}
 FAILURE_THRESHOLD = 2
-_accuracy_iteration = 0
-ACCURACY_INTERVAL = 5
 
 CPU_THRESHOLD = 90.0
 MEMORY_THRESHOLD = 80.0
@@ -71,28 +69,6 @@ def _push_metric(name: str, value: float, labels: dict | None = None) -> None:
         urllib.request.urlopen(req, timeout=5)
     except Exception as e:
         logger.warning("Failed to push %s: %s", name, e)
-
-
-def _get_pg_connection():
-    import psycopg2
-
-    return psycopg2.connect(
-        dbname_wmata=POSTGRES_DB_WMATA,
-        dbname_traffic=POSTGRES_DB_TRAFFIC,
-        infra_host=POSTGRES_INFRA_HOST,
-        infra_port=POSTGRES_INFRA_PORT,
-        infra_dbname=POSTGRES_DB_INFRA,
-        infra_user=POSTGRES_INFRA_USER,
-        infra_password=POSTGRES_INFRA_PASSWORD,
-        silver_host=POSTGRES_SILVER_HOST,
-        silver_port=POSTGRES_SILVER_PORT,
-        silver_user=POSTGRES_SILVER_USER,
-        silver_password=POSTGRES_SILVER_PASSWORD,
-        gold_host=POSTGRES_GOLD_HOST,
-        gold_port=POSTGRES_GOLD_PORT,
-        gold_user=POSTGRES_GOLD_USER,
-        gold_password=POSTGRES_GOLD_PASSWORD,
-    )
 
 
 def _http_get(url: str, timeout: int = 5) -> bool:
@@ -167,17 +143,7 @@ def _check_mlflow() -> bool:
 
 
 def _check_inference() -> bool:
-    try:
-        url = f"{VM_URL}/api/v1/query?query=demand_staleness_seconds"
-        resp = urllib.request.urlopen(url, timeout=5)
-        data = resp.json()
-        results = data.get("data", {}).get("result", [])
-        if not results:
-            return False
-        ts = float(results[0]["value"][0])
-        return (time.time() - ts) < 120
-    except Exception:
-        return False
+    return _http_get(f"{INFERENCE_URL}/health")
 
 
 def _check_seaweedfs() -> bool:
@@ -203,27 +169,6 @@ def _check_vm_disk() -> bool:
                     level="CRITICAL",
                     throttle_key="vm_disk_low",
                     throttle_seconds=1800,
-                )
-                return False
-        return True
-    except Exception:
-        return True
-
-
-def _check_inference_staleness() -> bool:
-    try:
-        url = f"{VM_URL}/api/v1/query?query=max(demand_staleness_seconds)"
-        resp = urllib.request.urlopen(url, timeout=5)
-        data = resp.json()
-        results = data.get("data", {}).get("result", [])
-        if results:
-            staleness = float(results[0]["value"][1])
-            if staleness > 900:
-                send_alert(
-                    f"Inference staleness alert from VM: *{int(staleness)}s*",
-                    level="WARNING",
-                    throttle_key="vm_staleness",
-                    throttle_seconds=600,
                 )
                 return False
         return True
@@ -293,101 +238,6 @@ def _push_health_metrics(checks_results: list[tuple[str, bool]]) -> None:
         _push_metric("service_up", 1.0 if ok else 0.0, {"service": name})
 
 
-def _push_pipeline_latency() -> None:
-    try:
-        conn = _get_pg_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT COALESCE(MAX(ABS(EXTRACT(EPOCH FROM (updated_at - time)))), 0)
-            FROM silver.demand_5min
-            WHERE updated_at > NOW() - INTERVAL '5 minutes'
-        """)
-        row = cur.fetchone()
-        latency = float(row[0]) if row else 0.0
-        cur.close()
-        conn.close()
-        _push_metric("pipeline_latency_seconds", latency)
-    except Exception as e:
-        logger.warning("Pipeline latency query failed: %s", e)
-
-
-def _evaluate_accuracy() -> None:
-    try:
-        conn = _get_pg_connection()
-        cur = conn.cursor()
-
-        cur.execute("""
-            SELECT p.region_id, p.created_at,
-                   p.horizon_h01, p.horizon_h02, p.horizon_h03, p.horizon_h04,
-                   p.horizon_h05, p.horizon_h06, p.horizon_h07, p.horizon_h08,
-                   p.horizon_h09, p.horizon_h10, p.horizon_h11, p.horizon_h12,
-                   p.horizon_h13, p.horizon_h14, p.horizon_h15, p.horizon_h16,
-                   p.horizon_h17, p.horizon_h18, p.horizon_h19, p.horizon_h20,
-                   p.horizon_h21, p.horizon_h22, p.horizon_h23, p.horizon_h24
-            FROM silver.predictions p
-            WHERE p.created_at >= NOW() - INTERVAL '48 hours'
-              AND p.created_at < NOW() - INTERVAL '24 hours'
-            ORDER BY p.created_at DESC
-            LIMIT 50
-        """)
-        predictions = cur.fetchall()
-
-        if not predictions:
-            cur.close()
-            conn.close()
-            return
-
-        regions = {}
-        for row in predictions:
-            region_id = row[0]
-            created_at = row[1]
-            horizons = row[2:]
-
-            for h_idx, predicted in enumerate(horizons):
-                if predicted is None or predicted <= 0:
-                    continue
-
-                h = h_idx + 1
-                expected_time = created_at + __import__("datetime").timedelta(hours=h)
-
-                cur.execute(
-                    """
-                    SELECT demand_mw FROM silver.features_ml
-                    WHERE region_id = %s AND time = %s
-                """,
-                    (region_id, expected_time),
-                )
-                actual_row = cur.fetchone()
-
-                if actual_row and actual_row[0] and actual_row[0] > 0:
-                    actual = actual_row[0]
-                    mape = abs((actual - predicted) / actual) * 100
-
-                    key = (region_id, h)
-                    if key not in regions:
-                        regions[key] = []
-                    regions[key].append(mape)
-
-        for (region_id, horizon), mapes in regions.items():
-            avg_mape = sum(mapes) / len(mapes)
-            _push_metric(
-                "prediction_mape",
-                avg_mape,
-                {
-                    "region": region_id,
-                    "horizon": str(horizon),
-                },
-            )
-
-        cur.close()
-        conn.close()
-        logger.info(
-            "Accuracy evaluation done: %d region/horizon combinations", len(regions)
-        )
-    except Exception as e:
-        logger.warning("Accuracy evaluation failed: %s", e)
-
-
 def run_checks() -> list[tuple[str, bool]]:
     checks = [
         ("PostgreSQL Infra", _check_postgres_infra),
@@ -411,29 +261,20 @@ def run_checks() -> list[tuple[str, bool]]:
 
     _push_health_metrics(results)
     _check_vm_disk()
-    _check_inference_staleness()
-    _push_pipeline_latency()
     _check_system_resources()
 
     return results
 
 
 def main() -> None:
-    global _accuracy_iteration
     logger.info(
-        "Health monitor started (interval=%ds, threshold=%d, accuracy_every=%d)",
+        "Health monitor started (interval=%ds, threshold=%d)",
         CHECK_INTERVAL,
         FAILURE_THRESHOLD,
-        ACCURACY_INTERVAL,
     )
     while True:
         try:
             run_checks()
-
-            _accuracy_iteration += 1
-            if _accuracy_iteration % ACCURACY_INTERVAL == 0:
-                _evaluate_accuracy()
-                _accuracy_iteration = 0
         except Exception as e:
             logger.exception("Health check loop error: %s", e)
         time.sleep(CHECK_INTERVAL)

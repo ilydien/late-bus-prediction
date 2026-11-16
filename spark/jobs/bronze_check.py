@@ -27,11 +27,12 @@ def main() -> None:
     spark = SparkSession.builder.appName("wmata-bronze-check").getOrCreate()
     print(f"Spark version: {spark.version}")
 
-    # 1. SeaweedFS over S3A.
+    # 1. SeaweedFS over S3A. Resolve the filesystem from the path so the S3A
+    # implementation is used instead of the default (file:///).
     jvm = spark._jvm
     hadoop_conf = spark._jsc.hadoopConfiguration()
-    fs = jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
     path = jvm.org.apache.hadoop.fs.Path(f"s3a://{BRONZE_BUCKET}/")
+    fs = path.getFileSystem(hadoop_conf)
     print(f"s3a://{BRONZE_BUCKET}/ exists: {fs.exists(path)}")
 
     # 2. PostgreSQL over JDBC. `SELECT 1` proves the connection without
