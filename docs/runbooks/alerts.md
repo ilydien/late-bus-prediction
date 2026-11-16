@@ -11,7 +11,7 @@ Panduan singkat penanganan 3 kategori alert utama yang dievaluasi oleh **vmalert
 - **Gejala:** Metrik `wmata_pipeline_job_runs_total{status="failed"}` meningkat dalam 5 menit terakhir.
 
 ### Langkah Cek
-1. Buka **Grafana → Ops Overview** (`http://localhost:3001`) atau **Dagster UI** (`http://localhost:3000`).
+1. Buka **VictoriaMetrics VMUI** (`http://localhost:8428/vmui`), **React Monitoring Dashboard** (`http://localhost:5173`), atau **Dagster UI** (`http://localhost:3000`).
 2. Buka **VictoriaLogs VMUI** (`http://localhost:9428/select/vmui`) dan query:
    ```logsql
    level:ERROR job:<nama_job>
@@ -34,7 +34,7 @@ Panduan singkat penanganan 3 kategori alert utama yang dievaluasi oleh **vmalert
 - **Gejala:** `jetstream_consumer_num_pending > 1000` selama 3 menit atau umur event terakhir `wmata_stream_last_event_timestamp` melewati 5 menit.
 
 ### Langkah Cek
-1. Cek panel **NATS JetStream** di Grafana (`http://localhost:3001`) atau buka **NATS NUI** (`http://localhost:31311`).
+1. Cek metrik `jetstream_consumer_num_pending` & `jetstream_stream_total_messages` di **VictoriaMetrics VMUI** (`http://localhost:8428/vmui`) / **React Monitoring Dashboard**, atau buka **NATS NUI** (`http://localhost:31311`).
 2. Periksa status consumer dan stream di terminal:
    ```bash
    docker compose -f compose.dev.yaml --profile dev run --rm --entrypoint nats nats-init -s nats:4222 stream ls
@@ -63,7 +63,7 @@ Panduan singkat penanganan 3 kategori alert utama yang dievaluasi oleh **vmalert
    ```bash
    docker compose -f compose.dev.yaml --profile dev logs --tail=100 <service_name>
    ```
-3. Cek pemakaian CPU/RAM/Disk container di Grafana panel **Container Resources (cAdvisor)**.
+3. Cek pemakaian CPU/RAM/Disk container di **VictoriaMetrics VMUI** (`container_cpu_usage_seconds_total`, `container_memory_working_set_bytes`) atau **React Monitoring Dashboard**.
 
 ### Perbaikan
 - Untuk service down: perbaiki penyebab di log lalu jalankan `docker compose -f compose.dev.yaml --profile dev up -d <service_name>`.

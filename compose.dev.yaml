@@ -1138,6 +1138,7 @@ services:
       VM_URL: http://victoriametrics:8428
       VL_URL: http://victorialogs:9428
       VECTOR_URL: http://vector:8686
+      VMALERT_URL: http://vmalert:8880
       TELEGRAM_BOT_API_KEY: ${TELEGRAM_BOT_API_KEY:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
@@ -1188,36 +1189,6 @@ services:
       - wmata-lateness-dev
     profiles: ["dev"]
 
-  grafana:
-    <<: *default-logging
-    image: docker.io/grafana/grafana-oss:11.3.0
-    restart: unless-stopped
-    ports:
-      - ${HOST_IP:-127.0.0.1}:3001:3000
-    environment:
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_INSTALL_PLUGINS: victoriametrics-logs-datasource
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./configs/grafana/dashboards:/etc/grafana/dashboards:ro
-    depends_on:
-      victoriametrics:
-        condition: service_healthy
-      victorialogs:
-        condition: service_started
-    healthcheck:
-      test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:3000/api/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    networks:
-      - wmata-lateness-dev
-    profiles: ["dev"]
-
 networks:
   wmata-lateness-dev:
     driver: bridge
@@ -1227,4 +1198,3 @@ volumes:
   spock-silver-2-data:
   spock-gold-1-data:
   spock-gold-2-data:
-  grafana-data:
