@@ -1,24 +1,47 @@
 data_dir: /var/lib/vector
 
+api:
+  enabled: true
+  address: 0.0.0.0:8686
+
 sources:
-  podman_logs:
+  docker_logs:
     type: docker_logs
     docker_host: unix:///var/run/docker.sock
 
 transforms:
-  to_ndjson:
+  parse_app_logs:
     type: remap
-    inputs: [podman_logs]
+    inputs: [docker_logs]
     source: |
-      . = encode_json(.)
+      raw_msg = string(.message) ?? ""
+      parsed, err = parse_json(raw_msg)
+      if err == null && is_object(parsed) {
+        if exists(parsed.timestamp) { .timestamp = parsed.timestamp }
+        if exists(parsed.level) { .level = upcase(string!(parsed.level)) }
+        if exists(parsed.service) { .service = parsed.service }
+        if exists(parsed.run_id) { .run_id = parsed.run_id }
+        if exists(parsed.domain) { .domain = parsed.domain }
+        if exists(parsed.layer) { .layer = parsed.layer }
+        if exists(parsed.job) { .job = parsed.job }
+        if exists(parsed.duration_ms) { .duration_ms = parsed.duration_ms }
+        if exists(parsed.row_count) { .row_count = parsed.row_count }
+        if exists(parsed.error_type) { .error_type = parsed.error_type }
+        if exists(parsed.exception) { .exception = parsed.exception }
+        if exists(parsed.message) { .message = string!(parsed.message) }
+      } else {
+        if !exists(.level) { .level = "INFO" }
+        if !exists(.service) { .service = .container_name }
+        if !exists(.run_id) { .run_id = "unassigned" }
+      }
 
 sinks:
   victorialogs:
     type: http
-    inputs: [to_ndjson]
-    uri: http://victorialogs:9428/insert/jsonline?_msg_field=message&_time_field=timestamp&_stream_fields=host,container_name
+    inputs: [parse_app_logs]
+    uri: http://victorialogs:9428/insert/jsonline?_msg_field=message&_time_field=timestamp&_stream_fields=container_name,service,level
     encoding:
-      codec: text
-      framing:
-        method: newline_delimited
+      codec: json
+    framing:
+      method: newline_delimited
     method: post

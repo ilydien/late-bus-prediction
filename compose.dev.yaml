@@ -307,7 +307,7 @@ services:
         echo "SeaweedFS buckets ready"
     depends_on:
       seaweedfs:
-        condition: service_started
+        condition: service_healthy
     networks:
       - wmata-lateness-dev
     profiles: ["dev"]
@@ -346,16 +346,14 @@ services:
     restart: unless-stopped
     ports:
       - ${HOST_IP:-127.0.0.1}:8428:8428
-    environment:
-      POSTGRES_USER: ${POSTGRES_INFRA_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
-
     volumes:
       - ./storage/victoriametrics:/storage
+      - ./configs/victoriametrics/scrape.yml:/etc/victoriametrics/scrape.yml:ro
     command:
       - "-storageDataPath=/storage"
       - "-retentionPeriod=${VM_RETENTION:-3M}"
       - "-httpListenAddr=:8428"
+      - "-promscrape.config=/etc/victoriametrics/scrape.yml"
       - "-selfScrapeInterval=10s"
       - "-search.maxQueryDuration=30s"
       - "-memory.allowedPercent=60"
@@ -398,10 +396,16 @@ services:
     restart: unless-stopped
     volumes:
       - ./configs/vector/vector.yaml:/etc/vector/vector.yaml:ro
-      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
     depends_on:
       victorialogs:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:8686/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - wmata-lateness-dev
     profiles: ["dev"]
@@ -678,7 +682,7 @@ services:
         ]
       interval: 30s
       timeout: 10s
-      retries: 3000
+      retries: 15
       start_period: 30s
     depends_on:
       postgres-infra:
@@ -1013,34 +1017,207 @@ services:
   #     - wmata-lateness-dev
   #   profiles: ["dev"]
 
-  # monitor:
-  #   <<: *default-logging
-  #   build:
-  #     context: .
-  #     dockerfile: monitor/Containerfile
-  #   restart: unless-stopped
-  #   environment:
-  #     PG_HOST: postgres-infra
-  #     PG_PORT: 5432
-  #     PG_DB: ${POSTGRES_DB:-electricity}
-  #     PG_USER: ${POSTGRES_USER:-postgres}
-  #     PG_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-  #     NATS_URL: nats://nats:8222
-  #     DEBEZIUM_URL: http://debezium-server:8080
-  #     VM_URL: http://victoriametrics:8428
-  #     CHECK_INTERVAL: "60"
-  #     TELEGRAM_BOT_API_KEY: ${TELEGRAM_BOT_API_KEY:-}
-  #     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-  #   volumes:
-  #     - ./shared:/app/shared:ro
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     victoriametrics:
-  #       condition: service_healthy
-  #   networks:
-  #     - wmata-lateness-dev
-  #   profiles: ["dev"]
+  nats-exporter:
+    <<: *default-logging
+    image: docker.io/natsio/prometheus-nats-exporter:0.20.3
+    restart: unless-stopped
+    command:
+      - "-varz"
+      - "-connz"
+      - "-subz"
+      - "-routez"
+      - "-jsz=all"
+      - "http://nats:8222"
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
+  postgres-exporter-infra:
+    <<: *default-logging
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_INFRA_USER:-postgres}:${POSTGRES_INFRA_PASSWORD:-postgres}@postgres-infra:${POSTGRES_INFRA_PORT:-5432}/${POSTGRES_DB_INFRA:-infra}?sslmode=disable"
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres_exporter/queries.yaml
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    volumes:
+      - ./configs/postgres/queries-infra.yaml:/etc/postgres_exporter/queries.yaml:ro
+    depends_on:
+      postgres-infra:
+        condition: service_healthy
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
+  postgres-exporter-silver:
+    <<: *default-logging
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_SILVER_USER:-postgres}:${POSTGRES_SILVER_PASSWORD:-postgres}@haproxy:${POSTGRES_SILVER_READ_PORT:-5435}/${POSTGRES_DB_WMATA:-wmata}?sslmode=disable"
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres_exporter/queries.yaml
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    volumes:
+      - ./configs/postgres/queries-spock.yaml:/etc/postgres_exporter/queries.yaml:ro
+    depends_on:
+      db-ready:
+        condition: service_completed_successfully
+      spock-wire-silver:
+        condition: service_completed_successfully
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
+  postgres-exporter-gold:
+    <<: *default-logging
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_GOLD_USER:-postgres}:${POSTGRES_GOLD_PASSWORD:-postgres}@haproxy:${POSTGRES_GOLD_READ_PORT:-5436}/${POSTGRES_DB_WMATA:-wmata}?sslmode=disable"
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres_exporter/queries.yaml
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    volumes:
+      - ./configs/postgres/queries-spock.yaml:/etc/postgres_exporter/queries.yaml:ro
+    depends_on:
+      db-ready:
+        condition: service_completed_successfully
+      spock-wire-gold:
+        condition: service_completed_successfully
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
+  cadvisor:
+    <<: *default-logging
+    image: ghcr.io/google/cadvisor:v0.60.6
+    restart: unless-stopped
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
+  monitor:
+    <<: *default-logging
+    build:
+      context: .
+      dockerfile: monitor/Containerfile
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:8090:8090
+    environment:
+      MONITOR_PORT: "8090"
+      CHECK_INTERVAL: "30"
+      POSTGRES_INFRA_HOST: postgres-infra
+      POSTGRES_INFRA_PORT: ${POSTGRES_INFRA_PORT:-5432}
+      POSTGRES_SILVER_HOST: ${POSTGRES_SILVER_HOST:-haproxy}
+      POSTGRES_SILVER_PORT: ${POSTGRES_SILVER_PORT:-5433}
+      POSTGRES_GOLD_HOST: ${POSTGRES_GOLD_HOST:-haproxy}
+      POSTGRES_GOLD_PORT: ${POSTGRES_GOLD_PORT:-5434}
+      HAPROXY_STATS_URL: http://haproxy:8404
+      SEAWEEDFS_URL: http://seaweedfs:9333
+      SEAWEEDFS_BRIDGE_URL: http://seaweedfs-bridge:8080
+      NATS_MON_URL: http://nats:8222
+      DEBEZIUM_WMATA_URL: http://debezium-wmata:8080
+      DEBEZIUM_TRAFFIC_URL: http://debezium-traffic:8080
+      DAGSTER_URL: http://dagster-webserver:3000
+      MLFLOW_URL: http://mlflow:5000
+      TRINO_URL: http://trino:8080
+      VM_URL: http://victoriametrics:8428
+      VL_URL: http://victorialogs:9428
+      VECTOR_URL: http://vector:8686
+      TELEGRAM_BOT_API_KEY: ${TELEGRAM_BOT_API_KEY:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./shared:/app/shared:ro
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+      victorialogs:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8090/health').status == 200",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
+  vmalert:
+    <<: *default-logging
+    image: docker.io/victoriametrics/vmalert:v1.156.0
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:8880:8880
+    volumes:
+      - ./configs/vmalert/alerts.yml:/etc/vmalert/alerts.yml:ro
+    command:
+      - "-rule=/etc/vmalert/alerts.yml"
+      - "-datasource.url=http://victoriametrics:8428"
+      - "-remoteWrite.url=http://victoriametrics:8428"
+      - "-remoteRead.url=http://victoriametrics:8428"
+      - "-notifier.url=http://monitor:8090"
+      - "-evaluationInterval=15s"
+      - "-httpListenAddr=:8880"
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+      monitor:
+        condition: service_healthy
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
+  grafana:
+    <<: *default-logging
+    image: docker.io/grafana/grafana-oss:11.3.0
+    restart: unless-stopped
+    ports:
+      - ${HOST_IP:-127.0.0.1}:3001:3000
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: victoriametrics-logs-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./configs/grafana/dashboards:/etc/grafana/dashboards:ro
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+      victorialogs:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
 
 networks:
   wmata-lateness-dev:
@@ -1051,3 +1228,4 @@ volumes:
   spock-silver-2-data:
   spock-gold-1-data:
   spock-gold-2-data:
+  grafana-data:
