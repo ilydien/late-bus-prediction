@@ -2,7 +2,7 @@
 
 A medallion-architecture data platform for **WMATA** (Washington Metropolitan Area Transit Authority) transit and traffic data. Bronze objects live in **SeaweedFS** (S3), silver and gold tables live in two-node **PostgreSQL + Spock** multi-master clusters, and changes are streamed into **NATS JetStream** through **Debezium** and SeaweedFS filer webhooks. Every database client reaches the silver and gold clusters through **HAProxy**.
 
-> **Status:** infrastructure scaffold, validated end to end on a local Docker host. Containers, databases, buckets, streams, CDC wiring, Spock replication and HAProxy routing are in place and smoke-tested. Batch bronze/silver/gold, ML training and the weekly retraining scaffold are implemented; the retraining schedule is intentionally **STOPPED** until live 2026 data exists. dbt models, dlt pipelines, ML inference and the dashboard are still placeholders — see [Status & Roadmap](#status--roadmap) and [docs/retraining.md](docs/retraining.md).
+> **Status:** infrastructure scaffold, validated end to end on a local Docker host. Containers, databases, buckets, streams, CDC wiring, Spock replication and HAProxy routing are in place and smoke-tested. Batch bronze/silver/gold, the automatic NATS -> silver consumer, ML training and the weekly retraining scaffold are implemented; the retraining schedule is intentionally **STOPPED** until live 2026 data exists. dbt models, dlt pipelines, ML inference and the dashboard are still placeholders — see [Status & Roadmap](#status--roadmap) and [docs/retraining.md](docs/retraining.md).
 
 ---
 
@@ -576,14 +576,22 @@ Step 3 requires the AWS CLI (or any S3 client). Deleting the object should also 
 | Trino catalogs over silver/gold Postgres | Implemented; four catalogs verified |
 | Silver CDC configuration | Implemented; change event validated on a probe table |
 | dbt models | Placeholder (`.gitkeep` only, `sources.yml` has `PLACEHOLDER_TABLE`); project parses |
-| Dagster assets, jobs, schedules | Weekly retrain assets/job implemented; schedule **STOPPED** until live 2026 data exists |
+| NATS -> silver consumer | Implemented as a long-running service; Spark writes staging, then an idempotent upsert merges silver. See [docs/silver-consumer.md](docs/silver-consumer.md) |
+| Historical bronze ingest | Implemented: auto one-shot `dlt` on compose up + `bronze_ingest` Dagster asset, state volume, existing-date skip, daily schedule STOPPED |
+| Parquet analytical storage | Implemented: versioned Parquet snapshots, daily 03:30 ET schedule, retention 7, manifest, replay; see [docs/parquet_storage.md](docs/parquet_storage.md) |
+| Serving SQL/API | Implemented: `gold/ddl/007_serving.sql`, FastAPI `serving/api`, 5+ read-only endpoints; see [docs/serving_api.md](docs/serving_api.md) |
+| Batch inference | Implemented: `ml/batch_inference.py`, Dagster `batch_inference`, `model_predictions.status/error/inference_run_id`; v3 inference verified |
+| Tests | 30 unit tests, 42% coverage for batch/ML modules; see [docs/test_report.md](docs/test_report.md) |
+| Data quality automation | GX staging gate + daily 05:00 ET `data_quality_audit`; reports in `quality/reports/`; see [docs/data_quality.md](docs/data_quality.md) |
+| Batch contract, quality gate, lineage | Implemented: `docs/batch_contract.md`, custom checks + Great Expectations staging gate, `public.data_quality_runs`, `public.pipeline_runs`. See [docs/great_expectations.md](docs/great_expectations.md) |
+| Dagster assets, jobs, schedules | Weekly retrain + daily batch refresh schedules implemented; both **STOPPED** until live 2026 data exists |
 | MLflow tracking | Implemented (healthy; Postgres backend, SeaweedFS artifacts) |
 | dlt pipelines | Placeholder (image only) |
-| ML training / MLflow experiments | Implemented; M2/M3 logged, champion v1, challenger v2; artifacts in `s3://mlflow/` |
+| ML training / MLflow experiments | Implemented; M2/M3/v3 logged, champion v1, v3 experiment with `route_categories.json`; see [docs/f11_report.md](docs/f11_report.md) |
 | Weekly retraining | Implemented in [docs/retraining.md](docs/retraining.md); incremental gold + MLflow promotion gate |
 | Inference service | Commented out in `compose.dev.yaml` |
 | Dashboard backend / frontend | Commented out; source not present |
-| Great Expectations suites | Library installed, no suites |
+| Great Expectations suites | Implemented: GX 1.25 staging gate, Data Docs, JSON report |
 | Health monitor | Code fixed (valid Postgres helpers, project-specific checks); service commented out |
 | Caddy reverse proxy | Config placeholder, no service |
 
