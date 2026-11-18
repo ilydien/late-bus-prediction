@@ -7,9 +7,11 @@ to gold.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import lightgbm as lgb
 import mlflow
@@ -73,6 +75,22 @@ PARAMS = {
 }
 
 
+def git_commit() -> str:
+    value = os.environ.get("GIT_COMMIT")
+    if value:
+        return value
+    for base in (Path.cwd(), Path(__file__).resolve().parents[1], Path("/app"), Path("/opt/dagster/app")):
+        git_dir = base / ".git"
+        try:
+            head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+            if head.startswith("ref: "):
+                return (git_dir / head[5:]).read_text(encoding="utf-8").strip()
+            return head
+        except OSError:
+            continue
+    return "unknown"
+
+
 def connect():
     return psycopg2.connect(
         host=GOLD_HOST,
@@ -81,6 +99,18 @@ def connect():
         user=GOLD_USER,
         password=GOLD_PASSWORD,
         connect_timeout=10,
+    )
+
+
+def split_for_dates(service_date, max_date, valid_days: int = VALID_DAYS, test_days: int = TEST_DAYS):
+    """Time-based rolling split used by training and unit tests."""
+    test_start = max_date - timedelta(days=test_days - 1)
+    valid_start = test_start - timedelta(days=valid_days)
+    service = pd.to_datetime(service_date).dt.date
+    return np.where(
+        service >= test_start,
+        "test",
+        np.where(service >= valid_start, "valid", "train"),
     )
 
 
@@ -121,16 +151,12 @@ def load_data() -> pd.DataFrame:
     # Rolling split: last TEST_DAYS days = test, preceding VALID_DAYS = valid.
     test_start = max_date - timedelta(days=TEST_DAYS - 1)
     valid_start = test_start - timedelta(days=VALID_DAYS)
-    service_date = pd.to_datetime(df["service_date"]).dt.date
-    df["split"] = np.where(
-        service_date >= test_start,
-        "test",
-        np.where(service_date >= valid_start, "valid", "train"),
-    )
+    df["split"] = split_for_dates(df["service_date"], max_date, VALID_DAYS, TEST_DAYS)
 
     numeric = [f for f in FEATURES if f != "route_id"]
     df[numeric] = df[numeric].apply(pd.to_numeric, errors="coerce")
     df["route_id"] = df["route_id"].astype("category")
+    df.attrs["route_categories"] = [str(x) for x in df["route_id"].cat.categories]
     df.attrs["max_service_date"] = max_date
     df.attrs["window_start"] = window_start
     df.attrs["valid_start"] = valid_start
@@ -277,9 +303,20 @@ def main() -> None:
             )
 
     max_date = df.attrs["max_service_date"]
+    route_categories = df.attrs.get("route_categories", [])
     run_name = os.environ.get("MLFLOW_RUN_NAME") or (
         f"lgbm-trip-delay-{max_date.isoformat()}-{FEATURESET}"
     )
+
+    split_manifest = {
+        "train": [len(train), str(train["service_date"].min()), str(train["service_date"].max())],
+        "valid": [len(valid), str(valid["service_date"].min()), str(valid["service_date"].max())],
+        "test": [len(test), str(test["service_date"].min()), str(test["service_date"].max())],
+    }
+    dataset_hash = hashlib.sha256(
+        json.dumps(split_manifest, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    feature_hash = hashlib.sha256(",".join(FEATURES).encode()).hexdigest()[:16]
 
     X_train, y_train = train[FEATURES], train[TARGET]
     X_valid, y_valid = valid[FEATURES], valid[TARGET]
@@ -310,6 +347,9 @@ def main() -> None:
             {
                 "data_source": "gold.trip_delay_features",
                 "dataset_version": f"gold-{max_date.isoformat()}",
+                "dataset_hash": dataset_hash,
+                "feature_hash": feature_hash,
+                "git_commit": git_commit(),
                 "model_family": "lightgbm",
                 "target": TARGET,
                 "featureset": FEATURESET,
@@ -326,9 +366,13 @@ def main() -> None:
                     "valid": [str(valid["service_date"].min()), str(valid["service_date"].max())],
                     "test": [str(test["service_date"].min()), str(test["service_date"].max())],
                 },
+                "dataset_hash": dataset_hash,
+                "feature_hash": feature_hash,
+                "git_commit": git_commit(),
             },
             "feature_contract.json",
         )
+        mlflow.log_dict({"route_id": route_categories}, "route_categories.json")
 
         model = lgb.LGBMRegressor(**PARAMS)
         model.fit(

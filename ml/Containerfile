@@ -11,7 +11,9 @@ RUN pip install --no-cache-dir \
   scikit-learn \
   psycopg2-binary \
   mlflow \
-  boto3
+  boto3 \
+  nats-py \
+  coverage
 
 COPY . /app
 
