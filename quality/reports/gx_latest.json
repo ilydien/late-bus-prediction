@@ -1,0 +1,8 @@
+{
+  "run_id": "2cebf763-b8c4-428e-b62e-a58f1dc4c575",
+  "dataset": "gold",
+  "table": "trip_delay_features",
+  "success": true,
+  "generated_at": "2026-11-18T11:38:38.080557+00:00",
+  "checkpoint": "gold_trip_delay_checkpoint"
+}
