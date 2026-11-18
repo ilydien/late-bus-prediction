@@ -9,6 +9,7 @@ No WMATA API key is used for this dataset.
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import tarfile
@@ -18,8 +19,10 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Iterator
 from zoneinfo import ZoneInfo
 
+import boto3
 import dlt
 import requests
+from botocore.config import Config
 from dlt.common.configuration.specs import AwsCredentials
 from dlt.common.configuration.specs.aws_credentials import AwsCredentialsWithoutDefaults
 from dlt.destinations import filesystem
@@ -163,6 +166,40 @@ def _dates(start: str, end: str) -> list[str]:
     return out
 
 
+def _existing_bronze_dates() -> set[str]:
+    """Dates already present in bronze, so a first run does not duplicate data."""
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=os.environ.get("SEAWEEDFS_S3_ENDPOINT", "http://seaweedfs:8333"),
+            aws_access_key_id=os.environ["WMATA_KEY_ID"],
+            aws_secret_access_key=os.environ["WMATA_SECRET_KEY"],
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+            config=Config(s3={"addressing_style": "path"}),
+        )
+        dates: set[str] = set()
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket="wmata", Prefix="bronze_2020/bus_positions/"):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(".jsonl.gz"):
+                    continue
+                body = client.get_object(Bucket="wmata", Key=key)["Body"]
+                try:
+                    with gzip.GzipFile(fileobj=body) as gz:
+                        line = gz.readline()
+                    record = json.loads(line)
+                    service_date = record.get("service_date")
+                    if service_date:
+                        dates.add(service_date)
+                except Exception:
+                    continue
+        return dates
+    except Exception as exc:  # noqa: BLE001 - fall back to dlt state
+        print(f"WARN existing-date scan failed: {exc}", flush=True)
+        return set()
+
+
 def _load_done() -> dict:
     try:
         with open(STATE_FILE, encoding="utf-8") as fh:
@@ -200,9 +237,20 @@ def main() -> None:
     )
 
     done = _load_done()
+    existing = _existing_bronze_dates()
+    print(f"existing bronze dates={len(existing)}", flush=True)
     for day in _dates(START, END):
         if done.get(day, {}).get("status") == "ok":
             print(f"SKIP {day}", flush=True)
+            continue
+        if day in existing:
+            done[day] = {
+                "status": "ok",
+                "loaded_at": datetime.now(timezone.utc).isoformat(),
+                "reason": "existing bronze object",
+            }
+            _save_done(done)
+            print(f"SKIP existing {day}", flush=True)
             continue
         print(f"START {day}", flush=True)
         try:
