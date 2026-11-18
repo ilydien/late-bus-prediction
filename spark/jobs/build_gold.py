@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from pyspark.sql import SparkSession, functions as F, Window
 
@@ -42,10 +42,28 @@ def write_gold(df, table: str) -> None:
     print(f"gold {table} written", flush=True)
 
 
+def parse_ts(value: str | None):
+    if not value:
+        return None
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["full", "incremental"], default="full")
+    ap.add_argument("--start-ts", help="incremental backfill start (ISO-8601)")
+    ap.add_argument("--end-ts", help="incremental backfill end (ISO-8601)")
     args = ap.parse_args()
+
+    backfill_start = parse_ts(args.start_ts)
+    backfill_end = parse_ts(args.end_ts)
+    if args.mode == "full" and (backfill_start or backfill_end):
+        ap.error("--start-ts/--end-ts are only supported with --mode incremental")
+    if backfill_end and not backfill_start:
+        ap.error("--end-ts requires --start-ts")
 
     spark = (
         SparkSession.builder.appName("wmata-silver-to-gold")
@@ -55,6 +73,9 @@ def main() -> None:
     spark.sparkContext.setLogLevel("WARN")
 
     watermark = None
+    output_start = None
+    read_start = None
+    read_end = None
     if args.mode == "incremental":
         rows = spark.read.jdbc(
             GOLD_URL,
@@ -64,22 +85,41 @@ def main() -> None:
         ).collect()
         if rows and rows[0][0] is not None:
             watermark = rows[0][0]
-        max_row = spark.read.jdbc(
-            SILVER_URL,
-            "(SELECT max(snapshot_ts) AS m FROM public.bus_trip_snapshot) t",
-            properties=PROPS,
-        ).collect()[0]
-        max_silver = max_row["m"]
-        if watermark is not None and max_silver is not None and max_silver <= watermark:
-            print(f"SKIP no new silver data (watermark={watermark})", flush=True)
-            spark.stop()
-            return
 
-    if watermark is not None:
-        start = watermark - timedelta(minutes=20)
+        if backfill_start is not None:
+            output_start = backfill_start
+            read_start = backfill_start - timedelta(minutes=20)
+        elif watermark is not None:
+            output_start = watermark
+            read_start = watermark - timedelta(minutes=20)
+        else:
+            read_start = None
+
+        if backfill_end is not None:
+            read_end = backfill_end + timedelta(minutes=20)
+
+        if backfill_start is None:
+            max_row = spark.read.jdbc(
+                SILVER_URL,
+                "(SELECT max(snapshot_ts) AS m FROM public.bus_trip_snapshot) t",
+                properties=PROPS,
+            ).collect()[0]
+            max_silver = max_row["m"]
+            if watermark is not None and max_silver is not None and max_silver <= watermark:
+                print(f"SKIP no new silver data (watermark={watermark})", flush=True)
+                spark.stop()
+                return
+
+    conditions = []
+    if read_start is not None:
+        conditions.append(f"snapshot_ts >= '{read_start.isoformat()}'")
+    if read_end is not None:
+        conditions.append(f"snapshot_ts <= '{read_end.isoformat()}'")
+    if conditions:
         dbtable = (
-            "(SELECT * FROM public.bus_trip_snapshot "
-            f"WHERE snapshot_ts >= '{start.isoformat()}') t"
+            "(SELECT * FROM public.bus_trip_snapshot WHERE "
+            + " AND ".join(conditions)
+            + ") t"
         )
         silver = spark.read.jdbc(SILVER_URL, dbtable, properties=PROPS)
     else:
@@ -190,8 +230,10 @@ def main() -> None:
         "split",
     )
     if args.mode == "incremental":
-        if watermark is not None:
-            features = features.filter(F.col("snapshot_ts") > F.lit(watermark))
+        if output_start is not None:
+            features = features.filter(F.col("snapshot_ts") > F.lit(output_start))
+        if backfill_end is not None:
+            features = features.filter(F.col("snapshot_ts") <= F.lit(backfill_end))
         write_gold(features, "trip_delay_features_staging")
         print("incremental staging written; run finalize_gold.py", flush=True)
         spark.stop()
