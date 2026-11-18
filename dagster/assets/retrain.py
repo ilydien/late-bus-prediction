@@ -8,11 +8,22 @@ The schedule is intentionally STOPPED until live 2026 data exists.
 """
 
 import os
+import re
 
 import docker
 import mlflow
 import psycopg2
-from dagster import AssetExecutionContext, MaterializeResult, MetadataValue, asset
+from dagster import (
+    AssetExecutionContext,
+    MaterializeResult,
+    MetadataValue,
+    RetryPolicy,
+    asset,
+)
+
+from governance import run_log
+from quality.checks import run_checks
+from quality.gx_gate import run_gx_gate
 
 SPARK_IMAGE = os.environ.get("SPARK_GOLD_IMAGE", "wmata-spark-gold:latest")
 ML_IMAGE = os.environ.get("ML_IMAGE", "wmata-ml:latest")
@@ -39,6 +50,14 @@ PG_ENV = {
     "POSTGRES_GOLD_USER": USER,
     "POSTGRES_GOLD_PASSWORD": PASSWORD,
 }
+S3_ENV = {
+    **PG_ENV,
+    "AWS_ACCESS_KEY_ID": os.environ.get("SEAWEEDFS_ACCESS_KEY", "seaweedfs-access-key"),
+    "AWS_SECRET_ACCESS_KEY": os.environ.get("SEAWEEDFS_SECRET_KEY", "seaweedfs-secret-key"),
+    "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
+    "AWS_EC2_METADATA_DISABLED": "true",
+}
+
 ML_ENV = {
     **PG_ENV,
     "MLFLOW_TRACKING_URI": MLFLOW_URI,
@@ -55,6 +74,7 @@ ML_ENV = {
     "TRAIN_MIN_WEEKS": os.environ.get("TRAIN_MIN_WEEKS", "4"),
     "TRAIN_VALID_DAYS": os.environ.get("TRAIN_VALID_DAYS", "7"),
     "TRAIN_TEST_DAYS": os.environ.get("TRAIN_TEST_DAYS", "7"),
+    "GIT_COMMIT": run_log.git_commit(),
 }
 
 FEATURE_COLS = [
@@ -130,9 +150,17 @@ def _finalize_gold(context: AssetExecutionContext) -> None:
         )
         conn.commit()
     context.log.info(f"finalize staged={staged} merged={merged} silver_max={silver_max}")
+    return staged, merged, silver_max
 
 
-def _run(context: AssetExecutionContext, image: str, command: list[str], env: dict, entrypoint=None) -> str:
+def _run(
+    context: AssetExecutionContext,
+    image: str,
+    command: list[str],
+    env: dict,
+    entrypoint=None,
+    volumes=None,
+) -> str:
     client = docker.from_env()
     context.log.info(f"running {image}: {' '.join(command)}")
     try:
@@ -142,6 +170,7 @@ def _run(context: AssetExecutionContext, image: str, command: list[str], env: di
             entrypoint=entrypoint,
             network=NETWORK,
             environment=env,
+            volumes=volumes,
             remove=True,
             detach=False,
         )
@@ -165,7 +194,10 @@ def _silver_conn():
     )
 
 
-@asset(group_name="retrain")
+@asset(
+    group_name="retrain",
+    retry_policy=RetryPolicy(max_retries=2, delay=10),
+)
 def gold_trip_delay_features(context: AssetExecutionContext) -> MaterializeResult:
     with _gold_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -188,15 +220,66 @@ def gold_trip_delay_features(context: AssetExecutionContext) -> MaterializeResul
             }
         )
 
-    mode = "incremental" if watermark is not None else "full"
-    _run(
-        context,
-        SPARK_IMAGE,
-        ["--driver-memory", "2g", "/opt/spark/jobs/build_gold.py", "--mode", mode],
-        PG_ENV,
-        entrypoint="/opt/spark/bin/spark-submit",
+    run_id = context.run_id
+    run_log.safe_start_run(
+        run_id,
+        "gold_trip_delay_features",
+        "gold",
+        input_datasets=["silver.bus_trip_snapshot", "silver.route_stats"],
+        output_datasets=["gold.trip_delay_features"],
+        source_manifest={
+            "batch_id": run_id,
+            "watermark": str(watermark),
+            "max_silver": str(max_silver),
+        },
     )
-    _finalize_gold(context)
+
+    mode = "incremental" if watermark is not None else "full"
+    try:
+        run_checks(run_id=run_id, layer="silver", fail_on_critical=True)
+        _run(
+            context,
+            SPARK_IMAGE,
+            ["--driver-memory", "2g", "/opt/spark/jobs/build_gold.py", "--mode", mode],
+            PG_ENV,
+            entrypoint="/opt/spark/bin/spark-submit",
+        )
+        with _gold_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM public.trip_delay_features_staging")
+            staged_rows = int(cur.fetchone()[0])
+        if staged_rows == 0:
+            # No row has a complete 14-16 minute future target yet. Advance the
+            # watermark without failing the quality gate on an empty batch.
+            staged, merged, silver_max = _finalize_gold(context)
+            run_log.safe_finish_run(
+                run_id,
+                "success",
+                row_counts={
+                    "staged": staged,
+                    "merged": merged,
+                    "silver_max": str(silver_max),
+                    "note": "empty staging",
+                },
+            )
+            return MaterializeResult(
+                metadata={
+                    "mode": mode,
+                    "skipped": True,
+                    "reason": "empty gold staging",
+                }
+            )
+        run_gx_gate(run_id=run_id, dataset="staging", fail_on_error=True)
+        run_checks(run_id=run_id, layer="gold_staging", fail_on_critical=True)
+        staged, merged, silver_max = _finalize_gold(context)
+        run_checks(run_id=run_id, layer="gold", fail_on_critical=True)
+        run_log.safe_finish_run(
+            run_id,
+            "success",
+            row_counts={"staged": staged, "merged": merged, "silver_max": str(silver_max)},
+        )
+    except Exception as exc:  # noqa: BLE001 - record the failure before retrying
+        run_log.safe_finish_run(run_id, "failed", error=str(exc))
+        raise
 
     with _gold_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -209,7 +292,11 @@ def gold_trip_delay_features(context: AssetExecutionContext) -> MaterializeResul
     )
 
 
-@asset(deps=[gold_trip_delay_features], group_name="retrain")
+@asset(
+    deps=[gold_trip_delay_features],
+    group_name="retrain",
+    retry_policy=RetryPolicy(max_retries=2, delay=10),
+)
 def trip_delay_model(context: AssetExecutionContext) -> MaterializeResult:
     with _gold_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -229,7 +316,26 @@ def trip_delay_model(context: AssetExecutionContext) -> MaterializeResult:
             }
         )
 
-    text = _run(context, ML_IMAGE, ["python", "/app/train_trip_delay.py"], ML_ENV)
+    run_id = context.run_id
+    run_log.safe_start_run(
+        run_id,
+        "trip_delay_model",
+        "ml",
+        input_datasets=["gold.trip_delay_features"],
+        output_datasets=["mlflow.trip_delay_lgbm", "gold.model_predictions"],
+    )
+    try:
+        text = _run(context, ML_IMAGE, ["python", "/app/train_trip_delay.py"], ML_ENV)
+        match = re.search(r"model_version=([0-9a-f]+)", text)
+        mlflow_run_id = match.group(1) if match else "unknown"
+        run_log.safe_finish_run(
+            run_id,
+            "success",
+            row_counts={"mlflow_run_id": mlflow_run_id},
+        )
+    except Exception as exc:  # noqa: BLE001
+        run_log.safe_finish_run(run_id, "failed", error=str(exc))
+        raise
     return MaterializeResult(
         metadata={"training_log_tail": MetadataValue.text(text[-2000:])}
     )

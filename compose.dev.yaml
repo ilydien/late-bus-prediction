@@ -561,8 +561,14 @@ services:
       WMATA_NETWORK: wmata-lateness_wmata-lateness-dev
       SPARK_GOLD_IMAGE: wmata-spark-gold:latest
       ML_IMAGE: wmata-ml:latest
+      DLT_IMAGE: wmata-lateness-dlt:latest
+      DLT_STATE_VOLUME: wmata-lateness_dlt-state
+      DLT_START_DATE: "2020-01-06"
+      DLT_END_DATE: "2020-02-08"
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MLFLOW_S3_ENDPOINT_URL: ${SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs:8333}
+      QUALITY_REPORT_DIR: /opt/dagster/app/quality/reports
+      PARQUET_RETENTION_VERSIONS: "7"
     env_file:
       - .env
     volumes:
@@ -570,6 +576,10 @@ services:
       - ./dlt:/opt/dagster/dlt
       - ./dbt:/opt/dagster/dbt
       - ./gx_quality:/opt/dagster/app/gx_quality
+      - ./quality:/opt/dagster/app/quality
+      - ./governance:/opt/dagster/app/governance:ro
+      - ./tests:/opt/dagster/app/tests:ro
+      - ./.git:/opt/dagster/app/.git:ro
       - ./shared:/opt/dagster/app/shared:ro
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     depends_on:
@@ -776,14 +786,23 @@ services:
     build:
       context: ./dlt
       dockerfile: Containerfile
+    command: ["ingest_wmata_2020.py"]
     restart: "no"
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+      seaweedfs-bridge:
+        condition: service_healthy
     environment:
       POSTGRES_INFRA_USER: ${POSTGRES_INFRA_USER:-postgres}
       POSTGRES_INFRA_PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
       DESTINATION__POSTGRES__CREDENTIALS__PASSWORD: ${POSTGRES_INFRA_PASSWORD:-postgres}
+    env_file:
+      - .env
     volumes:
       - ./dlt:/app
       - ./shared:/app/shared:ro
+      - dlt-state:/work
     working_dir: /app
     networks:
       - wmata-lateness-dev
@@ -910,6 +929,70 @@ services:
     networks:
       - wmata-lateness-dev
     profiles: ["dev"]
+
+  consumer:
+    <<: *default-logging
+    build:
+      context: ./consumer
+      dockerfile: Containerfile
+    command: ["python3", "/app/bronze_consumer.py"]
+    restart: unless-stopped
+    stop_grace_period: 10m
+    env_file:
+      - .env
+    environment:
+      NATS_URL: nats://nats:4222
+      SPARK_MASTER: spark://spark-master:7077
+      SPARK_JOB: /opt/spark/jobs/bronze_to_silver.py
+      SILVER_MERGE: /app/merge_silver.py
+      CONSUMER_STATE: /work/consumer_state.json
+      BRONZE_MANIFEST: /work/bronze_batch.json
+      CONSUMER_HEARTBEAT: /work/consumer_heartbeat
+      CONSUMER_POLL_INTERVAL: "5"
+      CONSUMER_FETCH_TIMEOUT: "2"
+      CONSUMER_ERROR_BACKOFF: "30"
+      CONSUMER_BATCH_SIZE: "200"
+      WMATA_BRONZE_PREFIXES: "bronze_"
+      TRAFFIC_BRONZE_PREFIX: "ddot/"
+      QUALITY_REPORT_DIR: /work/quality
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedfs-access-key}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfs-secret-key}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    volumes:
+      - ./consumer:/app
+      - ./quality:/app/quality:ro
+      - ./governance:/app/governance:ro
+      - ./.git:/app/.git:ro
+      - ./spark/jobs:/opt/spark/jobs:ro
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - consumer-state:/work
+      - ./quality/reports:/work/quality
+    depends_on:
+      nats-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+      db-ready:
+        condition: service_completed_successfully
+      spock-wire-silver:
+        condition: service_completed_successfully
+      seaweedfs:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import os,time; p='/work/consumer_heartbeat'; assert os.path.exists(p) and time.time()-os.path.getmtime(p)<1800\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
   # dlt-demand-nemweb:
   #   <<: *default-logging
   #   build:
@@ -1037,6 +1120,41 @@ services:
   #     - wmata-lateness-dev
   #   profiles: ["dev"]
 
+  serving-api:
+    <<: *default-logging
+    build:
+      context: ./serving/api
+      dockerfile: Containerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_GOLD_HOST: haproxy
+      POSTGRES_GOLD_PORT: "5436"
+      POSTGRES_GOLD_USER: ${POSTGRES_GOLD_USER:-postgres}
+      POSTGRES_GOLD_PASSWORD: ${POSTGRES_GOLD_PASSWORD:-postgres}
+      POSTGRES_DB_WMATA: ${POSTGRES_DB_WMATA:-wmata}
+    ports:
+      - ${HOST_IP:-127.0.0.1}:18000:8000
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
   # monitor:
   #   <<: *default-logging
   #   build:
@@ -1075,3 +1193,5 @@ volumes:
   spock-silver-2-data:
   spock-gold-1-data:
   spock-gold-2-data:
+  consumer-state:
+  dlt-state:
