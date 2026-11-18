@@ -180,8 +180,8 @@ def silver_wmata(spark: SparkSession, keys: list[str]) -> None:
         "speed_kmh",
         "source_file",
     )
-    write_jdbc(out, "wmata", "public.bus_trip_snapshot")
-    print("silver bus_trip_snapshot written", flush=True)
+    write_jdbc(out, "wmata", "public.bus_trip_snapshot_staging")
+    print("silver bus_trip_snapshot_staging written", flush=True)
 
 def parse_hms(value: str) -> int | None:
     try:
@@ -252,8 +252,8 @@ def route_stats(spark: SparkSession) -> None:
         )
 
     df = spark.createDataFrame(rows)
-    write_jdbc(df, "wmata", "public.route_stats")
-    print(f"silver route_stats rows={len(rows):,}", flush=True)
+    write_jdbc(df, "wmata", "public.route_stats_staging")
+    print(f"silver route_stats_staging rows={len(rows):,}", flush=True)
 
 
 def silver_ddot(spark: SparkSession, keys: list[str]) -> None:
@@ -366,8 +366,8 @@ def silver_ddot(spark: SparkSession, keys: list[str]) -> None:
         df = df.toDF(*[c.lower() for c in df.columns])
         pk = spec[0][0].lower()
         df = df.filter(F.col(pk).isNotNull())
-        write_jdbc(df, "traffic", f"public.{name}")
-        print(f"silver {name} rows={len(rows):,}", flush=True)
+        write_jdbc(df, "traffic", f"public.{name}_staging")
+        print(f"silver {name}_staging rows={len(rows):,}", flush=True)
 
 
 def main() -> None:

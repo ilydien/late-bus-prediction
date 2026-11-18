@@ -1,0 +1,15 @@
+{
+  "created_at": "2026-11-18T00:00:00+00:00",
+  "wmata": [
+    {
+      "s3_key": "bronze_2020/bus_positions/1794798468.890579.4b34e9f1f0.jsonl.gz",
+      "etag": "8d95c0c16d13e7e577c7437ce1ef2716-4"
+    }
+  ],
+  "traffic": [
+    {
+      "s3_key": "ddot/taz/traffic_analysis_zones.geojson",
+      "etag": "64d54b0fa0374387a93ad3dd15214c68"
+    }
+  ]
+}
