@@ -1,283 +1,482 @@
+"""Platform health probe, Prometheus metrics endpoint, and vmalert -> Telegram relay."""
+
+from __future__ import annotations
+
+import json
 import logging
 import os
 import shutil
+import signal
+import socket
 import sys
+import threading
 import time
+import urllib.parse
 import urllib.request
-import urllib.error
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable
 
 import psutil
 
 sys.path.insert(0, "/app")
 
 from shared.alerts import send_alert
+from shared.logging import run_context, setup_json_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+setup_json_logging("health-monitor")
 logger = logging.getLogger("health-monitor")
 
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
-POSTGRES_DB_INFRA = os.environ.get("POSTGRES_DB_INFRA", "infra")
-POSTGRES_DB_WMATA = os.environ.get("POSTGRES_DB_WMATA", "wmata")
-POSTGRES_DB_TRAFFIC = os.environ.get("POSTGRES_DB_TRAFFIC", "traffic")
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
+MONITOR_PORT = int(os.environ.get("MONITOR_PORT", "8090"))
+
 POSTGRES_INFRA_HOST = os.environ.get("POSTGRES_INFRA_HOST", "postgres-infra")
 POSTGRES_INFRA_PORT = int(os.environ.get("POSTGRES_INFRA_PORT", "5432"))
-POSTGRES_INFRA_USER = os.environ.get("POSTGRES_INFRA_USER", "postgres")
-POSTGRES_INFRA_PASSWORD = os.environ.get("POSTGRES_INFRA_PASSWORD", "postgres")
 POSTGRES_SILVER_HOST = os.environ.get("POSTGRES_SILVER_HOST", "haproxy")
 POSTGRES_SILVER_PORT = int(os.environ.get("POSTGRES_SILVER_PORT", "5433"))
-POSTGRES_SILVER_USER = os.environ.get("POSTGRES_SILVER_USER", "postgres")
-POSTGRES_SILVER_PASSWORD = os.environ.get("POSTGRES_SILVER_PASSWORD", "postgres")
 POSTGRES_GOLD_HOST = os.environ.get("POSTGRES_GOLD_HOST", "haproxy")
 POSTGRES_GOLD_PORT = int(os.environ.get("POSTGRES_GOLD_PORT", "5434"))
-POSTGRES_GOLD_USER = os.environ.get("POSTGRES_GOLD_USER", "postgres")
-POSTGRES_GOLD_PASSWORD = os.environ.get("POSTGRES_GOLD_PASSWORD", "postgres")
-NATS_URL = os.environ.get("NATS_URL", "nats://nats:8222")
-DEBEZIUM_URL = os.environ.get("DEBEZIUM_URL", "http://debezium-wmata:8080")
-VM_URL = os.environ.get("VM_URL", "http://victoriametrics:8428")
-VL_URL = os.environ.get("VL_URL", "http://victorialogs:9428")
+
+HAPROXY_STATS_URL = os.environ.get("HAPROXY_STATS_URL", "http://haproxy:8404")
+SEAWEEDFS_URL = os.environ.get("SEAWEEDFS_URL", "http://seaweedfs:9333")
+SEAWEEDFS_BRIDGE_URL = os.environ.get("SEAWEEDFS_BRIDGE_URL", "http://seaweedfs-bridge:8080")
+NATS_MON_URL = os.environ.get("NATS_MON_URL", "http://nats:8222")
+DEBEZIUM_WMATA_URL = os.environ.get("DEBEZIUM_WMATA_URL", "http://debezium-wmata:8080")
+DEBEZIUM_TRAFFIC_URL = os.environ.get("DEBEZIUM_TRAFFIC_URL", "http://debezium-traffic:8080")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000")
 MLFLOW_URL = os.environ.get("MLFLOW_URL", "http://mlflow:5000")
-INFERENCE_URL = os.environ.get("INFERENCE_URL", "http://inference:8001")
-SEAWEEDFS_URL = os.environ.get("SEAWEEDFS_URL", "http://seaweedfs:9333")
-DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://dashboard-backend:8000")
-VM_API_URL = f"{VM_URL}/api/v1/import/prometheus"
+TRINO_URL = os.environ.get("TRINO_URL", "http://trino:8080")
+VM_URL = os.environ.get("VM_URL", "http://victoriametrics:8428")
+VL_URL = os.environ.get("VL_URL", "http://victorialogs:9428")
+VECTOR_URL = os.environ.get("VECTOR_URL", "http://vector:8686")
+VMALERT_URL = os.environ.get("VMALERT_URL", "http://vmalert:8880")
 
-_failures: dict[str, int] = {}
-FAILURE_THRESHOLD = 2
+_STATE_LOCK = threading.Lock()
+_latest_checks: dict[str, dict[str, object]] = {}
+_latest_host_metrics: dict[str, float] = {}
+_last_run_ts: float = 0.0
+_alert_counts: dict[tuple[str, str], int] = {}
+_firing_keys: set[str] = set()
 
-CPU_THRESHOLD = 90.0
-MEMORY_THRESHOLD = 80.0
-DISK_THRESHOLD = 80.0
 
-
-def _push_metric(name: str, value: float, labels: dict | None = None) -> None:
-    label_str = (
-        ",".join(f'{k}="{v}"' for k, v in sorted(labels.items())) if labels else ""
-    )
-    now = int(time.time())
-    line = f"{name}{{{label_str}}} {value} {now}\n"
+def _http_ok(url: str, timeout: int = 5) -> bool:
     try:
-        req = urllib.request.Request(
-            VM_API_URL,
-            data=line.encode(),
-            headers={"Content-Type": "text/plain"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        logger.warning("Failed to push %s: %s", name, e)
-
-
-def _http_get(url: str, timeout: int = 5) -> bool:
-    try:
-        resp = urllib.request.urlopen(url, timeout=timeout)
-        return 200 <= resp.status < 400
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= resp.status < 400
     except Exception:
         return False
 
 
-def _check_postgres_infra() -> bool:
-    import socket
-
+def _tcp_ok(host: str, port: int, timeout: int = 3) -> bool:
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3)
-        s.connect((POSTGRES_INFRA_HOST, POSTGRES_INFRA_PORT))
-        s.close()
-        return True
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
     except Exception:
         return False
 
 
-def _check_postgres_silver() -> bool:
-    import socket
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3)
-        s.connect((POSTGRES_SILVER_HOST, POSTGRES_SILVER_PORT))
-        s.close()
-        return True
-    except Exception:
-        return False
-
-
-def _check_postgres_gold() -> bool:
-    import socket
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3)
-        s.connect((POSTGRES_GOLD_HOST, POSTGRES_GOLD_PORT))
-        s.close()
-        return True
-    except Exception:
-        return False
-
-
-def _check_nats() -> bool:
-    return _http_get(f"http://{NATS_URL.split('//')[-1]}/healthz")
-
-
-def _check_debezium() -> bool:
-    return _http_get(f"{DEBEZIUM_URL}/q/health/ready", timeout=5)
-
-
-def _check_victoriametrics() -> bool:
-    return _http_get(f"{VM_URL}/-/healthy")
-
-
-def _check_victorialogs() -> bool:
-    return _http_get(f"{VL_URL}/health")
-
-
-def _check_dagster() -> bool:
-    return _http_get(f"{DAGSTER_URL}/dagit_info")
-
-
-def _check_mlflow() -> bool:
-    return _http_get(f"{MLFLOW_URL}/health")
-
-
-def _check_inference() -> bool:
-    return _http_get(f"{INFERENCE_URL}/health")
-
-
-def _check_seaweedfs() -> bool:
-    return _http_get(f"{SEAWEEDFS_URL}/cluster/status")
-
-
-def _check_dashboard() -> bool:
-    return _http_get(f"{DASHBOARD_URL}/health")
-
-
-def _check_vm_disk() -> bool:
-    try:
-        url = f"{VM_URL}/api/v1/query?query=min(vm_free_disk_space_bytes)"
-        resp = urllib.request.urlopen(url, timeout=5)
-        data = resp.json()
-        results = data.get("data", {}).get("result", [])
-        if results:
-            free_bytes = float(results[0]["value"][1])
-            free_gb = free_bytes / (1024**3)
-            if free_gb < 1.0:
-                send_alert(
-                    f"VictoriaMetrics disk low: *{free_gb:.1f}GB* free",
-                    level="CRITICAL",
-                    throttle_key="vm_disk_low",
-                    throttle_seconds=1800,
-                )
-                return False
-        return True
-    except Exception:
-        return True
-
-
-def _check_system_resources() -> None:
-    try:
-        cpu = psutil.cpu_percent(interval=1)
-        mem = psutil.virtual_memory().percent
-        disk = shutil.disk_usage("/")
-        disk_pct = (disk.used / disk.total) * 100
-
-        _push_metric("system_cpu_percent", cpu)
-        _push_metric("system_memory_percent", mem)
-        _push_metric("system_disk_percent", disk_pct)
-
-        if cpu > CPU_THRESHOLD:
-            send_alert(
-                f"System CPU usage *{cpu:.1f}%* exceeds {CPU_THRESHOLD}%",
-                level="CRITICAL",
-                throttle_key="system_cpu",
-                throttle_seconds=600,
-            )
-        if mem > MEMORY_THRESHOLD:
-            send_alert(
-                f"System RAM usage *{mem:.1f}%* exceeds {MEMORY_THRESHOLD}%",
-                level="CRITICAL",
-                throttle_key="system_mem",
-                throttle_seconds=600,
-            )
-        if disk_pct > DISK_THRESHOLD:
-            send_alert(
-                f"System disk usage *{disk_pct:.1f}%* exceeds {DISK_THRESHOLD}%",
-                level="CRITICAL",
-                throttle_key="system_disk",
-                throttle_seconds=600,
-            )
-    except Exception as e:
-        logger.warning("System resource check failed: %s", e)
-
-
-def _alert_if_persistent(name: str, ok: bool) -> None:
-    if ok:
-        _failures.pop(name, None)
-        return
-    _failures[name] = _failures.get(name, 0) + 1
-    if _failures[name] == FAILURE_THRESHOLD:
-        send_alert(
-            f"Service *{name}* is DOWN (failed {FAILURE_THRESHOLD} consecutive checks)",
-            level="CRITICAL",
-            throttle_key=f"monitor_{name}",
-            throttle_seconds=600,
-        )
-    elif _failures[name] > FAILURE_THRESHOLD and _failures[name] % 10 == 0:
-        send_alert(
-            f"Service *{name}* still DOWN ({_failures[name]} consecutive failures)",
-            level="CRITICAL",
-            throttle_key=f"monitor_{name}",
-            throttle_seconds=600,
-        )
-
-
-def _push_health_metrics(checks_results: list[tuple[str, bool]]) -> None:
-    for name, ok in checks_results:
-        _push_metric("service_up", 1.0 if ok else 0.0, {"service": name})
-
-
-def run_checks() -> list[tuple[str, bool]]:
-    checks = [
-        ("PostgreSQL Infra", _check_postgres_infra),
-        ("PostgreSQL Silver", _check_postgres_silver),
-        ("PostgreSQL Gold", _check_postgres_gold),
-        ("NATS", _check_nats),
-        ("Debezium", _check_debezium),
-        ("VictoriaMetrics", _check_victoriametrics),
-        ("VictoriaLogs", _check_victorialogs),
-        ("Dagster", _check_dagster),
-        ("MLflow", _check_mlflow),
-        ("Inference", _check_inference),
-        ("SeaweedFS", _check_seaweedfs),
-        ("Dashboard Backend", _check_dashboard),
+def _build_checks() -> list[tuple[str, Callable[[], bool]]]:
+    return [
+        ("postgres-infra", lambda: _tcp_ok(POSTGRES_INFRA_HOST, POSTGRES_INFRA_PORT)),
+        ("haproxy-silver-rw", lambda: _tcp_ok(POSTGRES_SILVER_HOST, POSTGRES_SILVER_PORT)),
+        ("haproxy-gold-rw", lambda: _tcp_ok(POSTGRES_GOLD_HOST, POSTGRES_GOLD_PORT)),
+        ("haproxy-stats", lambda: _http_ok(f"{HAPROXY_STATS_URL}/")),
+        ("seaweedfs", lambda: _http_ok(f"{SEAWEEDFS_URL}/cluster/status")),
+        ("seaweedfs-bridge", lambda: _http_ok(f"{SEAWEEDFS_BRIDGE_URL}/health")),
+        ("nats", lambda: _http_ok(f"{NATS_MON_URL}/healthz")),
+        ("debezium-wmata", lambda: _http_ok(f"{DEBEZIUM_WMATA_URL}/q/health/ready")),
+        ("debezium-traffic", lambda: _http_ok(f"{DEBEZIUM_TRAFFIC_URL}/q/health/ready")),
+        ("dagster-webserver", lambda: _http_ok(f"{DAGSTER_URL}/dagit_info")),
+        ("mlflow", lambda: _http_ok(f"{MLFLOW_URL}/health")),
+        ("trino", lambda: _http_ok(f"{TRINO_URL}/v1/info")),
+        ("victoriametrics", lambda: _http_ok(f"{VM_URL}/-/healthy")),
+        ("victorialogs", lambda: _http_ok(f"{VL_URL}/health")),
+        ("vector", lambda: _http_ok(f"{VECTOR_URL}/health")),
     ]
-    results = []
-    for name, check_fn in checks:
-        ok = check_fn()
-        _alert_if_persistent(name, ok)
-        results.append((name, ok))
 
-    _push_health_metrics(results)
-    _check_vm_disk()
-    _check_system_resources()
 
+def run_checks() -> dict[str, dict[str, object]]:
+    """Run all service health probes and update in-memory metrics snapshot."""
+    global _last_run_ts
+    results: dict[str, dict[str, object]] = {}
+
+    for name, fn in _build_checks():
+        t0 = time.monotonic()
+        ok = fn()
+        elapsed = round(time.monotonic() - t0, 4)
+        results[name] = {"up": ok, "status": "ok" if ok else "down", "duration_s": elapsed}
+        if not ok:
+            logger.warning("Service check failed: %s", name, extra={"domain": "infra", "layer": "ops", "job": "health_probe"})
+
+    cpu = psutil.cpu_percent(interval=None)
+    mem = psutil.virtual_memory().percent
+    disk = shutil.disk_usage("/")
+    disk_pct = round((disk.used / disk.total) * 100.0, 2)
+
+    with _STATE_LOCK:
+        _latest_checks.clear()
+        _latest_checks.update(results)
+        _latest_host_metrics.clear()
+        _latest_host_metrics.update(
+            {
+                "cpu_percent": float(cpu),
+                "memory_percent": float(mem),
+                "disk_percent": float(disk_pct),
+            }
+        )
+        _last_run_ts = time.time()
+
+    up_count = sum(1 for item in results.values() if item["up"])
+    logger.info(
+        "Health probe completed: %d/%d services UP",
+        up_count,
+        len(results),
+        extra={"domain": "infra", "layer": "ops", "job": "health_probe"},
+    )
     return results
 
 
-def main() -> None:
-    logger.info(
-        "Health monitor started (interval=%ds, threshold=%d)",
-        CHECK_INTERVAL,
-        FAILURE_THRESHOLD,
+def render_prometheus_metrics() -> str:
+    """Render current health probe and alert relay counters in Prometheus exposition format."""
+    lines = [
+        "# HELP wmata_service_up Service health status (1=up, 0=down)",
+        "# TYPE wmata_service_up gauge",
+        "# HELP wmata_service_check_duration_seconds Health check duration in seconds",
+        "# TYPE wmata_service_check_duration_seconds gauge",
+    ]
+    with _STATE_LOCK:
+        checks_copy = dict(_latest_checks)
+        host_copy = dict(_latest_host_metrics)
+        alert_copy = dict(_alert_counts)
+        last_ts = _last_run_ts
+
+    for svc, info in sorted(checks_copy.items()):
+        up_val = 1 if info["up"] else 0
+        lines.append(f'wmata_service_up{{service="{svc}"}} {up_val}')
+        lines.append(f'wmata_service_check_duration_seconds{{service="{svc}"}} {info["duration_s"]}')
+
+    lines.extend(
+        [
+            "# HELP wmata_monitor_last_run_timestamp Unix timestamp of last health probe cycle",
+            "# TYPE wmata_monitor_last_run_timestamp gauge",
+            f"wmata_monitor_last_run_timestamp {last_ts:.3f}",
+        ]
     )
-    while True:
+
+    for metric_key, prom_name in (
+        ("cpu_percent", "wmata_host_cpu_percent"),
+        ("memory_percent", "wmata_host_memory_percent"),
+        ("disk_percent", "wmata_host_disk_percent"),
+    ):
+        if metric_key in host_copy:
+            lines.append(f"# TYPE {prom_name} gauge")
+            lines.append(f"{prom_name} {host_copy[metric_key]}")
+
+    if alert_copy:
+        lines.append("# HELP wmata_alert_notifications_total Alert notifications processed by relay")
+        lines.append("# TYPE wmata_alert_notifications_total counter")
+        for (alertname, status), count in sorted(alert_copy.items()):
+            lines.append(
+                f'wmata_alert_notifications_total{{alertname="{alertname}",status="{status}"}} {count}'
+            )
+
+    return "\n".join(lines) + "\n"
+
+
+def _parse_iso_ts(value: str | None) -> float | None:
+    if not value or value.startswith("0001-"):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _is_alert_resolved(alert: dict, top_status: str | None = None) -> bool:
+    if top_status and top_status.lower() == "resolved":
+        return True
+    if str(alert.get("status", "")).lower() == "resolved":
+        return True
+    ends_ts = _parse_iso_ts(alert.get("endsAt"))
+    if ends_ts is not None and ends_ts <= time.time() + 2.0:
+        return True
+    return False
+
+
+def handle_alertmanager_payload(payload: object) -> int:
+    """Process vmalert / Alertmanager webhook payload and dispatch Telegram notifications."""
+    top_status: str | None = None
+    if isinstance(payload, list):
+        alerts = payload
+    elif isinstance(payload, dict):
+        top_status = payload.get("status")
+        alerts = payload.get("alerts", [])
+    else:
+        return 0
+
+    processed = 0
+    for alert in alerts:
+        if not isinstance(alert, dict):
+            continue
+        labels = alert.get("labels", {})
+        annotations = alert.get("annotations", {})
+        alert_name = str(labels.get("alertname", "UnknownAlert"))
+        severity = str(labels.get("severity", "CRITICAL")).upper()
+        service = str(labels.get("service", labels.get("job", "platform")))
+        summary = str(annotations.get("summary", alert_name))
+        description = str(annotations.get("description", ""))
+        runbook = annotations.get("runbook")
+
+        resolved = _is_alert_resolved(alert, top_status)
+        status = "RESOLVED" if resolved else "FIRING"
+
+        label_sig = ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
+        dedup_key = f"{alert_name}:{label_sig}"
+
+        with _STATE_LOCK:
+            was_firing = dedup_key in _firing_keys
+            if resolved:
+                _firing_keys.discard(dedup_key)
+            else:
+                _firing_keys.add(dedup_key)
+            _alert_counts[(alert_name, status)] = _alert_counts.get((alert_name, status), 0) + 1
+
+        if resolved and not was_firing:
+            processed += 1
+            continue
+
+        body_parts = [f"*Service:* `{service}`", f"*Summary:* {summary}"]
+        if description:
+            body_parts.append(f"*Detail:* {description}")
+        message = "\n".join(body_parts)
+
+        logger.info(
+            "Alert relay %s: %s (%s)",
+            status,
+            alert_name,
+            service,
+            extra={"domain": "infra", "layer": "ops", "job": "alert_relay"},
+        )
+        send_alert(
+            message=message,
+            level=severity,
+            throttle_key=dedup_key,
+            throttle_seconds=300,
+            alert_name=alert_name,
+            status=status,
+            runbook=str(runbook) if runbook else None,
+        )
+        processed += 1
+
+    return processed
+
+
+def _fetch_json(url: str, timeout: int = 5) -> object | None:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _query_vm(promql: str) -> list[dict[str, object]]:
+    encoded = urllib.parse.urlencode({"query": promql})
+    data = _fetch_json(f"{VM_URL.rstrip('/')}/api/v1/query?{encoded}")
+    if not isinstance(data, dict):
+        return []
+    result = data.get("data", {}).get("result", [])
+    rows: list[dict[str, object]] = []
+    for item in result:
+        val = item.get("value", [None, None])
         try:
-            run_checks()
-        except Exception as e:
-            logger.exception("Health check loop error: %s", e)
-        time.sleep(CHECK_INTERVAL)
+            num = float(val[1])
+        except (TypeError, ValueError, IndexError):
+            num = 0.0
+        rows.append({"labels": item.get("metric", {}), "value": num})
+    return rows
+
+
+def build_monitoring_summary() -> dict[str, object]:
+    """Build a unified monitoring JSON snapshot for the React dashboard."""
+    with _STATE_LOCK:
+        services = dict(_latest_checks)
+        host = dict(_latest_host_metrics)
+        last_run = _last_run_ts
+
+    alerts_raw = _fetch_json(f"{VMALERT_URL.rstrip('/')}/api/v1/alerts")
+    alerts = alerts_raw.get("data", {}).get("alerts", []) if isinstance(alerts_raw, dict) else []
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "last_probe_ts": last_run,
+        "services": services,
+        "host": host,
+        "alerts": alerts,
+        "metrics": {
+            "container_cpu_pct": _query_vm('sum by (name) (rate(container_cpu_usage_seconds_total{name!=""}[1m])) * 100'),
+            "container_memory_bytes": _query_vm('container_memory_working_set_bytes{name!=""}'),
+            "nats_stream_messages": _query_vm("jetstream_stream_total_messages"),
+            "nats_consumer_pending": _query_vm("jetstream_consumer_num_pending"),
+            "pg_up": _query_vm("pg_up"),
+            "spock_replicating": _query_vm("spock_subscription_is_replicating"),
+        },
+    }
+
+
+def query_logs(
+    service: str = "",
+    level: str = "",
+    run_id: str = "",
+    limit: int = 50,
+) -> dict[str, object]:
+    """Query structured logs from VictoriaLogs for dashboard log exploration."""
+    terms: list[str] = []
+    for key, val in (("service", service), ("level", level), ("run_id", run_id)):
+        clean = val.strip().replace('"', "")
+        if clean:
+            terms.append(f'{key}:"{clean}"')
+    logsql = " ".join(terms) if terms else "*"
+    bounded_limit = max(1, min(int(limit), 200))
+    params = urllib.parse.urlencode({"query": logsql, "limit": str(bounded_limit)})
+    url = f"{VL_URL.rstrip('/')}/select/logsql/query?{params}"
+
+    entries: list[dict[str, object]] = []
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            for raw_line in resp.read().decode("utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as exc:
+        logger.warning("VictoriaLogs query failed: %s", exc)
+
+    return {"query": logsql, "count": len(entries), "logs": entries}
+
+
+class MonitorHandler(BaseHTTPRequestHandler):
+    """HTTP handler serving /health, /metrics, /api/monitoring/*, and /api/v2/alerts."""
+
+    server_version = "wmata-health-monitor/1.0"
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        logger.debug("http: " + fmt, *args)
+
+    def _send_bytes(self, status: int, content_type: str, data: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_OPTIONS(self) -> None:
+        self._send_bytes(204, "text/plain; charset=utf-8", b"")
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path == "/health":
+            with _STATE_LOCK:
+                checks = {k: v["status"] for k, v in _latest_checks.items()}
+                last_run = _last_run_ts
+            body = json.dumps(
+                {
+                    "status": "ok",
+                    "service": "health-monitor",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "last_probe_ts": last_run,
+                    "checks": checks,
+                }
+            ).encode("utf-8")
+            self._send_bytes(200, "application/json", body)
+        elif path == "/metrics":
+            body = render_prometheus_metrics().encode("utf-8")
+            self._send_bytes(200, "text/plain; version=0.0.4; charset=utf-8", body)
+        elif path == "/api/monitoring/summary":
+            body = json.dumps(build_monitoring_summary()).encode("utf-8")
+            self._send_bytes(200, "application/json", body)
+        elif path == "/api/monitoring/logs":
+            qs = urllib.parse.parse_qs(parsed.query)
+            limit_raw = qs.get("limit", ["50"])[0]
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                limit = 50
+            result = query_logs(
+                service=qs.get("service", [""])[0],
+                level=qs.get("level", [""])[0],
+                run_id=qs.get("run_id", [""])[0],
+                limit=limit,
+            )
+            self._send_bytes(200, "application/json", json.dumps(result).encode("utf-8"))
+        else:
+            self._send_bytes(404, "text/plain; charset=utf-8", b"not found")
+
+    def do_POST(self) -> None:
+        if self.path not in ("/api/v2/alerts", "/api/v1/alerts", "/alert-webhook"):
+            self._send_bytes(404, "text/plain; charset=utf-8", b"not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            payload = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            self._send_bytes(400, "application/json", b'{"error":"invalid json"}')
+            return
+
+        with run_context("alert"):
+            count = handle_alertmanager_payload(payload)
+        resp = json.dumps({"status": "ok", "processed": count}).encode("utf-8")
+        self._send_bytes(200, "application/json", resp)
+
+
+def _probe_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        with run_context("probe"):
+            try:
+                run_checks()
+            except Exception as exc:
+                logger.exception(
+                    "Health check loop error: %s",
+                    exc,
+                    extra={"domain": "infra", "layer": "ops", "job": "health_probe"},
+                )
+        stop_event.wait(CHECK_INTERVAL)
+
+
+def main() -> None:
+    stop_event = threading.Event()
+    server = ThreadingHTTPServer(("0.0.0.0", MONITOR_PORT), MonitorHandler)
+    server.daemon_threads = True
+
+    def _shutdown(signum: int, _frame: object) -> None:
+        logger.info("Received signal %s, shutting down", signum)
+        stop_event.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    # Initial probe before serving requests
+    with run_context("probe-init"):
+        run_checks()
+
+    probe_thread = threading.Thread(target=_probe_loop, args=(stop_event,), daemon=True)
+    probe_thread.start()
+
+    logger.info("Health monitor listening on :%d (interval=%ds)", MONITOR_PORT, CHECK_INTERVAL)
+    try:
+        server.serve_forever()
+    finally:
+        stop_event.set()
+        server.server_close()
 
 
 if __name__ == "__main__":

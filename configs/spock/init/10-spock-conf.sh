@@ -46,13 +46,5 @@ set_conf spock.save_resolutions on
 # per database by 40-extensions.sh.
 set_conf snowflake.node "${NODE_ORDINAL}"
 
-# PostgreSQL 18 restricts logical decoding to the plugins listed in
-# output_plugin_libraries. Spock's `spock_output` must be listed, otherwise the
-# apply worker fails to create its replication slot. Detect support from the
-# shipped sample config; `postgres --describe-config` is not reliable while the
-# entrypoint's temporary server is running.
-if pg_config --sharedir >/dev/null 2>&1 \
-  && grep -qE '^#?[[:space:]]*output_plugin_libraries' \
-    "$(pg_config --sharedir)/postgresql.conf.sample" 2>/dev/null; then
-  set_conf output_plugin_libraries "'pgoutput, test_decoding, spock_output'"
-fi
+# CVE-2026-6471 added output_plugin_libraries; spock_output must be trusted for Spock replication slots.
+set_conf output_plugin_libraries "'pgoutput, test_decoding, spock_output'"

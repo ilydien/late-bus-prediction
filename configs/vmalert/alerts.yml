@@ -1,0 +1,78 @@
+groups:
+  - name: wmata_platform_alerts
+    interval: 15s
+    rules:
+      # Alert A: Pipeline / Batch Job Failed
+      - alert: PipelineJobFailed
+        expr: increase(wmata_pipeline_job_runs_total{status="failed"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          owner: batch-ml
+          category: job-failure
+        annotations:
+          summary: "Pipeline job {{ $labels.job }} failed on {{ $labels.service }}"
+          description: "Job {{ $labels.job }} ({{ $labels.domain }}/{{ $labels.layer }}) recorded a failure in the last 5 minutes."
+          runbook: "docs/runbooks/alerts.md#alert-a-pipelinejobfailed"
+
+      # Alert B: Stream Consumer Lag or Freshness Stale
+      - alert: StreamConsumerLagHigh
+        expr: jetstream_consumer_num_pending > 1000
+        for: 3m
+        labels:
+          severity: warning
+          owner: streaming
+          category: stream-lag
+        annotations:
+          summary: "NATS JetStream consumer lag high on {{ $labels.stream_name }}/{{ $labels.consumer_name }}"
+          description: "Pending messages = {{ $value }} (threshold > 1000 for 3m)."
+          runbook: "docs/runbooks/alerts.md#alert-b-streamlagorstale"
+
+      - alert: StreamFreshnessStale
+        expr: (time() - wmata_stream_last_event_timestamp) > 300
+        for: 2m
+        labels:
+          severity: warning
+          owner: streaming
+          category: stream-freshness
+        annotations:
+          summary: "Stream {{ $labels.stream }} has no fresh events"
+          description: "Last event age is {{ $value | humanizeDuration }} (threshold > 5m)."
+          runbook: "docs/runbooks/alerts.md#alert-b-streamlagorstale"
+
+      # Alert C: Service Down or Resource Saturated
+      - alert: ServiceDown
+        expr: wmata_service_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          owner: platform-ops
+          category: service-health
+        annotations:
+          summary: "Service {{ $labels.service }} is DOWN"
+          description: "Health probe for {{ $labels.service }} has failed for 1 minute."
+          runbook: "docs/runbooks/alerts.md#alert-c-servicedown-resourcehigh"
+
+      - alert: HostResourceHigh
+        expr: wmata_host_memory_percent > 85 or wmata_host_disk_percent > 85
+        for: 2m
+        labels:
+          severity: critical
+          owner: platform-ops
+          category: resource-exhaustion
+        annotations:
+          summary: "Host resource usage critical ({{ $labels.__name__ }})"
+          description: "Current usage is {{ $value }}% (threshold > 85% for 2m)."
+          runbook: "docs/runbooks/alerts.md#alert-c-servicedown-resourcehigh"
+
+      - alert: VictoriaMetricsDiskLow
+        expr: vm_free_disk_space_bytes < 1073741824
+        for: 2m
+        labels:
+          severity: critical
+          owner: platform-ops
+          category: resource-exhaustion
+        annotations:
+          summary: "VictoriaMetrics storage free space < 1 GB"
+          description: "Free bytes remaining: {{ $value }}."
+          runbook: "docs/runbooks/alerts.md#alert-c-servicedown-resourcehigh"
