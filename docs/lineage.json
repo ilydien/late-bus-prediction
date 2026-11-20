@@ -1,0 +1,72 @@
+{
+  "datasets": {
+    "bronze.wmata.bus_positions": {
+      "layer": "bronze",
+      "location": "s3://wmata/bronze_2020/bus_positions/",
+      "owner": "batch",
+      "downstream": ["silver.wmata.bus_trip_snapshot"]
+    },
+    "bronze.traffic.ddot": {
+      "layer": "bronze",
+      "location": "s3://traffic/ddot/",
+      "owner": "batch",
+      "downstream": [
+        "silver.traffic.ddot_aadt_2020",
+        "silver.traffic.ddot_am_speed_2019",
+        "silver.traffic.ddot_taz"
+      ]
+    },
+    "silver.wmata.bus_trip_snapshot": {
+      "layer": "silver",
+      "location": "postgres://wmata/public.bus_trip_snapshot",
+      "owner": "batch",
+      "downstream": ["gold.wmata.trip_delay_features"]
+    },
+    "silver.wmata.route_stats": {
+      "layer": "silver",
+      "location": "postgres://wmata/public.route_stats",
+      "owner": "batch",
+      "downstream": ["gold.wmata.trip_delay_features"]
+    },
+    "gold.wmata.trip_delay_features": {
+      "layer": "gold",
+      "location": "postgres://wmata/public.trip_delay_features",
+      "owner": "batch",
+      "downstream": ["mlflow.trip_delay_lgbm", "gold.wmata.model_predictions"]
+    },
+    "gold.wmata.route_hourly_delay": {
+      "layer": "gold",
+      "location": "postgres://wmata/public.route_hourly_delay",
+      "owner": "batch",
+      "downstream": ["dashboard"]
+    },
+    "gold.wmata.route_daily_reliability": {
+      "layer": "gold",
+      "location": "postgres://wmata/public.route_daily_reliability",
+      "owner": "batch",
+      "downstream": ["dashboard"]
+    },
+    "gold.wmata.route_ddot_features": {
+      "layer": "gold",
+      "location": "postgres://wmata/public.route_ddot_features",
+      "owner": "batch",
+      "downstream": ["gold.wmata.trip_delay_features"]
+    },
+    "gold.parquet.snapshot": {
+      "layer": "gold",
+      "location": "s3://wmata/gold_parquet/",
+      "owner": "batch",
+      "downstream": ["benchmark", "ml.training.snapshot", "audit"]
+    },
+    "gold.wmata.model_predictions": {
+      "layer": "gold",
+      "location": "postgres://wmata/public.model_predictions",
+      "owner": "batch",
+      "downstream": ["dashboard", "monitoring"]
+    }
+  },
+  "runtime": {
+    "run_table": "postgres://wmata/public.pipeline_runs",
+    "quality_table": "postgres://wmata/public.data_quality_runs"
+  }
+}

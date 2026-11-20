@@ -8,12 +8,18 @@
 dlt/state/
 
 # Data storage
-storage/
+storage
+data/
 
 # Python
+.coverage
+htmlcov/
 __pycache__/
 *.pyc
 *.pyo
+
+# Great Expectations runtime context (contains DB connection)
+gx_quality/gx/
 
 # dbt
 dbt/target/

@@ -4,9 +4,11 @@ RUN pip install --no-cache-dir \
   "dlt[postgres]" \
   httpx \
   boto3 \
+  s3fs \
   sqlalchemy
 
 WORKDIR /app
+COPY . /app
 
 ENV PYTHONUNBUFFERED=1
 ENV DLT_PROJECT_DIR=/app

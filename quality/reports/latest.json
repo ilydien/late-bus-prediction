@@ -1,0 +1,357 @@
+{
+  "run_id": "2cebf763-b8c4-428e-b62e-a58f1dc4c575",
+  "generated_at": "2026-11-18T11:38:35.674715+00:00",
+  "layer": "all",
+  "summary": {
+    "overall": "warn",
+    "total": 32,
+    "pass": 31,
+    "fail": 0,
+    "warn": 1
+  },
+  "results": [
+    {
+      "layer": "silver",
+      "dataset": "bus_trip_snapshot",
+      "check_name": "row_count",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 18206575.0,
+      "threshold": 1.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "bus_trip_snapshot",
+      "check_name": "null_keys",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "bus_trip_snapshot",
+      "check_name": "duplicate_pk",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "bus_trip_snapshot",
+      "check_name": "deviation_range",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "bus_trip_snapshot",
+      "check_name": "speed_range",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "bus_trip_snapshot",
+      "check_name": "progress_range",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "bus_trip_snapshot",
+      "check_name": "freshness_hours",
+      "status": "warn",
+      "severity": "warning",
+      "observed": 59387.656649992496,
+      "threshold": 48.0,
+      "details": {
+        "max_snapshot_ts": "2020-02-08T23:59:00+00:00"
+      }
+    },
+    {
+      "layer": "silver",
+      "dataset": "route_stats",
+      "check_name": "row_count",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 250.0,
+      "threshold": 1.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "route_stats",
+      "check_name": "duplicate_pk",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "bus_trip_snapshot",
+      "check_name": "route_coverage_missing_ratio",
+      "status": "pass",
+      "severity": "warning",
+      "observed": 0.035856573705179286,
+      "threshold": 0.05,
+      "details": {
+        "missing_routes": 9,
+        "distinct_routes": 251
+      }
+    },
+    {
+      "layer": "silver",
+      "dataset": "ddot_aadt_2020",
+      "check_name": "row_count",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 7734.0,
+      "threshold": 1.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "ddot_aadt_2020",
+      "check_name": "duplicate_pk",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "ddot_am_speed_2019",
+      "check_name": "row_count",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 7292.0,
+      "threshold": 1.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "ddot_am_speed_2019",
+      "check_name": "duplicate_pk",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "ddot_taz",
+      "check_name": "row_count",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 393.0,
+      "threshold": 1.0,
+      "details": {}
+    },
+    {
+      "layer": "silver",
+      "dataset": "ddot_taz",
+      "check_name": "duplicate_pk",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "trip_delay_features",
+      "check_name": "row_count",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 2565962.0,
+      "threshold": 1.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "trip_delay_features",
+      "check_name": "duplicate_pk",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "trip_delay_features",
+      "check_name": "target_null",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "trip_delay_features",
+      "check_name": "target_range",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "trip_delay_features",
+      "check_name": "null_route_id_ratio",
+      "status": "pass",
+      "severity": "warning",
+      "observed": 0.0,
+      "threshold": 0.02,
+      "details": {
+        "null_rows": 0,
+        "total_rows": 2565962
+      }
+    },
+    {
+      "layer": "gold",
+      "dataset": "trip_delay_features",
+      "check_name": "null_deviation_now_ratio",
+      "status": "pass",
+      "severity": "warning",
+      "observed": 0.0,
+      "threshold": 0.02,
+      "details": {
+        "null_rows": 0,
+        "total_rows": 2565962
+      }
+    },
+    {
+      "layer": "gold",
+      "dataset": "trip_delay_features",
+      "check_name": "null_speed_kmh_ratio",
+      "status": "pass",
+      "severity": "warning",
+      "observed": 0.0034002841819169576,
+      "threshold": 0.02,
+      "details": {
+        "null_rows": 8725,
+        "total_rows": 2565962
+      }
+    },
+    {
+      "layer": "gold",
+      "dataset": "trip_delay_features",
+      "check_name": "null_progress_pct_ratio",
+      "status": "pass",
+      "severity": "warning",
+      "observed": 0.008923358958550438,
+      "threshold": 0.02,
+      "details": {
+        "null_rows": 22897,
+        "total_rows": 2565962
+      }
+    },
+    {
+      "layer": "gold",
+      "dataset": "route_hourly_delay",
+      "check_name": "row_count",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 107279.0,
+      "threshold": 1.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "route_hourly_delay",
+      "check_name": "duplicate_pk",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "route_daily_reliability",
+      "check_name": "row_count",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 7566.0,
+      "threshold": 1.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "route_daily_reliability",
+      "check_name": "duplicate_pk",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "model_predictions",
+      "check_name": "row_count",
+      "status": "pass",
+      "severity": "warning",
+      "observed": 1589232.0,
+      "threshold": 1.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "model_predictions",
+      "check_name": "null_model_version",
+      "status": "pass",
+      "severity": "critical",
+      "observed": 0.0,
+      "threshold": 0.0,
+      "details": {}
+    },
+    {
+      "layer": "gold",
+      "dataset": "model_predictions",
+      "check_name": "inference_error_ratio",
+      "status": "pass",
+      "severity": "warning",
+      "observed": 6.292347498666023e-07,
+      "threshold": 0.01,
+      "details": {
+        "error_rows": 1,
+        "total_rows": 1589232
+      }
+    },
+    {
+      "layer": "gold",
+      "dataset": "route_ddot_features",
+      "check_name": "route_coverage_ratio",
+      "status": "pass",
+      "severity": "warning",
+      "observed": 0.584,
+      "threshold": 0.5,
+      "details": {
+        "ddot_routes": 146,
+        "route_stats": 250
+      }
+    }
+  ]
+}

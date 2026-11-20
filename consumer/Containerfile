@@ -1,0 +1,13 @@
+FROM wmata-lateness-spark-master:latest
+
+USER root
+RUN pip install --no-cache-dir nats-py boto3 psycopg2-binary \
+    && mkdir -p /work \
+    && chown 185:185 /work
+
+USER 185
+WORKDIR /app
+COPY . /app
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
