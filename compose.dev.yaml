@@ -799,6 +799,158 @@ services:
       - wmata-lateness-dev
     profiles: ["dev"]
 
+  tomtom-poller:
+    <<: *default-logging
+    build:
+      context: ./dlt
+      dockerfile: Containerfile
+    command: ["poll_tomtom_traffic.py"]
+    restart: unless-stopped
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+      seaweedfs-bridge:
+        condition: service_healthy
+    environment:
+      SEAWEEDFS_S3_ENDPOINT: ${SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs:8333}
+      SEAWEEDFS_BUCKET_TRAFFIC_BRONZE: ${SEAWEEDFS_BUCKET_TRAFFIC_BRONZE:-traffic}
+      TRAFFIC_KEY_ID: ${TRAFFIC_KEY_ID:-traffic-key-id}
+      TRAFFIC_SECRET_KEY: ${TRAFFIC_SECRET_KEY:-traffic-secret-key}
+      TOMTOM_API_KEY: ${TOMTOM_API_KEY:-}
+      TOMTOM_API_MODE: ${TOMTOM_API_MODE:-auto}
+      TOMTOM_MOVE_AUTO_SUBMIT: ${TOMTOM_MOVE_AUTO_SUBMIT:-false}
+      TOMTOM_MOVE_EMIT_BASELINE: ${TOMTOM_MOVE_EMIT_BASELINE:-true}
+      TOMTOM_POLL_INTERVAL: ${TOMTOM_POLL_INTERVAL:-600}
+      TOMTOM_BBOX: ${TOMTOM_BBOX:--77.15,38.80,-76.90,39.02}
+      TOMTOM_FLOW_ZOOM: ${TOMTOM_FLOW_ZOOM:-10}
+      TOMTOM_MAX_DAILY_REQUESTS: ${TOMTOM_MAX_DAILY_REQUESTS:-2450}
+      TOMTOM_QUOTA_STATE: /work/tomtom_quota_state.json
+      TOMTOM_MOVE_STATE: /work/tomtom_move_state.json
+      TOMTOM_HEARTBEAT: /work/tomtom_poller_heartbeat
+      VM_URL: http://victoriametrics:8428
+    env_file:
+      - .env
+    volumes:
+      - ./dlt:/app
+      - ./shared:/app/shared:ro
+      - ./governance:/app/governance:ro
+      - ./.git:/app/.git:ro
+      - dlt-state:/work
+    working_dir: /app
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import os,time; p='/work/tomtom_poller_heartbeat'; assert os.path.exists(p) and time.time()-os.path.getmtime(p)<1800\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
+  wmata-poller:
+    <<: *default-logging
+    build:
+      context: ./dlt
+      dockerfile: Containerfile
+    command: ["poll_wmata_live.py"]
+    restart: unless-stopped
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+      seaweedfs-bridge:
+        condition: service_healthy
+    environment:
+      SEAWEEDFS_S3_ENDPOINT: ${SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs:8333}
+      SEAWEEDFS_BUCKET_WMATA_BRONZE: ${SEAWEEDFS_BUCKET_WMATA_BRONZE:-wmata}
+      WMATA_KEY_ID: ${WMATA_KEY_ID:-wmata-key-id}
+      WMATA_SECRET_KEY: ${WMATA_SECRET_KEY:-wmata-secret-key}
+      WMATA_API_KEY: ${WMATA_API_KEY:-}
+      WMATA_POLL_INTERVAL: ${WMATA_POLL_INTERVAL:-60}
+      WMATA_HEARTBEAT: /work/wmata_poller_heartbeat
+      VM_URL: http://victoriametrics:8428
+    env_file:
+      - .env
+    volumes:
+      - ./dlt:/app
+      - ./shared:/app/shared:ro
+      - ./governance:/app/governance:ro
+      - ./.git:/app/.git:ro
+      - dlt-state:/work
+    working_dir: /app
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import os,time; p='/work/wmata_poller_heartbeat'; assert os.path.exists(p) and time.time()-os.path.getmtime(p)<1800\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
+  stream-inference:
+    <<: *default-logging
+    build:
+      context: ./ml
+      dockerfile: Containerfile
+    command: ["python3", "/app/stream_inference.py"]
+    restart: unless-stopped
+    depends_on:
+      db-ready:
+        condition: service_completed_successfully
+      spock-wire-silver:
+        condition: service_completed_successfully
+      spock-wire-gold:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      POSTGRES_SILVER_HOST: haproxy
+      POSTGRES_SILVER_PORT: "5433"
+      POSTGRES_SILVER_USER: ${POSTGRES_SILVER_USER:-postgres}
+      POSTGRES_SILVER_PASSWORD: ${POSTGRES_SILVER_PASSWORD:-postgres}
+      POSTGRES_GOLD_HOST: haproxy
+      POSTGRES_GOLD_PORT: "5434"
+      POSTGRES_GOLD_USER: ${POSTGRES_GOLD_USER:-postgres}
+      POSTGRES_GOLD_PASSWORD: ${POSTGRES_GOLD_PASSWORD:-postgres}
+      POSTGRES_DB_WMATA: ${POSTGRES_DB_WMATA:-wmata}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://seaweedfs:8333
+      AWS_ACCESS_KEY_ID: ${MLFLOW_KEY_ID:-mlflow-key-id}
+      AWS_SECRET_ACCESS_KEY: ${MLFLOW_SECRET_KEY:-mlflow-secret-key}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      NATS_URL: nats://nats:4222
+      STREAM_INFERENCE_INTERVAL: "20"
+    volumes:
+      - ./ml:/app
+      - ./governance:/app/governance:ro
+      - ./.git:/app/.git:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import os,time; p='/tmp/stream_inference_heartbeat'; assert os.path.exists(p) and time.time()-os.path.getmtime(p)<1800\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - wmata-lateness-dev
+    profiles: ["dev"]
+
   consumer:
     <<: *default-logging
     build:
@@ -823,6 +975,7 @@ services:
       CONSUMER_BATCH_SIZE: "200"
       WMATA_BRONZE_PREFIXES: "bronze_"
       TRAFFIC_BRONZE_PREFIX: "ddot/"
+      TOMTOM_BRONZE_PREFIX: "tomtom/"
       QUALITY_REPORT_DIR: /work/quality
       AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedfs-access-key}
       AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfs-secret-key}
@@ -1220,6 +1373,15 @@ services:
       POSTGRES_GOLD_USER: ${POSTGRES_GOLD_USER:-postgres}
       POSTGRES_GOLD_PASSWORD: ${POSTGRES_GOLD_PASSWORD:-postgres}
       POSTGRES_DB_WMATA: ${POSTGRES_DB_WMATA:-wmata}
+      POSTGRES_SILVER_HOST: haproxy
+      POSTGRES_SILVER_READ_PORT: "5435"
+      POSTGRES_SILVER_USER: ${POSTGRES_SILVER_USER:-postgres}
+      POSTGRES_SILVER_PASSWORD: ${POSTGRES_SILVER_PASSWORD:-postgres}
+      POSTGRES_DB_TRAFFIC: ${POSTGRES_DB_TRAFFIC:-traffic}
+      NATS_URL: nats://nats:4222
+      MONITOR_URL: http://monitor:8090
+    volumes:
+      - ./serving/api:/app:ro
     ports:
       - ${HOST_IP:-127.0.0.1}:18000:8000
     depends_on:

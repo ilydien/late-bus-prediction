@@ -98,6 +98,37 @@ class ServingApiTest(unittest.TestCase):
         response = self.client.get("/v1/predictions/latest?limit=0")
         self.assertEqual(response.status_code, 422)
 
+    def test_dashboard_html(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("WMATA", response.text)
+        self.assertIn("TomTom", response.text)
+
+    def test_routes_list(self):
+        response = self.client.get("/v1/routes/list")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("F8", response.json()["routes"])
+
+    def test_traffic_corridors_fallback(self):
+        response = self.client.get("/v1/traffic/corridors")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("data", body)
+        self.assertGreaterEqual(len(body["data"]), 16)
+
+    def test_stream_status(self):
+        response = self.client.get("/v1/stream/status")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("freshness", body)
+        self.assertIn("pipeline_runs", body)
+
+    def test_stream_events_sse_oneshot(self):
+        response = self.client.get("/v1/stream/events?oneshot=true")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/event-stream", response.headers.get("content-type", ""))
+        self.assertIn("event: connected", response.text)
+
 
 if __name__ == "__main__":
     unittest.main()

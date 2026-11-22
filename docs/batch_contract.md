@@ -11,6 +11,8 @@ streaming owner, and the dashboard/monitoring owner.
 | GTFS static 2020 | `s3://wmata/reference/gtfs_static/version=20200106/` | zip + JSON | active |
 | GTFS static 2026 | `s3://wmata/reference/gtfs_static/version=20260913/` | zip + JSON | reference only |
 | DDOT traffic | `s3://traffic/ddot/` | GeoJSON | active |
+| TomTom live flow segments | `s3://traffic/tomtom/flow/` | `.jsonl.gz` | active (live poller) |
+| TomTom live traffic incidents | `s3://traffic/tomtom/incidents/` | `.jsonl.gz` | active (live poller) |
 | WMATA archive 2025 | `s3://wmata/historical/archive/` | `.tar.gz` | raw archive, not processed |
 
 ## Bronze event contract
@@ -73,6 +75,13 @@ Database: `wmata` and `traffic` on PostgreSQL through HAProxy `5433`.
 - `ddot_am_speed_2019` primary key `objectid`.
 - `ddot_taz` primary key `taz`.
 - Staging tables: `<table>_staging`.
+
+### `traffic.tomtom_*`
+
+- `tomtom_flow_segment` primary key `(corridor_id, snapshot_ts)`.
+- `tomtom_traffic_incident` primary key `(incident_id, snapshot_ts)`.
+- Staging tables: `tomtom_flow_segment_staging`, `tomtom_traffic_incident_staging`.
+- Live poller: `dlt/poll_tomtom_traffic.py` (`tomtom-poller` service).
 
 ## Event-time and late-data policy
 

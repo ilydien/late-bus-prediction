@@ -31,8 +31,23 @@ DATABASES = {
 
 TABLES = {
     "wmata": ["bus_trip_snapshot", "route_stats"],
-    "traffic": ["ddot_aadt_2020", "ddot_am_speed_2019", "ddot_taz"],
+    "traffic": [
+        "ddot_aadt_2020",
+        "ddot_am_speed_2019",
+        "ddot_taz",
+        "tomtom_flow_segment",
+        "tomtom_traffic_incident",
+    ],
 }
+
+
+def table_exists(cur, table: str) -> bool:
+    cur.execute(
+        "SELECT to_regclass(%s) IS NOT NULL",
+        (f"public.{table}",),
+    )
+    row = cur.fetchone()
+    return bool(row and row[0])
 
 
 def connect(database: str):
@@ -79,13 +94,18 @@ def primary_key(cur, table: str) -> list[str]:
 def truncate_staging(cur, database: str) -> int:
     count = 0
     for table in TABLES[database]:
-        cur.execute(f"TRUNCATE public.{table}_staging")
+        staging = f"{table}_staging"
+        if not table_exists(cur, staging):
+            continue
+        cur.execute(f"TRUNCATE public.{staging}")
         count += 1
     return count
 
 
 def merge_table(conn, cur, table: str) -> tuple[int, int]:
     staging = f"{table}_staging"
+    if not table_exists(cur, staging):
+        return 0, 0
     cur.execute(f"SELECT count(*) FROM public.{staging}")
     staged = int(cur.fetchone()[0])
     if staged == 0:

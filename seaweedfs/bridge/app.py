@@ -20,9 +20,13 @@ import logging
 import os
 import signal
 import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import nats
+try:
+    import nats
+except ImportError:  # pragma: no cover - allows pure helper tests without nats-py
+    nats = None  # type: ignore[assignment]
 
 NATS_URL = os.environ.get("NATS_URL", "nats://nats:4222")
 LISTEN_PORT = int(os.environ.get("BRIDGE_PORT", "8080"))
@@ -109,6 +113,70 @@ def route(key: str) -> str | None:
     return None
 
 
+def _extract_etag(event: dict) -> str:
+    if event.get("etag"):
+        return str(event["etag"])
+    message = event.get("message") or event.get("message_data") or {}
+    for side in ("new_entry", "old_entry"):
+        entry = message.get(side) or {}
+        attrs = entry.get("attributes") or {}
+        for name in ("md5", "e_tag", "etag"):
+            if attrs.get(name):
+                return str(attrs[name])
+    return ""
+
+
+def _extract_event_time(event: dict, fallback_iso: str) -> str:
+    if event.get("event_time"):
+        return str(event["event_time"])
+    message = event.get("message") or event.get("message_data") or {}
+    for side in ("new_entry", "old_entry"):
+        entry = message.get(side) or {}
+        attrs = entry.get("attributes") or {}
+        mtime = attrs.get("mtime")
+        if mtime is not None:
+            try:
+                return datetime.fromtimestamp(float(mtime), tz=timezone.utc).isoformat()
+            except (TypeError, ValueError, OSError):
+                pass
+    return fallback_iso
+
+
+def enrich_envelope(event: dict, raw_sha256: str) -> dict:
+    """Ensure standard streaming contract fields exist while preserving raw SeaweedFS keys."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    key = event.get("key") or ""
+    bucket = event.get("bucket") or ""
+    s3_key = event.get("s3_key") or ""
+    for prefix in ROUTES:
+        if key.startswith(prefix):
+            bucket = bucket or prefix.strip("/").split("/")[-1]
+            s3_key = s3_key or key[len(prefix):]
+            break
+
+    etag = _extract_etag(event)
+    event_id = event.get("event_id") or (
+        hashlib.sha256(f"{bucket}|{s3_key}|{etag}".encode()).hexdigest()
+        if (bucket and s3_key and etag)
+        else raw_sha256
+    )
+
+    enriched = dict(event)
+    enriched.setdefault("event_id", event_id)
+    enriched.setdefault("event_time", _extract_event_time(event, now_iso))
+    enriched.setdefault("ingest_time", now_iso)
+    enriched.setdefault("payload_version", "v1")
+    enriched.setdefault("source", "seaweedfs")
+    if bucket:
+        enriched.setdefault("bucket", bucket)
+    if s3_key:
+        enriched.setdefault("s3_key", s3_key)
+    if etag:
+        enriched.setdefault("etag", etag)
+    enriched.setdefault("event_type", event.get("event_type") or "create")
+    return enriched
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "seaweedfs-bridge/1.0"
 
@@ -157,10 +225,13 @@ class Handler(BaseHTTPRequestHandler):
 
         # Retries replay identical bytes; hashing the payload lets JetStream
         # dedupe them inside the stream's duplicate window.
-        msg_id = hashlib.sha256(raw).hexdigest()
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
+        enriched = enrich_envelope(event, raw_sha256)
+        msg_id = str(enriched.get("event_id") or raw_sha256)
+        payload = json.dumps(enriched, separators=(",", ":")).encode("utf-8")
 
         try:
-            publisher.publish(subject, raw, msg_id)
+            publisher.publish(subject, payload, msg_id)
         except Exception:
             log.exception("publish to %s failed for %s", subject, key)
             self._reply(503, "nats unavailable")
