@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import urllib.request
 from datetime import date, datetime, timezone
@@ -13,6 +14,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from psycopg2 import connect
 from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel
@@ -174,6 +176,117 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+_INCIDENT_CATEGORIES: dict[int, str] = {
+    0: "Incident",
+    1: "Accident",
+    2: "Fog",
+    3: "Road Hazard",
+    4: "Rain",
+    5: "Ice",
+    6: "Traffic Jam",
+    7: "Lane Closed",
+    8: "Road Closed",
+    9: "Road Works",
+    10: "Wind",
+    11: "Flooding",
+    14: "Disabled Vehicle",
+}
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2.0) ** 2
+    )
+    return 2.0 * r * math.asin(min(1.0, math.sqrt(max(0.0, a))))
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    try:
+        if val is None:
+            return default
+        f = float(val)
+        return default if math.isnan(f) or math.isinf(f) else f
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_iso_dt(val: Any) -> datetime | None:
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    if not val:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _diagnose_bus_cause(
+    dev: float,
+    progress: float | None,
+    gps_speed: float | None,
+    corridor_ratio: float | None,
+    corridor_name: str | None,
+    near_incident: bool,
+    incident_cat: str | None,
+    incident_road: str | None,
+    incident_dist_m: int | None,
+) -> tuple[str, str]:
+    """Return (primary_cause_label, plain_language_reason) for a live bus."""
+    if dev <= 2.0:
+        if dev < -1.0:
+            return ("Early / Fast", f"Running {abs(dev):.1f}m ahead of schedule")
+        return ("On-Time", "Operating within normal schedule window")
+    if dev <= 5.0:
+        if near_incident and incident_cat:
+            return ("Watch: Near Incident", f"Moderate delay near {incident_cat} ({incident_dist_m}m)")
+        if corridor_ratio is not None and corridor_ratio < 0.72:
+            return ("Watch: Dense Traffic", f"Slowed along {corridor_name or 'corridor'} ({int(corridor_ratio * 100)}% flow)")
+        return ("Minor Delay", f"+{dev:.1f}m behind schedule (within 5m SLA)")
+
+    # Late > 5m — determine primary root cause
+    if near_incident and incident_cat:
+        road_str = f" on {incident_road}" if incident_road else ""
+        return (
+            "Nearby Incident",
+            f"Within {incident_dist_m or 0}m of active {incident_cat}{road_str}",
+        )
+    if (corridor_ratio is not None and corridor_ratio < 0.72) or (
+        gps_speed is not None and gps_speed < 10.5
+    ):
+        if corridor_ratio is not None and corridor_ratio < 0.72:
+            return (
+                "Traffic Congestion",
+                f"{corridor_name or 'Corridor'} flow at {int(corridor_ratio * 100)}% free-flow",
+            )
+        if gps_speed is not None and gps_speed < 1.5:
+            return (
+                "Traffic Congestion",
+                f"Bus stalled / heavy stop dwell ({gps_speed:.1f} km/h live GPS speed)",
+            )
+        return (
+            "Traffic Congestion",
+            f"Slow live operating speed ({gps_speed:.1f} km/h)",
+        )
+    if progress is not None and progress >= 0.60:
+        return (
+            "Trip Cascading",
+            f"Delay compounded by {int(progress * 100)}% trip progress (stop dwell / bunching)",
+        )
+    return (
+        "Schedule / Dispatch",
+        f"Already +{dev:.1f}m late early in trip ({int((progress or 0.25) * 100)}% progress)",
+    )
 
 
 def get_conn():
@@ -299,16 +412,19 @@ def latest_predictions(
     conn=Depends(get_conn),
 ):
     sql = """
-        SELECT input_record_id, model_version, predicted_at, trip_key, snapshot_ts,
-               route_id, predicted_delay_min, actual_delay_min, abs_error,
-               predicted_late, actual_late, inference_run_id
-        FROM public.serving_latest_predictions
+        SELECT p.input_record_id, p.model_version, p.predicted_at, p.trip_key, p.snapshot_ts,
+               p.route_id, p.predicted_delay_min, p.actual_delay_min, p.abs_error,
+               p.predicted_late, p.actual_late, p.inference_run_id,
+               f.deviation_now, f.progress_pct, f.speed_kmh, f.am_speed_ratio
+        FROM public.serving_latest_predictions p
+        LEFT JOIN public.trip_delay_features f
+          ON f.trip_key = p.trip_key AND f.snapshot_ts = p.snapshot_ts
     """
     params: list = []
     if route_id:
-        sql += " WHERE route_id = %s"
+        sql += " WHERE p.route_id = %s"
         params.append(route_id)
-    sql += " ORDER BY predicted_at DESC LIMIT %s"
+    sql += " ORDER BY p.predicted_at DESC LIMIT %s"
     params.append(limit)
     return {"data": _fetch(conn, sql, params), "freshness": _freshness(conn)}
 
@@ -365,6 +481,10 @@ def _try_silver_traffic_query(sql: str, params=()) -> list[dict[str, Any]]:
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/live-map", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/root-cause", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/ml-forecast", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/pipeline", response_class=HTMLResponse, include_in_schema=False)
 def dashboard_ui():
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
@@ -392,8 +512,7 @@ def routes_list(conn=Depends(get_conn)):
     return {"routes": [r.get("route_id") for r in rows if r.get("route_id")]}
 
 
-@app.get("/v1/traffic/corridors")
-def traffic_corridors(limit: int = Query(50, ge=1, le=200)):
+def _fetch_latest_corridors(limit: int = 50) -> list[dict[str, Any]]:
     sql = """
         SELECT DISTINCT ON (corridor_id)
                corridor_id, snapshot_ts, event_time, service_date,
@@ -406,15 +525,10 @@ def traffic_corridors(limit: int = Query(50, ge=1, le=200)):
         ORDER BY corridor_id, snapshot_ts DESC
         LIMIT %s
     """
-    rows = _try_silver_traffic_query(sql, (limit,))
-    return {
-        "source": "silver.traffic.tomtom_flow_segment" if rows else "corridor_reference",
-        "data": rows if rows else DEFAULT_DC_CORRIDORS,
-    }
+    return _try_silver_traffic_query(sql, (limit,))
 
 
-@app.get("/v1/traffic/incidents")
-def traffic_incidents(limit: int = Query(100, ge=1, le=500)):
+def _fetch_latest_incidents(limit: int = 200) -> list[dict[str, Any]]:
     sql = """
         SELECT incident_id, snapshot_ts, event_time, service_date,
                icon_category, magnitude_of_delay, delay_sec, length_m,
@@ -426,7 +540,173 @@ def traffic_incidents(limit: int = Query(100, ge=1, le=500)):
         ORDER BY delay_sec DESC NULLS LAST
         LIMIT %s
     """
-    rows = _try_silver_traffic_query(sql, (limit,))
+    return _try_silver_traffic_query(sql, (limit,))
+
+
+def _fetch_live_buses_with_gps_speed(
+    route_id: str | None = None,
+    limit: int = 600,
+) -> list[dict[str, Any]]:
+    """Fetch latest live WMATA bus per vehicle plus GPS-derived speed from its prior snapshot."""
+    where_clause = "WHERE lat IS NOT NULL AND lon IS NOT NULL"
+    params: list[Any] = []
+    if route_id:
+        where_clause += " AND route_id = %s"
+        params.append(route_id)
+    params.append(limit)
+
+    sql = f"""
+        WITH ranked AS (
+            SELECT vehicle_id, trip_key, trip_id, route_id, direction,
+                   direction_num, trip_headsign, lat, lon, deviation_min,
+                   speed_kmh, progress_pct, event_time, snapshot_ts, service_date,
+                   ROW_NUMBER() OVER (PARTITION BY vehicle_id ORDER BY snapshot_ts DESC) AS rn
+            FROM public.bus_trip_snapshot
+            {where_clause}
+        )
+        SELECT a.vehicle_id, a.trip_key, a.trip_id, a.route_id, a.direction,
+               a.direction_num, a.trip_headsign, a.lat, a.lon, a.deviation_min,
+               a.progress_pct, a.event_time, a.snapshot_ts, a.service_date,
+               COALESCE(
+                   a.speed_kmh,
+                   CASE
+                       WHEN b.lat IS NOT NULL
+                        AND EXTRACT(EPOCH FROM (a.snapshot_ts - b.snapshot_ts)) BETWEEN 10 AND 900
+                       THEN LEAST(
+                           75.0,
+                           (111.32 * sqrt(
+                               power(a.lat - b.lat, 2)
+                               + power((a.lon - b.lon) * cos(radians(a.lat)), 2)
+                           )) / (EXTRACT(EPOCH FROM (a.snapshot_ts - b.snapshot_ts)) / 3600.0)
+                       )
+                       ELSE NULL
+                   END
+               ) AS speed_kmh
+        FROM ranked a
+        LEFT JOIN ranked b ON a.vehicle_id = b.vehicle_id AND b.rn = 2
+        WHERE a.rn = 1
+        ORDER BY a.snapshot_ts DESC, a.vehicle_id
+        LIMIT %s
+    """
+    return _try_silver_query(SILVER_WMATA_DB, sql, tuple(params))
+
+
+def _enrich_buses_with_traffic(
+    buses: list[dict[str, Any]],
+    corridors: list[dict[str, Any]],
+    incidents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach nearest TomTom corridor, nearest active incident, and diagnosed delay cause."""
+    corridor_pts = [
+        (
+            _safe_float(c.get("query_lat")),
+            _safe_float(c.get("query_lon")),
+            c,
+        )
+        for c in corridors
+        if c.get("query_lat") is not None and c.get("query_lon") is not None
+    ]
+    incident_pts = [
+        (
+            _safe_float(inc.get("lat")),
+            _safe_float(inc.get("lon")),
+            inc,
+        )
+        for inc in incidents
+        if inc.get("lat") is not None and inc.get("lon") is not None
+    ]
+
+    for b in buses:
+        lat = _safe_float(b.get("lat"))
+        lon = _safe_float(b.get("lon"))
+        dev = _safe_float(b.get("deviation_min"))
+        prog = None if b.get("progress_pct") is None else _safe_float(b.get("progress_pct"))
+        spd = None if b.get("speed_kmh") is None else round(_safe_float(b.get("speed_kmh")), 1)
+        b["speed_kmh"] = spd
+
+        best_c = None
+        best_c_dist = 999.0
+        for clat, clon, c in corridor_pts:
+            d = _haversine_km(lat, lon, clat, clon)
+            if d < best_c_dist:
+                best_c_dist = d
+                best_c = c
+
+        corridor_ratio = None
+        corridor_name = None
+        corridor_delay_sec = None
+        if best_c is not None and best_c_dist <= 4.5:
+            corridor_ratio = _safe_float(best_c.get("speed_ratio"), 0.85)
+            corridor_name = best_c.get("corridor_name") or best_c.get("corridor_id")
+            corridor_delay_sec = int(_safe_float(best_c.get("delay_sec"), 0))
+            b["corridor_name"] = corridor_name
+            b["corridor_speed_ratio"] = round(corridor_ratio, 3)
+            b["corridor_speed_kmh"] = round(_safe_float(best_c.get("current_speed_kmh"), 20.0), 1)
+            b["corridor_delay_sec"] = corridor_delay_sec
+            b["corridor_distance_km"] = round(best_c_dist, 2)
+        else:
+            b["corridor_name"] = None
+            b["corridor_speed_ratio"] = None
+            b["corridor_speed_kmh"] = None
+            b["corridor_delay_sec"] = None
+
+        best_inc = None
+        best_inc_dist = 999.0
+        for ilat, ilon, inc in incident_pts:
+            d = _haversine_km(lat, lon, ilat, ilon)
+            if d < best_inc_dist:
+                best_inc_dist = d
+                best_inc = inc
+
+        near_incident = best_inc is not None and best_inc_dist <= 1.5
+        incident_cat = None
+        incident_road = None
+        incident_dist_m = None
+        if near_incident and best_inc is not None:
+            incident_cat = _INCIDENT_CATEGORIES.get(int(_safe_float(best_inc.get("icon_category"), 0)), "Incident")
+            incident_road = best_inc.get("road_numbers") or best_inc.get("from_location")
+            incident_dist_m = int(round(best_inc_dist * 1000))
+            b["near_incident"] = True
+            b["incident_category"] = incident_cat
+            b["incident_road"] = incident_road
+            b["incident_distance_m"] = incident_dist_m
+            b["incident_delay_sec"] = int(_safe_float(best_inc.get("delay_sec"), 0))
+        else:
+            b["near_incident"] = False
+            b["incident_category"] = None
+            b["incident_road"] = None
+            b["incident_distance_m"] = None
+            b["incident_delay_sec"] = None
+
+        cause, detail = _diagnose_bus_cause(
+            dev=dev,
+            progress=prog,
+            gps_speed=spd,
+            corridor_ratio=corridor_ratio,
+            corridor_name=corridor_name,
+            near_incident=near_incident,
+            incident_cat=incident_cat,
+            incident_road=incident_road,
+            incident_dist_m=incident_dist_m,
+        )
+        b["diagnosed_cause"] = cause
+        b["cause_detail"] = detail
+
+    return buses
+
+
+@app.get("/v1/traffic/corridors")
+def traffic_corridors(limit: int = Query(50, ge=1, le=200)):
+    rows = _fetch_latest_corridors(limit=limit)
+    return {
+        "source": "silver.traffic.tomtom_flow_segment" if rows else "corridor_reference",
+        "data": rows if rows else DEFAULT_DC_CORRIDORS,
+    }
+
+
+@app.get("/v1/traffic/incidents")
+def traffic_incidents(limit: int = Query(100, ge=1, le=500)):
+    rows = _fetch_latest_incidents(limit=limit)
     return {"source": "silver.traffic.tomtom_traffic_incident", "data": rows}
 
 
@@ -436,25 +716,14 @@ def live_buses(
     limit: int = Query(300, ge=1, le=1000),
     conn=Depends(get_conn),
 ):
-    """Return latest live WMATA bus positions from Silver enriched with Gold ML predictions."""
-    sql = """
-        SELECT DISTINCT ON (vehicle_id)
-               vehicle_id, trip_key, trip_id, route_id, direction,
-               direction_num, trip_headsign, lat, lon, deviation_min,
-               speed_kmh, progress_pct, event_time, snapshot_ts, service_date
-        FROM public.bus_trip_snapshot
-        WHERE lat IS NOT NULL AND lon IS NOT NULL
-    """
-    params: list[Any] = []
-    if route_id:
-        sql += " AND route_id = %s"
-        params.append(route_id)
-    sql += " ORDER BY vehicle_id, snapshot_ts DESC LIMIT %s"
-    params.append(limit)
-
-    buses = _try_silver_query(SILVER_WMATA_DB, sql, tuple(params))
+    """Return latest live WMATA bus positions enriched with GPS speed, TomTom proximity, ML predictions & cause."""
+    buses = _fetch_live_buses_with_gps_speed(route_id=route_id, limit=limit)
     if not buses:
         return {"source": "silver.wmata.bus_trip_snapshot", "data": []}
+
+    corridors = _fetch_latest_corridors(limit=50)
+    incidents = _fetch_latest_incidents(limit=250)
+    _enrich_buses_with_traffic(buses, corridors, incidents)
 
     pred_map: dict[str, dict[str, Any]] = {}
     try:
@@ -482,7 +751,7 @@ def live_buses(
             b["predicted_late"] = p.get("predicted_late")
             b["model_version"] = p.get("model_version")
         else:
-            dev = float(b.get("deviation_min") or 0.0)
+            dev = _safe_float(b.get("deviation_min"))
             b["predicted_delay_min"] = round(dev * 0.92, 2)
             b["predicted_late"] = 1 if dev > 5.0 else 0
             b["model_version"] = "v1"
@@ -490,9 +759,466 @@ def live_buses(
     return {"source": "silver.wmata.bus_trip_snapshot", "data": buses}
 
 
+@app.get("/v1/analytics/root-cause")
+def analytics_root_cause(
+    start_date: date,
+    end_date: date,
+    route_id: str | None = None,
+    conn=Depends(get_conn),
+):
+    """Diagnose WHY buses are late by joining Gold features/marts with Silver GPS & TomTom proximity."""
+    _validate_range(start_date, end_date)
+    fresh = _freshness(conn)
+
+    where_feat = "WHERE service_date BETWEEN %s AND %s AND deviation_now IS NOT NULL"
+    feat_params: list[Any] = [start_date, end_date]
+    if route_id:
+        where_feat += " AND route_id = %s"
+        feat_params.append(route_id)
+
+    # 1. Delay status distribution (5 intuitive buckets)
+    delay_distribution = [
+        {"key": "early", "label": "Early (< -1m)", "count": 0, "pct": 0.0},
+        {"key": "on_time", "label": "On-Time (-1 to +2m)", "count": 0, "pct": 0.0},
+        {"key": "slight", "label": "Slightly Late (+2 to +5m)", "count": 0, "pct": 0.0},
+        {"key": "late", "label": "Late (+5 to +10m)", "count": 0, "pct": 0.0},
+        {"key": "severe", "label": "Severe (> +10m)", "count": 0, "pct": 0.0},
+    ]
+    try:
+        dist_rows = _fetch(
+            conn,
+            f"""
+            SELECT
+              count(*) FILTER (WHERE deviation_now < -1) AS early,
+              count(*) FILTER (WHERE deviation_now >= -1 AND deviation_now <= 2) AS on_time,
+              count(*) FILTER (WHERE deviation_now > 2 AND deviation_now <= 5) AS slight,
+              count(*) FILTER (WHERE deviation_now > 5 AND deviation_now <= 10) AS late,
+              count(*) FILTER (WHERE deviation_now > 10) AS severe,
+              count(*) AS total
+            FROM public.trip_delay_features
+            {where_feat}
+            """,
+            feat_params,
+        )
+        if dist_rows and dist_rows[0].get("total"):
+            d0 = dist_rows[0]
+            tot = max(1, int(d0.get("total") or 0))
+            for item in delay_distribution:
+                cnt = int(d0.get(item["key"]) or 0)
+                item["count"] = cnt
+                item["pct"] = round(100.0 * cnt / tot, 1)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2. Trip progress cascading curve (0-20% Start -> 80-100% End)
+    stage_labels = [
+        (0, "0–20% Start"),
+        (1, "20–40% Early"),
+        (2, "40–60% Mid"),
+        (3, "60–80% Late"),
+        (4, "80–100% End"),
+    ]
+    progress_curve: list[dict[str, Any]] = []
+    try:
+        prog_rows = _fetch(
+            conn,
+            f"""
+            SELECT
+              LEAST(4, GREATEST(0, floor(COALESCE(progress_pct, 0.5) * 5)::int)) AS bucket,
+              count(*) AS samples,
+              avg(deviation_now) AS avg_delay,
+              100.0 * avg(CASE WHEN deviation_now > 5 THEN 1.0 ELSE 0.0 END) AS late_pct
+            FROM public.trip_delay_features
+            {where_feat}
+            GROUP BY 1
+            ORDER BY 1
+            """,
+            feat_params,
+        )
+        by_bucket = {int(r["bucket"]): r for r in prog_rows if r.get("bucket") is not None}
+        for b_idx, lbl in stage_labels:
+            row = by_bucket.get(b_idx)
+            progress_curve.append(
+                {
+                    "stage": lbl,
+                    "samples": int(row["samples"]) if row else 0,
+                    "avg_delay": round(_safe_float(row["avg_delay"]), 2) if row else 0.0,
+                    "late_pct": round(_safe_float(row["late_pct"]), 1) if row else 0.0,
+                }
+            )
+    except Exception:  # noqa: BLE001
+        progress_curve = [{"stage": lbl, "samples": 0, "avg_delay": 0.0, "late_pct": 0.0} for _, lbl in stage_labels]
+
+    # 3. Real feature correlations against target +15m delay from Gold features
+    feature_drivers: list[dict[str, Any]] = []
+    try:
+        corr_rows = _fetch(
+            conn,
+            f"""
+            SELECT
+              corr(deviation_now, target_deviation_15m) AS c_deviation_now,
+              corr(progress_pct, target_deviation_15m) AS c_progress_pct,
+              corr(am_speed_ratio, target_deviation_15m) AS c_am_speed_ratio,
+              corr(speed_kmh, target_deviation_15m) AS c_speed_kmh,
+              corr(time_since_start_min, target_deviation_15m) AS c_time_since_start,
+              corr(hour_local::double precision, target_deviation_15m) AS c_hour_local,
+              corr(median_headway_min, target_deviation_15m) AS c_headway
+            FROM public.trip_delay_features
+            {where_feat} AND target_deviation_15m IS NOT NULL
+            """,
+            feat_params,
+        )
+        if corr_rows:
+            c0 = corr_rows[0]
+            specs = [
+                ("c_deviation_now", "Current Schedule Momentum", "deviation_now", "Existing delay carries forward strongly over the next 15 min"),
+                ("c_progress_pct", "Trip Progress (Cascading)", "progress_pct", "Delays compound toward the middle and end of a trip"),
+                ("c_time_since_start", "Elapsed Trip Time", "time_since_start_min", "Longer time in service increases stop-dwell exposure"),
+                ("c_hour_local", "Time of Day (Peak Period)", "hour_local", "Evening rush hours show substantially higher delay rates"),
+                ("c_am_speed_ratio", "Corridor Traffic Flow (TomTom)", "am_speed_ratio", "Lower free-flow speed ratio increases predicted delay"),
+                ("c_speed_kmh", "Operating Speed (km/h)", "speed_kmh", "Slower fleet speed corresponds to heavier delay buildup"),
+                ("c_headway", "Scheduled Headway (min)", "median_headway_min", "Longer headways amplify bunching and passenger load"),
+            ]
+            for col_key, label, raw_feat, desc in specs:
+                val = c0.get(col_key)
+                if val is None:
+                    continue
+                fval = _safe_float(val, 0.0)
+                if abs(fval) < 0.001:
+                    continue
+                feature_drivers.append(
+                    {
+                        "feature": raw_feat,
+                        "label": label,
+                        "correlation": round(fval, 3),
+                        "impact_pct": round(min(100.0, abs(fval) * 100.0), 1),
+                        "direction": "increases_delay" if fval >= 0 else "reduces_delay",
+                        "description": desc,
+                    }
+                )
+            feature_drivers.sort(key=lambda x: abs(x["correlation"]), reverse=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 4. Gold daily route metrics & per-route progress features
+    route_daily_map: dict[str, dict[str, Any]] = {}
+    try:
+        r_rows = _fetch(
+            conn,
+            f"""
+            SELECT route_id,
+                   sum(trips) AS trips,
+                   avg(avg_deviation) AS avg_delay,
+                   avg(median_deviation) AS median_delay,
+                   avg(p90_deviation) AS p90_delay,
+                   avg(on_time_pct) AS on_time_pct,
+                   avg(late_pct) AS late_pct,
+                   avg(avg_speed_kmh) AS mart_speed_kmh
+            FROM public.serving_route_daily
+            WHERE service_date BETWEEN %s AND %s
+            {"AND route_id = %s" if route_id else ""}
+            GROUP BY route_id
+            """,
+            feat_params,
+        )
+        for r in r_rows:
+            if r.get("route_id"):
+                route_daily_map[str(r["route_id"])] = r
+    except Exception:  # noqa: BLE001
+        pass
+
+    route_feat_map: dict[str, dict[str, Any]] = {}
+    try:
+        rf_rows = _fetch(
+            conn,
+            f"""
+            SELECT route_id,
+                   avg(progress_pct) FILTER (WHERE deviation_now > 5) AS avg_progress_late,
+                   avg(progress_pct) AS avg_progress
+            FROM public.trip_delay_features
+            {where_feat}
+            GROUP BY route_id
+            """,
+            feat_params,
+        )
+        for r in rf_rows:
+            if r.get("route_id"):
+                route_feat_map[str(r["route_id"])] = r
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 5. Live Silver spatial enrichment (GPS speed + TomTom corridor & incident proximity)
+    corridors = _fetch_latest_corridors(limit=50)
+    incidents = _fetch_latest_incidents(limit=250)
+    live_bus_rows = _fetch_live_buses_with_gps_speed(route_id=route_id, limit=800)
+    _enrich_buses_with_traffic(live_bus_rows, corridors, incidents)
+
+    # Spatial incident category breakdown
+    inc_cat_map: dict[str, dict[str, Any]] = {}
+    for inc in incidents:
+        cat = _INCIDENT_CATEGORIES.get(int(_safe_float(inc.get("icon_category"), 0)), "Incident")
+        slot = inc_cat_map.setdefault(cat, {"category": cat, "count": 0, "delay_sum_sec": 0.0, "length_m": 0.0})
+        slot["count"] += 1
+        slot["delay_sum_sec"] += _safe_float(inc.get("delay_sec"), 0.0)
+        slot["length_m"] += _safe_float(inc.get("length_m"), 0.0)
+    incident_breakdown = sorted(
+        [
+            {
+                "category": v["category"],
+                "count": v["count"],
+                "avg_delay_min": round((v["delay_sum_sec"] / max(1, v["count"])) / 60.0, 1),
+                "total_length_km": round(v["length_m"] / 1000.0, 1),
+            }
+            for v in inc_cat_map.values()
+        ],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
+
+    # Driver attribution across late live buses (deviation > 5m)
+    cause_meta = {
+        "Nearby Incident": "Bus is within 1.5 km of an active TomTom traffic incident (jam, closure, or roadworks)",
+        "Traffic Congestion": "Nearest DC corridor is below 72% free-flow speed or bus GPS speed dropped below 10.5 km/h",
+        "Trip Cascading": "Delay accumulated past 60% of the trip via stop dwell time and schedule bunching",
+        "Schedule / Dispatch": "Already >5m behind in the first 60% of the trip despite normal nearby traffic flow",
+    }
+    cause_stats: dict[str, dict[str, Any]] = {
+        k: {"cause": k, "count": 0, "delay_sum": 0.0, "description": desc}
+        for k, desc in cause_meta.items()
+    }
+    congestion_buckets = {
+        "free_flow": {"tier": "Free-Flow (≥ 78%)", "buses": 0, "delay_sum": 0.0, "late_count": 0},
+        "moderate": {"tier": "Moderate Flow (65–77%)", "buses": 0, "delay_sum": 0.0, "late_count": 0},
+        "congested": {"tier": "Congested (< 65%)", "buses": 0, "delay_sum": 0.0, "late_count": 0},
+    }
+
+    route_live_agg: dict[str, dict[str, Any]] = {}
+    total_late_live = 0
+    late_near_incidents = 0
+
+    for b in live_bus_rows:
+        dev = _safe_float(b.get("deviation_min"))
+        rt = str(b.get("route_id") or "")
+        spd = b.get("speed_kmh")
+        c_ratio = b.get("corridor_speed_ratio")
+        near_inc = bool(b.get("near_incident"))
+
+        # Congestion tier stats
+        if c_ratio is not None:
+            key = "free_flow" if c_ratio >= 0.78 else ("moderate" if c_ratio >= 0.65 else "congested")
+            cb = congestion_buckets[key]
+            cb["buses"] += 1
+            cb["delay_sum"] += dev
+            if dev > 5.0:
+                cb["late_count"] += 1
+
+        if rt:
+            ra = route_live_agg.setdefault(
+                rt,
+                {
+                    "live_buses": 0,
+                    "late_buses": 0,
+                    "gps_speeds": [],
+                    "corridor_ratios": [],
+                    "corridor_names": [],
+                    "near_inc_buses": 0,
+                    "near_inc_late": 0,
+                    "cause_counts": {},
+                    "cause_reasons": {},
+                },
+            )
+            ra["live_buses"] += 1
+            if spd is not None:
+                ra["gps_speeds"].append(float(spd))
+            if c_ratio is not None:
+                ra["corridor_ratios"].append(float(c_ratio))
+            if b.get("corridor_name"):
+                ra["corridor_names"].append(str(b["corridor_name"]))
+            if near_inc:
+                ra["near_inc_buses"] += 1
+            if dev > 5.0:
+                ra["late_buses"] += 1
+                if near_inc:
+                    ra["near_inc_late"] += 1
+                cause = str(b.get("diagnosed_cause") or "Trip Cascading")
+                ra["cause_counts"][cause] = ra["cause_counts"].get(cause, 0) + 1
+                if cause not in ra["cause_reasons"] and b.get("cause_detail"):
+                    ra["cause_reasons"][cause] = str(b.get("cause_detail"))
+
+        if dev > 5.0:
+            total_late_live += 1
+            if near_inc:
+                late_near_incidents += 1
+            cause = str(b.get("diagnosed_cause") or "Trip Cascading")
+            if cause in cause_stats:
+                cause_stats[cause]["count"] += 1
+                cause_stats[cause]["delay_sum"] += dev
+
+    driver_attribution = []
+    for v in cause_stats.values():
+        cnt = v["count"]
+        driver_attribution.append(
+            {
+                "cause": v["cause"],
+                "count": cnt,
+                "share_pct": round(100.0 * cnt / max(1, total_late_live), 1) if total_late_live else 0.0,
+                "avg_delay": round(v["delay_sum"] / max(1, cnt), 2) if cnt else 0.0,
+                "description": v["description"],
+            }
+        )
+    driver_attribution.sort(key=lambda x: x["count"], reverse=True)
+
+    congestion_tiers = [
+        {
+            "tier": v["tier"],
+            "buses": v["buses"],
+            "avg_delay": round(v["delay_sum"] / max(1, v["buses"]), 2) if v["buses"] else 0.0,
+            "late_pct": round(100.0 * v["late_count"] / max(1, v["buses"]), 1) if v["buses"] else 0.0,
+        }
+        for v in congestion_buckets.values()
+    ]
+
+    # 6. Per-route diagnostic breakdown (combining Gold metrics + live GPS speed + spatial causes)
+    route_diagnostics: list[dict[str, Any]] = []
+    for rt, dm in route_daily_map.items():
+        avg_delay = round(_safe_float(dm.get("avg_delay")), 2)
+        p90_delay = round(_safe_float(dm.get("p90_delay"), avg_delay), 2)
+        on_time_raw = _safe_float(dm.get("on_time_pct"), 0.0)
+        on_time_pct = round(on_time_raw * 100.0 if 0 < on_time_raw <= 1.0 else on_time_raw, 1)
+        trips = int(_safe_float(dm.get("trips"), 0))
+
+        rf = route_feat_map.get(rt, {})
+        avg_prog_late = rf.get("avg_progress_late")
+        avg_prog_late_f = None if avg_prog_late is None else round(_safe_float(avg_prog_late), 2)
+
+        rl = route_live_agg.get(rt, {})
+        gps_list = rl.get("gps_speeds") or []
+        c_ratios = rl.get("corridor_ratios") or []
+        c_names = rl.get("corridor_names") or []
+
+        avg_gps_spd = round(sum(gps_list) / len(gps_list), 1) if gps_list else round(_safe_float(dm.get("mart_speed_kmh"), 18.5), 1)
+        avg_c_ratio = round(sum(c_ratios) / len(c_ratios), 3) if c_ratios else None
+        top_corridor = max(set(c_names), key=c_names.count) if c_names else None
+        near_inc_cnt = int(rl.get("near_inc_buses") or 0)
+        cause_counts: dict[str, int] = rl.get("cause_counts") or {}
+
+        if avg_delay <= 2.5 and on_time_pct >= 80.0:
+            primary_cause = "Healthy"
+            cause_detail = f"Meeting 80% SLA ({on_time_pct:.0f}% on-time, avg {avg_gps_spd:.1f} km/h)"
+        elif cause_counts:
+            primary_cause = max(cause_counts.items(), key=lambda kv: kv[1])[0]
+            cause_detail = (rl.get("cause_reasons") or {}).get(primary_cause) or cause_meta.get(primary_cause, "")
+        elif avg_c_ratio is not None and avg_c_ratio < 0.72:
+            primary_cause = "Traffic Congestion"
+            cause_detail = f"{top_corridor or 'Corridor'} flow at {int(avg_c_ratio * 100)}% free-flow"
+        elif avg_prog_late_f is not None and avg_prog_late_f >= 0.60:
+            primary_cause = "Trip Cascading"
+            cause_detail = f"Late snapshots concentrate at {int(avg_prog_late_f * 100)}% trip progress"
+        elif avg_delay > 5.0 or on_time_pct < 70.0:
+            primary_cause = "Schedule / Dispatch"
+            cause_detail = f"Persistent delay (P90 {p90_delay:.1f}m) despite normal corridor speeds"
+        else:
+            primary_cause = "Minor Variance"
+            cause_detail = f"Moderate delay (+{avg_delay:.1f}m avg, {on_time_pct:.0f}% on-time)"
+
+        route_diagnostics.append(
+            {
+                "route_id": rt,
+                "trips": trips,
+                "avg_delay": avg_delay,
+                "p90_delay": p90_delay,
+                "on_time_pct": on_time_pct,
+                "avg_speed_kmh": avg_gps_spd,
+                "speed_source": "live_gps" if gps_list else "mart_avg",
+                "corridor_name": top_corridor,
+                "corridor_speed_ratio": avg_c_ratio,
+                "avg_progress_late": avg_prog_late_f,
+                "nearby_incidents": near_inc_cnt,
+                "live_buses": int(rl.get("live_buses") or 0),
+                "primary_cause": primary_cause,
+                "cause_detail": cause_detail,
+            }
+        )
+    route_diagnostics.sort(key=lambda x: x["avg_delay"], reverse=True)
+
+    # 7. Executive summary object for Page 1 smart banner & spotlight cards
+    avg_on_time = (
+        round(sum(r["on_time_pct"] for r in route_diagnostics) / len(route_diagnostics), 1)
+        if route_diagnostics
+        else 0.0
+    )
+    avg_flow_ratio = (
+        round(
+            100.0 * sum(_safe_float(c.get("speed_ratio"), 0.8) for c in corridors) / len(corridors),
+            1,
+        )
+        if corridors
+        else 0.0
+    )
+    worst_corridor = (
+        min(corridors, key=lambda c: _safe_float(c.get("speed_ratio"), 1.0)) if corridors else None
+    )
+    top_incident = incidents[0] if incidents else None
+    dominant_driver = driver_attribution[0] if driver_attribution and driver_attribution[0]["count"] > 0 else None
+
+    start_stage = progress_curve[0] if len(progress_curve) >= 1 else {"avg_delay": 0.0, "late_pct": 0.0}
+    end_stage = progress_curve[-1] if len(progress_curve) >= 5 else {"avg_delay": 0.0, "late_pct": 0.0}
+
+    executive_summary = {
+        "on_time_pct": avg_on_time,
+        "sla_target_pct": 80.0,
+        "sla_gap_pct": round(avg_on_time - 80.0, 1),
+        "dominant_cause": dominant_driver["cause"] if dominant_driver else "Trip Cascading",
+        "dominant_cause_pct": dominant_driver["share_pct"] if dominant_driver else 0.0,
+        "total_late_live_buses": total_late_live,
+        "late_buses_near_incidents": late_near_incidents,
+        "active_incidents": len(incidents),
+        "avg_flow_pct": avg_flow_ratio,
+        "start_stage_late_pct": start_stage["late_pct"],
+        "end_stage_late_pct": end_stage["late_pct"],
+        "start_stage_avg_delay": start_stage["avg_delay"],
+        "end_stage_avg_delay": end_stage["avg_delay"],
+        "worst_route": route_diagnostics[0] if route_diagnostics else None,
+        "worst_corridor": {
+            "corridor_name": worst_corridor.get("corridor_name"),
+            "speed_ratio_pct": round(_safe_float(worst_corridor.get("speed_ratio"), 0.0) * 100.0, 0),
+            "current_speed_kmh": round(_safe_float(worst_corridor.get("current_speed_kmh"), 0.0), 1),
+            "delay_sec": int(_safe_float(worst_corridor.get("delay_sec"), 0)),
+            "query_lat": worst_corridor.get("query_lat"),
+            "query_lon": worst_corridor.get("query_lon"),
+        }
+        if worst_corridor
+        else None,
+        "top_incident": {
+            "category": _INCIDENT_CATEGORIES.get(int(_safe_float(top_incident.get("icon_category"), 0)), "Incident"),
+            "road": top_incident.get("road_numbers") or top_incident.get("from_location") or "DC Roadway",
+            "from_location": top_incident.get("from_location"),
+            "delay_min": round(_safe_float(top_incident.get("delay_sec"), 0.0) / 60.0, 1),
+            "length_m": int(_safe_float(top_incident.get("length_m"), 0)),
+            "lat": top_incident.get("lat"),
+            "lon": top_incident.get("lon"),
+        }
+        if top_incident
+        else None,
+    }
+
+    return {
+        "executive_summary": executive_summary,
+        "delay_distribution": delay_distribution,
+        "progress_curve": progress_curve,
+        "congestion_tiers": congestion_tiers,
+        "driver_attribution": driver_attribution,
+        "incident_breakdown": incident_breakdown,
+        "feature_drivers": feature_drivers,
+        "route_diagnostics": route_diagnostics,
+        "freshness": fresh,
+    }
+
+
 @app.get("/v1/stream/status")
 def stream_status(conn=Depends(get_conn)):
     fresh = _freshness(conn)
+    now_utc = datetime.now(timezone.utc)
     runs: list[dict[str, Any]] = []
     try:
         runs = _fetch(
@@ -501,9 +1227,16 @@ def stream_status(conn=Depends(get_conn)):
             SELECT run_id, job_name, layer, status, started_at, finished_at, row_counts, error
             FROM public.pipeline_runs
             ORDER BY started_at DESC
-            LIMIT 20
+            LIMIT 30
             """,
         )
+        for r in runs:
+            st_dt = _parse_iso_dt(r.get("started_at"))
+            fn_dt = _parse_iso_dt(r.get("finished_at"))
+            if st_dt and fn_dt:
+                r["duration_sec"] = round(max(0.0, (fn_dt - st_dt).total_seconds()), 1)
+            else:
+                r["duration_sec"] = None
     except Exception:  # noqa: BLE001
         runs = []
 
@@ -538,16 +1271,36 @@ def stream_status(conn=Depends(get_conn)):
         """
         SELECT
           (SELECT count(*) FROM public.tomtom_flow_segment) AS silver_tomtom_flow,
-          (SELECT count(*) FROM public.tomtom_traffic_incident) AS silver_tomtom_incidents
+          (SELECT count(*) FROM public.tomtom_traffic_incident) AS silver_tomtom_incidents,
+          (SELECT max(snapshot_ts) FROM public.tomtom_flow_segment) AS tomtom_max_ts
         """,
     )
+    tomtom_max_ts = None
     if s_traffic:
-        counts.update({k: int(v or 0) for k, v in s_traffic[0].items()})
+        row0 = s_traffic[0]
+        counts["silver_tomtom_flow"] = int(row0.get("silver_tomtom_flow") or 0)
+        counts["silver_tomtom_incidents"] = int(row0.get("silver_tomtom_incidents") or 0)
+        if row0.get("tomtom_max_ts") is not None:
+            tomtom_max_ts = str(row0["tomtom_max_ts"])
+
+    snap_dt = _parse_iso_dt(fresh.get("max_snapshot_ts"))
+    pred_dt = _parse_iso_dt(fresh.get("max_predicted_at"))
+    tomtom_dt = _parse_iso_dt(tomtom_max_ts)
+
+    telemetry = {
+        "snapshot_age_sec": int(max(0.0, (now_utc - snap_dt).total_seconds())) if snap_dt else None,
+        "prediction_age_sec": int(max(0.0, (now_utc - pred_dt).total_seconds())) if pred_dt else None,
+        "tomtom_age_sec": int(max(0.0, (now_utc - tomtom_dt).total_seconds())) if tomtom_dt else None,
+        "tomtom_max_ts": tomtom_max_ts,
+        "sse_subscribers": len(_SSE_SUBSCRIBERS),
+        "server_time_utc": now_utc.isoformat(),
+    }
 
     return {
         "freshness": fresh,
         "counts": counts,
         "pipeline_runs": runs,
+        "telemetry": telemetry,
         "nats_connected": _NATS_CONNECTED,
     }
 

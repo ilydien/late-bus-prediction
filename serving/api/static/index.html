@@ -1,2281 +1,822 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MetroPulse DC — WMATA &amp; TomTom Real-Time Lateness Platform</title>
-  <link rel="icon" type="image/jpeg" href="/bus-logo.jpg?v=2" />
+  <title>MetroPulse DC — WMATA &amp; TomTom Real-Time Transit Intelligence</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link
-    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
     rel="stylesheet"
   />
-  <link
-    rel="stylesheet"
-    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-    crossorigin=""
-  />
-  <script
-    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-    crossorigin=""
-  ></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-  <style>
-    /* =====================================================================
-       MIDNIGHT TRANSIT SLATE — Design System Tokens
-       ===================================================================== */
-    :root {
-      --bg-canvas: #090c10;
-      --bg-surface: #11161f;
-      --bg-elevated: #171e2b;
-      --bg-hover: #1d2637;
-      --border: #1e2838;
-      --border-strong: #2e3d56;
-
-      --text-primary: #f1f5f9;
-      --text-secondary: #94a3b8;
-      --text-muted: #64748b;
-
-      --cobalt: #38bdf8;
-      --cobalt-strong: #0ea5e9;
-      --cobalt-soft: rgba(56, 189, 248, 0.13);
-
-      --teal: #14b8a6;
-      --teal-soft: rgba(20, 184, 166, 0.14);
-
-      --amber: #f59e0b;
-      --amber-soft: rgba(245, 158, 11, 0.14);
-
-      --crimson: #f43f5e;
-      --crimson-soft: rgba(244, 63, 94, 0.15);
-
-      --indigo: #818cf8;
-      --indigo-soft: rgba(129, 140, 248, 0.15);
-
-      --radius-sm: 8px;
-      --radius-md: 12px;
-      --radius-lg: 16px;
-      --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -8px rgba(0, 0, 0, 0.45);
-    }
-
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-
-    html {
-      scroll-behavior: smooth;
-    }
-
-    body {
-      font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background-color: var(--bg-canvas);
-      background-image:
-        radial-gradient(ellipse 65% 40% at 0% 0%, rgba(14, 165, 233, 0.08), transparent 60%),
-        radial-gradient(ellipse 50% 35% at 100% 0%, rgba(20, 184, 166, 0.06), transparent 55%);
-      color: var(--text-primary);
-      line-height: 1.45;
-      min-height: 100vh;
-      font-variant-numeric: tabular-nums;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    .mono {
-      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
-    }
-
-    ::-webkit-scrollbar {
-      width: 6px;
-      height: 6px;
-    }
-    ::-webkit-scrollbar-track {
-      background: transparent;
-    }
-    ::-webkit-scrollbar-thumb {
-      background: #28354a;
-      border-radius: 999px;
-    }
-    ::-webkit-scrollbar-thumb:hover {
-      background: #3a4c69;
-    }
-
-    /* =====================================================================
-       F-PATTERN TOP BAR: Brand Anchor (Left) + Command Controls (Right)
-       ===================================================================== */
-    .topbar {
-      position: sticky;
-      top: 0;
-      z-index: 1200;
-      background: rgba(9, 12, 16, 0.86);
-      backdrop-filter: blur(16px);
-      border-bottom: 1px solid var(--border);
-    }
-
-    .topbar-inner {
-      max-width: 1680px;
-      margin: 0 auto;
-      padding: 12px 24px;
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 13px;
-      text-decoration: none;
-      color: inherit;
-    }
-
-    .logo-wrap {
-      width: 44px;
-      height: 44px;
-      flex-shrink: 0;
-      border-radius: 11px;
-      overflow: hidden;
-      background: linear-gradient(135deg, #162235 0%, #0d1421 100%);
-      border: 1px solid var(--border-strong);
-      box-shadow: 0 4px 14px rgba(56, 189, 248, 0.16);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      position: relative;
-    }
-
-    .logo-img {
-      width: 100%;
-      height: 100%;
-      padding: 4px;
-      object-fit: contain;
-      filter: invert(1) contrast(1.25) brightness(1.08);
-      mix-blend-mode: screen;
-      display: block;
-    }
-
-    .brand-copy {
-      display: flex;
-      flex-direction: column;
-      gap: 1px;
-    }
-
-    .brand-title {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 17px;
-      font-weight: 800;
-      letter-spacing: -0.03em;
-      color: var(--text-primary);
-    }
-
-    .brand-title .dc-tag {
-      font-size: 10.5px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      padding: 2px 7px;
-      border-radius: 5px;
-      background: linear-gradient(135deg, rgba(20, 184, 166, 0.2), rgba(56, 189, 248, 0.2));
-      border: 1px solid rgba(56, 189, 248, 0.35);
-      color: var(--cobalt);
-    }
-
-    .brand-sub {
-      font-size: 11.5px;
-      color: var(--text-secondary);
-      font-weight: 500;
-    }
-
-    .topbar-right {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .status-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      padding: 6px 12px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 600;
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      color: var(--text-primary);
-    }
-
-    .pulse-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--teal);
-      box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.65);
-      animation: livePulse 2.2s infinite;
-    }
-
-    .pulse-dot.demo {
-      background: var(--amber);
-      animation: none;
-      box-shadow: 0 0 8px rgba(245, 158, 11, 0.5);
-    }
-
-    @keyframes livePulse {
-      0% { box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.65); }
-      70% { box-shadow: 0 0 0 7px rgba(20, 184, 166, 0); }
-      100% { box-shadow: 0 0 0 0 rgba(20, 184, 166, 0); }
-    }
-
-    .meta-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 6px 11px;
-      border-radius: var(--radius-sm);
-      font-size: 11.5px;
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      color: var(--text-secondary);
-    }
-
-    .meta-pill strong {
-      color: var(--text-primary);
-      font-weight: 600;
-    }
-
-    /* =====================================================================
-       COMMAND FILTER RIBBON (Secondary Horizontal Anchor)
-       ===================================================================== */
-    .command-ribbon {
-      background: rgba(17, 22, 31, 0.72);
-      border-bottom: 1px solid var(--border);
-    }
-
-    .command-ribbon-inner {
-      max-width: 1680px;
-      margin: 0 auto;
-      padding: 10px 24px;
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-    }
-
-    .control-cluster {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .field-label {
-      font-size: 11px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--text-muted);
-      margin-right: 2px;
-    }
-
-    select, input[type="date"], input[type="text"], button {
-      font-family: inherit;
-      font-size: 12.5px;
-      color: var(--text-primary);
-      background: var(--bg-elevated);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      padding: 6px 11px;
-      outline: none;
-      transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
-    }
-
-    select:focus, input[type="date"]:focus, input[type="text"]:focus {
-      border-color: var(--cobalt);
-      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.16);
-    }
-
-    button {
-      cursor: pointer;
-      font-weight: 600;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    button:hover {
-      background: var(--bg-hover);
-      border-color: var(--border-strong);
-    }
-
-    button.btn-primary {
-      background: linear-gradient(135deg, #0284c7, #0ea5e9);
-      border-color: #38bdf8;
-      color: #fff;
-    }
-    button.btn-primary:hover {
-      filter: brightness(1.08);
-    }
-
-    button.btn-ghost.active {
-      background: var(--cobalt-soft);
-      border-color: rgba(56, 189, 248, 0.45);
-      color: var(--cobalt);
-    }
-
-    button.btn-clear {
-      background: var(--crimson-soft);
-      border-color: rgba(244, 63, 94, 0.4);
-      color: #fda4af;
-    }
-
-    /* =====================================================================
-       MAIN WORKSPACE CONTAINER — Strict F-Pattern Visual Hierarchy
-       ===================================================================== */
-    .workspace {
-      max-width: 1680px;
-      margin: 0 auto;
-      padding: 20px 24px 48px;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }
-
-    /* --- ROW 1: Top Horizontal Sweep — 4 Primary KPI Cards --- */
-    .kpi-strip {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(230px, 1fr));
-      gap: 16px;
-    }
-
-    @media (max-width: 1120px) {
-      .kpi-strip { grid-template-columns: repeat(2, 1fr); }
-    }
-    @media (max-width: 600px) {
-      .kpi-strip { grid-template-columns: 1fr; }
-    }
-
-    .kpi-card {
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
-      padding: 18px 20px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      gap: 12px;
-      box-shadow: var(--shadow-card);
-      position: relative;
-      overflow: hidden;
-      transition: border-color 0.2s ease, transform 0.2s ease;
-    }
-
-    .kpi-card:hover {
-      border-color: var(--border-strong);
-      transform: translateY(-1px);
-    }
-
-    .kpi-card::after {
-      content: "";
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      height: 2px;
-      background: var(--accent-line, var(--cobalt));
-      opacity: 0.85;
-    }
-
-    .kpi-card.teal { --accent-line: linear-gradient(90deg, #14b8a6, #2dd4bf); }
-    .kpi-card.amber { --accent-line: linear-gradient(90deg, #f59e0b, #fbbf24); }
-    .kpi-card.indigo { --accent-line: linear-gradient(90deg, #6366f1, #818cf8); }
-    .kpi-card.cobalt { --accent-line: linear-gradient(90deg, #0ea5e9, #38bdf8); }
-
-    .kpi-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-
-    .kpi-title {
-      font-size: 11.5px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--text-secondary);
-    }
-
-    .kpi-body {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-    }
-
-    .kpi-number {
-      font-size: 31px;
-      font-weight: 800;
-      letter-spacing: -0.04em;
-      line-height: 1.05;
-      font-family: "JetBrains Mono", monospace;
-    }
-
-    .kpi-ring {
-      width: 52px;
-      height: 52px;
-      flex-shrink: 0;
-    }
-
-    .kpi-meter {
-      height: 5px;
-      width: 100%;
-      background: rgba(255, 255, 255, 0.06);
-      border-radius: 999px;
-      overflow: hidden;
-    }
-
-    .kpi-meter-fill {
-      height: 100%;
-      border-radius: 999px;
-      transition: width 0.5s cubic-bezier(0.22, 1, 0.36, 1);
-    }
-
-    .kpi-footer {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      font-size: 12px;
-      color: var(--text-secondary);
-    }
-
-    /* --- ROW 2: Second Sweep of the F — Spatial Hero (Left) + Watchlist (Right) --- */
-    .f-row-primary {
-      display: grid;
-      grid-template-columns: minmax(0, 1.55fr) minmax(360px, 1fr);
-      gap: 16px;
-      align-items: stretch;
-    }
-
-    /* --- ROW 3 & 4: Progressive Drilldown Rows --- */
-    .f-row-analytics {
-      display: grid;
-      grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
-      gap: 16px;
-    }
-
-    .f-row-equal {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 16px;
-    }
-
-    @media (max-width: 1180px) {
-      .f-row-primary,
-      .f-row-analytics,
-      .f-row-equal {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    /* --- Panels & Headers --- */
-    .panel {
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
-      padding: 16px 18px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      box-shadow: var(--shadow-card);
-      min-width: 0;
-    }
-
-    .panel-head {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid var(--border);
-    }
-
-    .panel-heading {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-
-    .panel-title {
-      font-size: 14px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .panel-desc {
-      font-size: 11.5px;
-      color: var(--text-muted);
-    }
-
-    /* --- Interactive DC Map Styling --- */
-    .map-stage {
-      position: relative;
-      width: 100%;
-      height: 500px;
-      border-radius: var(--radius-md);
-      overflow: hidden;
-      border: 1px solid var(--border);
-      background: #0a0e17;
-    }
-
-    #dc-map {
-      width: 100%;
-      height: 100%;
-      background: #0a0e17;
-    }
-
-    /* Curated Midnight Slate filter for keyless OpenStreetMap tiles */
-    #dc-map.map-dark .leaflet-tile-pane {
-      filter: grayscale(42%) invert(100%) hue-rotate(188deg) brightness(86%) contrast(104%) saturate(72%);
-    }
-
-    /* Floating Glass Layer Controls inside Map */
-    .map-overlay-top {
-      position: absolute;
-      top: 12px;
-      right: 12px;
-      z-index: 650;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      max-width: calc(100% - 64px);
-    }
-
-    .map-chip {
-      background: rgba(17, 22, 31, 0.88);
-      backdrop-filter: blur(10px);
-      border: 1px solid var(--border-strong);
-      border-radius: 999px;
-      padding: 5px 11px;
-      font-size: 11.5px;
-      font-weight: 600;
-      color: var(--text-secondary);
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .map-chip.active {
-      color: var(--text-primary);
-      border-color: var(--cobalt);
-      background: rgba(14, 165, 233, 0.2);
-    }
-
-    .map-chip .swatch {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-    }
-
-    .map-legend-bar {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      font-size: 11.5px;
-      color: var(--text-secondary);
-      padding-top: 2px;
-    }
-
-    .legend-items {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 14px;
-      align-items: center;
-    }
-
-    .legend-item {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .dot-sm {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      display: inline-block;
-    }
-
-    /* Dark-themed Leaflet Popups */
-    .leaflet-popup-content-wrapper {
-      background: #131a26 !important;
-      color: #f1f5f9 !important;
-      border: 1px solid #2e3d56 !important;
-      border-radius: 10px !important;
-      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55) !important;
-    }
-    .leaflet-popup-tip {
-      background: #131a26 !important;
-    }
-    .leaflet-popup-close-button {
-      color: #94a3b8 !important;
-    }
-    .leaflet-control-zoom a {
-      background: #131a26 !important;
-      color: #e2e8f0 !important;
-      border-color: #263348 !important;
-    }
-    .leaflet-control-zoom a:hover {
-      background: #1e2838 !important;
-    }
-
-    /* --- Tabs & Segmented Controls --- */
-    .segmented {
-      display: inline-flex;
-      background: var(--bg-canvas);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      padding: 3px;
-      gap: 3px;
-    }
-
-    .seg-btn {
-      background: transparent;
-      border: 1px solid transparent;
-      color: var(--text-secondary);
-      padding: 4px 10px;
-      font-size: 11.5px;
-      font-weight: 600;
-      border-radius: 6px;
-    }
-
-    .seg-btn:hover {
-      color: var(--text-primary);
-      background: rgba(255, 255, 255, 0.04);
-      border-color: transparent;
-    }
-
-    .seg-btn.active {
-      background: var(--bg-elevated);
-      border-color: var(--border-strong);
-      color: var(--text-primary);
-    }
-
-    /* --- Tables --- */
-    .table-scroll {
-      overflow-x: auto;
-      overflow-y: auto;
-      max-height: 448px;
-      border-radius: var(--radius-sm);
-    }
-
-    .table-scroll.compact {
-      max-height: 330px;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12px;
-    }
-
-    th, td {
-      padding: 9px 10px;
-      text-align: left;
-      border-bottom: 1px solid rgba(30, 40, 56, 0.8);
-      white-space: nowrap;
-    }
-
-    th {
-      position: sticky;
-      top: 0;
-      z-index: 2;
-      background: var(--bg-surface);
-      color: var(--text-muted);
-      font-size: 10.5px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-    }
-
-    tr.clickable {
-      cursor: pointer;
-    }
-
-    tr:hover td {
-      background: rgba(56, 189, 248, 0.06);
-    }
-
-    /* --- Badges & Route Chips --- */
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 10.5px;
-      font-weight: 700;
-      letter-spacing: 0.02em;
-    }
-
-    .badge.teal { background: var(--teal-soft); color: #2dd4bf; border: 1px solid rgba(20, 184, 166, 0.35); }
-    .badge.amber { background: var(--amber-soft); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
-    .badge.crimson { background: var(--crimson-soft); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.38); }
-    .badge.cobalt { background: var(--cobalt-soft); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
-    .badge.indigo { background: var(--indigo-soft); color: #a5b4fc; border: 1px solid rgba(129, 140, 248, 0.35); }
-
-    .route-chip {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 34px;
-      padding: 2px 7px;
-      margin-right: 4px;
-      border-radius: 6px;
-      background: rgba(56, 189, 248, 0.12);
-      border: 1px solid rgba(56, 189, 248, 0.32);
-      color: #7dd3fc;
-      font-family: "JetBrains Mono", monospace;
-      font-size: 11px;
-      font-weight: 700;
-      cursor: pointer;
-      transition: all 0.12s ease;
-    }
-
-    .route-chip:hover {
-      background: var(--cobalt-strong);
-      border-color: var(--cobalt);
-      color: #fff;
-    }
-
-    .mini-bar-wrap {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-    }
-
-    .mini-bar {
-      width: 52px;
-      height: 5px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.08);
-      overflow: hidden;
-    }
-
-    .mini-bar > span {
-      display: block;
-      height: 100%;
-      border-radius: 999px;
-    }
-
-    /* --- Charts --- */
-    .chart-stage {
-      position: relative;
-      height: 280px;
-      width: 100%;
-    }
-
-    /* --- Medallion Flow Strip inside Lineage Panel --- */
-    .medallion-flow {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 8px;
-    }
-
-    @media (max-width: 640px) {
-      .medallion-flow { grid-template-columns: repeat(2, 1fr); }
-    }
-
-    .flow-node {
-      background: var(--bg-elevated);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      padding: 8px 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-
-    .flow-node .fn-label {
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--text-muted);
-    }
-
-    .flow-node .fn-val {
-      font-size: 15px;
-      font-weight: 700;
-      font-family: "JetBrains Mono", monospace;
-      color: var(--text-primary);
-    }
-  </style>
 </head>
 <body>
-  <!-- ===================================================================
-       TOP HORIZONTAL SWEEP (F-PATTERN BAR 1): Logo + Live Telemetry Status
-       =================================================================== -->
-  <header class="topbar">
-    <div class="topbar-inner">
-      <div class="brand">
+  <div class="app-shell">
+    <!-- =====================================================================
+         PERSISTENT SIDEBAR NAVIGATION (Clean 1-Line Items)
+         ===================================================================== -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
         <div class="logo-wrap">
-          <img class="logo-img" src="/bus-logo.jpg?v=2" alt="MetroPulse DC Bus Logo" />
+          <img class="logo-img" src="/bus-logo.jpg?v=3" alt="MetroPulse DC Logo" />
         </div>
-
-        <div class="brand-copy">
-          <div class="brand-title">
-            MetroPulse
-            <span class="dc-tag">DC</span>
-            <span class="badge indigo" id="active-route-pill" style="display:none"></span>
-          </div>
-          <div class="brand-sub">WMATA Metrobus &amp; TomTom Real-Time Delay Telemetry</div>
+        <div>
+          <div class="brand-name">MetroPulse <span class="dc-pill">DC</span></div>
+          <div class="brand-tagline">WMATA &middot; TomTom</div>
         </div>
       </div>
 
-      <div class="topbar-right">
-        <div class="status-chip" id="connection-chip">
-          <span class="pulse-dot" id="connection-dot"></span>
-          <span id="connection-text">Connecting stream...</span>
-        </div>
-        <div class="meta-pill">
-          <span>Snapshot</span>
-          <strong class="mono" id="freshness-snapshot">—</strong>
-        </div>
-        <div class="meta-pill">
-          <span>Champion</span>
-          <strong class="mono" id="model-version-pill">trip_delay_lgbm v1</strong>
-        </div>
-        <div class="meta-pill">
-          <span>Scored</span>
-          <strong class="mono" id="freshness-prediction">—</strong>
-        </div>
-      </div>
-    </div>
-  </header>
-
-  <!-- Command Filter Ribbon -->
-  <div class="command-ribbon">
-    <div class="command-ribbon-inner">
-      <div class="control-cluster">
-        <span class="field-label">Route</span>
-        <select id="route-filter" aria-label="Filter by WMATA route">
-          <option value="">All Active Routes</option>
-        </select>
-
-        <span class="field-label" style="margin-left:6px">Window</span>
-        <input type="date" id="start-date" aria-label="Start date" />
-        <span style="color:var(--text-muted);font-size:12px">&rarr;</span>
-        <input type="date" id="end-date" aria-label="End date" />
-
-        <button class="btn-primary" id="apply-btn">Apply</button>
-        <button class="btn-clear" id="clear-route-btn" style="display:none">&times; Clear Route</button>
-      </div>
-
-      <div class="control-cluster">
-        <button class="btn-ghost active" id="preset-live-btn">Live Feed</button>
-        <button class="btn-ghost" id="preset-archive-btn">2020 Archive</button>
-        <button class="btn-ghost active" id="sse-toggle-btn" title="Toggle real-time Server-Sent Events push">
-          <span class="dot-sm" id="sse-btn-dot" style="background:var(--teal)"></span>
-          <span id="sse-btn-label">Real-Time Push: ON</span>
+      <div class="nav-group-label">Monitor</div>
+      <nav class="sidebar-nav" aria-label="Primary navigation">
+        <button class="nav-item active" data-page="overview" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="9" rx="1.5" />
+            <rect x="14" y="3" width="7" height="5" rx="1.5" />
+            <rect x="14" y="12" width="7" height="9" rx="1.5" />
+            <rect x="3" y="16" width="7" height="5" rx="1.5" />
+          </svg>
+          <span class="nav-label">Executive Pulse</span>
         </button>
-        <span class="meta-pill mono" id="live-push-ticker" style="font-size:11px;padding:5px 10px">Listening NATS SSE…</span>
-        <button id="refresh-now-btn" title="Manual refresh">&#x21bb;</button>
+
+        <button class="nav-item" data-page="live-map" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21" />
+            <line x1="9" y1="3" x2="9" y2="18" />
+            <line x1="15" y1="6" x2="15" y2="21" />
+          </svg>
+          <span class="nav-label">Live Fleet Map</span>
+          <span class="nav-badge" id="nav-badge-buses">0</span>
+        </button>
+
+        <button class="nav-item" data-page="root-cause" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            <line x1="11" y1="8" x2="11" y2="12" />
+            <line x1="11" y1="15" x2="11.01" y2="15" />
+          </svg>
+          <span class="nav-label">Root Cause</span>
+          <span class="nav-badge alert" id="nav-badge-late">0</span>
+        </button>
+
+        <div class="nav-group-label" style="padding:12px 6px 4px">Systems</div>
+
+        <button class="nav-item" data-page="ml-forecast" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5z" />
+            <path d="M2 17l10 5 10-5" />
+            <path d="M2 12l10 5 10-5" />
+          </svg>
+          <span class="nav-label">ML Forecast</span>
+        </button>
+
+        <button class="nav-item" data-page="pipeline" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+          </svg>
+          <span class="nav-label">Pipeline Health</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="stream-status-box">
+          <div class="stream-row">
+            <span class="pulse-dot" id="sse-dot"></span>
+            <span id="sse-status-label">Connecting...</span>
+          </div>
+          <div class="stream-meta mono">
+            <span id="sidebar-snap-age">—</span>
+            <span id="sidebar-model-ver">lgbm v1</span>
+          </div>
+        </div>
+
+        <div class="theme-switch" role="group" aria-label="Theme">
+          <button class="theme-btn active" id="theme-light-btn" type="button">&#9728; Daylight</button>
+          <button class="theme-btn" id="theme-dark-btn" type="button">&#9790; Night</button>
+        </div>
       </div>
+    </aside>
+
+    <!-- =====================================================================
+         MAIN WORKSPACE
+         ===================================================================== -->
+    <div class="main-area">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="mobile-menu-btn" id="mobile-menu-btn" aria-label="Menu" type="button">&#9776;</button>
+          <div class="page-title">
+            <span id="current-page-title">Executive Pulse</span>
+            <span class="badge brand" id="active-route-badge" style="display:none"></span>
+          </div>
+        </div>
+
+        <div class="topbar-controls">
+          <div class="ctrl-group">
+            <select id="route-filter" aria-label="WMATA Route">
+              <option value="">All Routes</option>
+            </select>
+            <button class="btn btn-soft-danger" id="clear-route-btn" style="display:none" type="button">&times;</button>
+          </div>
+
+          <div class="segmented" role="group" aria-label="Window">
+            <button class="seg-btn" id="preset-today-btn" type="button">Today</button>
+            <button class="seg-btn active" id="preset-live7-btn" type="button">7d</button>
+            <button class="seg-btn" id="preset-archive-btn" type="button">2020</button>
+          </div>
+
+          <div class="ctrl-group">
+            <input type="date" id="start-date" aria-label="Start date" />
+            <span style="color:var(--text-muted)">&rarr;</span>
+            <input type="date" id="end-date" aria-label="End date" />
+            <button class="btn btn-primary" id="apply-date-btn" type="button">Apply</button>
+          </div>
+
+          <button class="ticker-pill mono" id="sse-toggle-btn" title="Toggle NATS SSE Push" type="button">
+            <span class="dot-sm" id="ticker-dot" style="background:var(--emerald)"></span>
+            <span id="live-ticker-text">Push: ON</span>
+          </button>
+
+          <button class="btn" id="refresh-now-btn" title="Refresh" type="button">&#x21bb;</button>
+        </div>
+      </header>
+
+      <main class="content-wrap">
+        <!-- =================================================================
+             PAGE 1: EXECUTIVE PULSE (/)
+             ================================================================= -->
+        <section class="page-view active" id="page-overview">
+          <!-- Compact Visual Signal Strip (No prose paragraphs!) -->
+          <div class="signal-strip warn" id="exec-signal-strip">
+            <div class="signal-items">
+              <span class="badge amber" id="sig-sla-pill">SLA —</span>
+              <span class="signal-chip">
+                <span class="k">Top Cause</span>
+                <strong id="sig-cause-val">—</strong>
+              </span>
+              <span class="signal-chip">
+                <span class="k">Snowball</span>
+                <strong class="mono" id="sig-snowball-val">— &rarr; —</strong>
+              </span>
+              <span class="signal-chip">
+                <span class="k">Hotspot</span>
+                <strong class="mono" id="sig-hotspot-val">—</strong>
+              </span>
+            </div>
+            <div style="display:flex;gap:7px">
+              <button class="btn btn-primary" id="btn-go-root-cause" type="button">Root Cause &rarr;</button>
+              <button class="btn" id="btn-go-map" type="button">Live Map</button>
+            </div>
+          </div>
+
+          <!-- 4 Hero KPI Cards -->
+          <div class="grid-4">
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">On-Time (&le; 5m)</span>
+                <span class="badge emerald" id="ov-sla-badge">SLA 80%</span>
+              </div>
+              <div class="kpi-mid">
+                <div>
+                  <div class="kpi-value" id="ov-ontime">—</div>
+                  <div class="kpi-sub mono" id="ov-sla-gap">—</div>
+                </div>
+                <svg class="kpi-ring" viewBox="0 0 48 48" aria-hidden="true">
+                  <circle cx="24" cy="24" r="19" fill="none" stroke="var(--bg-elevated)" stroke-width="5" />
+                  <circle
+                    id="ov-ontime-ring"
+                    cx="24" cy="24" r="19"
+                    fill="none" stroke="var(--emerald)" stroke-width="5"
+                    stroke-linecap="round"
+                    stroke-dasharray="119.4" stroke-dashoffset="119.4"
+                    transform="rotate(-90 24 24)"
+                    style="transition: stroke-dashoffset 0.45s ease, stroke 0.25s ease"
+                  />
+                </svg>
+              </div>
+              <div class="kpi-foot">
+                <span id="ov-routes-count">— Routes</span>
+                <span class="mono" id="ov-trips-count">— trips</span>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Avg Delay</span>
+                <span class="badge amber mono" id="ov-p90-badge">P90 —</span>
+              </div>
+              <div class="kpi-mid">
+                <div>
+                  <div class="kpi-value" id="ov-avg-delay">—</div>
+                  <div class="kpi-sub mono" id="ov-median-sub">Med —</div>
+                </div>
+                <span class="badge sky mono" id="ov-speed-badge">— km/h</span>
+              </div>
+              <div class="kpi-bar">
+                <span id="ov-delay-bar" style="width:0%;background:var(--amber)"></span>
+              </div>
+              <div class="kpi-foot">
+                <span>Window</span>
+                <span class="mono" id="ov-window-label">—</span>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">ML +15m Forecast</span>
+                <span class="badge indigo mono" id="ov-ml-late-badge">Late —</span>
+              </div>
+              <div class="kpi-mid">
+                <div>
+                  <div class="kpi-value" id="ov-ml-pred">—</div>
+                  <div class="kpi-sub mono" id="ov-ml-err-sub">MAE —</div>
+                </div>
+                <span class="badge neutral mono" id="ov-ml-ver-badge">v1</span>
+              </div>
+              <div class="kpi-bar">
+                <span id="ov-ml-bar" style="width:0%;background:var(--indigo)"></span>
+              </div>
+              <div class="kpi-foot">
+                <span>LightGBM</span>
+                <span class="mono" id="ov-ml-scored">—</span>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">DC Road Flow</span>
+                <span class="badge crimson" id="ov-inc-badge">0 Inc</span>
+              </div>
+              <div class="kpi-mid">
+                <div>
+                  <div class="kpi-value" id="ov-flow-pct">—</div>
+                  <div class="kpi-sub mono" id="ov-flow-speed">— km/h</div>
+                </div>
+                <span class="badge brand mono" id="ov-buses-pill">0 buses</span>
+              </div>
+              <div class="kpi-bar">
+                <span id="ov-flow-bar" style="width:0%;background:var(--emerald)"></span>
+              </div>
+              <div class="kpi-foot">
+                <span>TomTom 16 Corridors</span>
+                <span class="mono" id="ov-flow-delay">+0s</span>
+              </div>
+            </article>
+          </div>
+
+          <!-- 2 High-Signal Visuals (Zero Redundancy) -->
+          <div class="grid-main-side">
+            <!-- Left: Donut Ring + Proportional Schedule Bars -->
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Fleet Schedule Composition</div>
+                <span class="badge neutral mono" id="ov-dist-total">—</span>
+              </div>
+              <div class="donut-split" style="flex:1">
+                <div class="donut-wrap">
+                  <canvas id="ovDonutChart"></canvas>
+                  <div class="donut-center">
+                    <div class="donut-center-val" id="ov-donut-center">—</div>
+                    <div class="donut-center-lbl">On-Time &le;5m</div>
+                  </div>
+                </div>
+                <div class="visual-bar-list" id="ov-dist-bars"></div>
+              </div>
+            </div>
+
+            <!-- Right: Top 10 Delayed Routes with 5m SLA Line + Direct Labels -->
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title" id="ov-bottleneck-title">Top 10 Delayed Routes</div>
+                <div class="segmented">
+                  <button class="seg-btn active" id="ov-chart-delay-btn" type="button">Avg / P90</button>
+                  <button class="seg-btn" id="ov-chart-ontime-btn" type="button">On-Time %</button>
+                </div>
+              </div>
+              <div class="chart-box tall">
+                <canvas id="ovBottleneckChart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <!-- 3 Compact Visual Spotlight Action Tiles -->
+          <div class="grid-3">
+            <div class="spotlight-card" id="spot-route-card">
+              <div class="spot-left">
+                <div class="spot-icon" style="background:var(--crimson-soft);color:var(--crimson)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                    <line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" />
+                  </svg>
+                </div>
+                <div style="min-width:0">
+                  <div class="spot-kicker">Worst Route</div>
+                  <div class="spot-title" id="spot-route-title">—</div>
+                  <div class="spot-meta mono" id="spot-route-meta">—</div>
+                </div>
+              </div>
+              <span class="badge crimson mono" id="spot-route-badge">—</span>
+            </div>
+
+            <div class="spotlight-card" id="spot-corridor-card">
+              <div class="spot-left">
+                <div class="spot-icon" style="background:var(--amber-soft);color:var(--amber)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <path d="M4 19L8 5M16 5l4 14M12 5v3M12 11v3M12 17v2" />
+                  </svg>
+                </div>
+                <div style="min-width:0">
+                  <div class="spot-kicker">Slowest Corridor</div>
+                  <div class="spot-title" id="spot-corridor-title">—</div>
+                  <div class="spot-meta mono" id="spot-corridor-meta">—</div>
+                </div>
+              </div>
+              <span class="badge amber mono" id="spot-corridor-badge">—</span>
+            </div>
+
+            <div class="spotlight-card" id="spot-incident-card">
+              <div class="spot-left">
+                <div class="spot-icon" style="background:var(--crimson-soft);color:var(--crimson)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
+                  </svg>
+                </div>
+                <div style="min-width:0">
+                  <div class="spot-kicker">Top Incident</div>
+                  <div class="spot-title" id="spot-incident-title">—</div>
+                  <div class="spot-meta mono" id="spot-incident-meta">—</div>
+                </div>
+              </div>
+              <span class="badge crimson mono" id="spot-incident-badge">—</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================
+             PAGE 2: LIVE FLEET MAP (/live-map)
+             ================================================================= -->
+        <section class="page-view" id="page-live-map">
+          <div class="grid-map-layout">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">DC Live Fleet &amp; Roadway Telemetry</div>
+                <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+                  <div class="segmented" role="group">
+                    <button class="seg-btn active" data-bus-filter="all" type="button">All</button>
+                    <button class="seg-btn" data-bus-filter="late" type="button">Late &gt;5m</button>
+                    <button class="seg-btn" data-bus-filter="moderate" type="button">2–5m</button>
+                    <button class="seg-btn" data-bus-filter="ontime" type="button">On-Time</button>
+                  </div>
+                  <button class="btn" id="reset-map-btn" type="button">&#x2316; Reset</button>
+                </div>
+              </div>
+
+              <div class="map-stage">
+                <div class="map-overlay-bar">
+                  <button class="map-chip active" id="toggle-buses-btn" type="button">
+                    <span class="dot-sm" style="background:var(--brand)"></span> Buses (<span id="map-bus-count">0</span>)
+                  </button>
+                  <button class="map-chip active" id="toggle-corridors-btn" type="button">
+                    <span class="dot-sm" style="background:var(--emerald)"></span> Corridors (<span id="map-corridor-count">0</span>)
+                  </button>
+                  <button class="map-chip active" id="toggle-incidents-btn" type="button">
+                    <span class="dot-sm" style="background:var(--crimson)"></span> Incidents (<span id="map-incident-count">0</span>)
+                  </button>
+                </div>
+                <div id="dc-map"></div>
+              </div>
+
+              <div class="map-legend">
+                <div class="legend-items">
+                  <span class="legend-item"><i class="dot-sm" style="background:var(--emerald)"></i> On-Time / Free (&ge;78%)</span>
+                  <span class="legend-item"><i class="dot-sm" style="background:var(--amber)"></i> 2–5m / Dense (55–77%)</span>
+                  <span class="legend-item"><i class="dot-sm" style="background:var(--crimson)"></i> Late &gt;5m / Jam (&lt;55%)</span>
+                </div>
+                <span class="mono" style="color:var(--text-muted)">OSM &middot; TomTom &middot; WMATA</span>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="segmented" role="tablist">
+                  <button class="seg-btn active" id="insp-tab-buses" type="button">Late (<span id="insp-late-count">0</span>)</button>
+                  <button class="seg-btn" id="insp-tab-flow" type="button">Flow (16)</button>
+                  <button class="seg-btn" id="insp-tab-inc" type="button">Incidents (<span id="insp-inc-count">0</span>)</button>
+                </div>
+                <input type="text" id="map-inspector-search" placeholder="Search..." style="width:100%" />
+              </div>
+
+              <div class="table-scroll tall table-compact" id="insp-pane-buses">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Route</th>
+                      <th>Delay</th>
+                      <th>Speed</th>
+                      <th>Cause</th>
+                    </tr>
+                  </thead>
+                  <tbody id="insp-buses-tbody"></tbody>
+                </table>
+              </div>
+
+              <div class="table-scroll tall table-compact" id="insp-pane-flow" style="display:none">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Corridor</th>
+                      <th>Speed</th>
+                      <th>Flow</th>
+                      <th>Delay</th>
+                    </tr>
+                  </thead>
+                  <tbody id="insp-flow-tbody"></tbody>
+                </table>
+              </div>
+
+              <div class="table-scroll tall table-compact" id="insp-pane-inc" style="display:none">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Type</th>
+                      <th>Road</th>
+                      <th>Delay</th>
+                      <th>Len</th>
+                    </tr>
+                  </thead>
+                  <tbody id="insp-inc-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================
+             PAGE 3: ROOT CAUSE (/root-cause)
+             ================================================================= -->
+        <section class="page-view" id="page-root-cause">
+          <div class="grid-4">
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Top Delay Driver</span>
+                <span class="badge crimson mono" id="rc-dom-share">—</span>
+              </div>
+              <div class="kpi-value" id="rc-dom-cause" style="font-size:21px;font-family:inherit">—</div>
+              <div class="kpi-foot"><span class="mono" id="rc-dom-sub">—</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Trip Snowball</span>
+                <span class="badge amber mono" id="rc-snowball-mult">—</span>
+              </div>
+              <div class="kpi-value" id="rc-snowball-val" style="font-size:22px">— &rarr; —</div>
+              <div class="kpi-foot"><span>Start (0–20%) &rarr; End (80–100%)</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Incident Zone (&le;1.5km)</span>
+                <span class="badge crimson" id="rc-inc-active">0</span>
+              </div>
+              <div class="kpi-value" id="rc-inc-exposed">—</div>
+              <div class="kpi-foot"><span>Late buses near incidents</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Congestion Impact</span>
+                <span class="badge brand" id="rc-cong-badge">TomTom</span>
+              </div>
+              <div class="kpi-value" id="rc-cong-penalty">—</div>
+              <div class="kpi-foot"><span class="mono" id="rc-cong-sub">—</span></div>
+            </article>
+          </div>
+
+          <!-- Row 1: Visual Donut Attribution + Snowball Curve with Direct Labels -->
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Late-Bus Cause Breakdown</div>
+                <span class="badge crimson mono" id="rc-late-total-badge">0 late</span>
+              </div>
+              <div class="donut-split" style="flex:1">
+                <div class="donut-wrap">
+                  <canvas id="rcCauseDonut"></canvas>
+                  <div class="donut-center">
+                    <div class="donut-center-val" id="rc-donut-center">0</div>
+                    <div class="donut-center-lbl">Late &gt;5m</div>
+                  </div>
+                </div>
+                <div class="visual-bar-list" id="rc-driver-bars"></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Delay Snowball: Trip Start &rarr; End</div>
+                <span class="badge amber">Avg Min vs % Late</span>
+              </div>
+              <div class="chart-box">
+                <canvas id="rcProgressChart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <!-- Row 2: Tinted Quadrant Scatter (with Route Labels!) + Dual-Axis Hourly -->
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Speed vs. Delay Quadrant</div>
+                <span class="badge neutral">Click bubble to filter</span>
+              </div>
+              <div class="chart-box">
+                <canvas id="rcQuadrantChart"></canvas>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title" id="rc-hourly-title">Hourly Delay vs. On-Time %</div>
+                <div class="segmented">
+                  <button class="seg-btn active" id="rc-sec-hourly" type="button">Hourly</button>
+                  <button class="seg-btn" id="rc-sec-congestion" type="button">Flow Tier</button>
+                </div>
+              </div>
+              <div class="chart-box">
+                <canvas id="rcHourlyChart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <!-- Row 3: Visual Route Diagnostic Table (Compact Signal Chips & Progress Gauges!) -->
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title">Route Root-Cause Matrix</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <div class="segmented">
+                  <button class="seg-btn active" data-cause-filter="all" type="button">All</button>
+                  <button class="seg-btn" data-cause-filter="issues" type="button">Delayed</button>
+                  <button class="seg-btn" data-cause-filter="incident" type="button">Incident</button>
+                </div>
+                <input type="text" id="rc-table-search" placeholder="Route / cause..." style="width:165px" />
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Route</th>
+                    <th>Trips</th>
+                    <th>Avg</th>
+                    <th>P90</th>
+                    <th>On-Time</th>
+                    <th>Speed</th>
+                    <th>Late Stage</th>
+                    <th>Cause</th>
+                    <th>Key Signal</th>
+                  </tr>
+                </thead>
+                <tbody id="rc-routes-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================
+             PAGE 4: ML FORECAST (/ml-forecast)
+             ================================================================= -->
+        <section class="page-view" id="page-ml-forecast">
+          <div class="grid-4">
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Avg +15m Forecast</span>
+                <span class="badge indigo mono" id="ml-model-badge">lgbm v1</span>
+              </div>
+              <div class="kpi-value" id="ml-kpi-avg">—</div>
+              <div class="kpi-foot"><span class="badge amber" id="ml-eval-mode-badge">Live Bootstrap</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Predicted Late (&gt;5m)</span>
+                <span class="badge crimson mono" id="ml-kpi-late-cnt">0</span>
+              </div>
+              <div class="kpi-value" id="ml-kpi-late-pct">—</div>
+              <div class="kpi-foot"><span>Forecast breaching 5m SLA</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">MAE / RMSE</span>
+                <span class="badge emerald mono" id="ml-kpi-acc">Acc —</span>
+              </div>
+              <div class="kpi-value" id="ml-kpi-mae">—</div>
+              <div class="kpi-foot"><span class="mono" id="ml-kpi-rmse">RMSE —</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Total Scored</span>
+                <span class="badge brand mono" id="ml-kpi-ver">v1</span>
+              </div>
+              <div class="kpi-value" id="ml-kpi-total">—</div>
+              <div class="kpi-foot"><span class="mono" id="ml-kpi-last-scored">—</span></div>
+            </article>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Predicted vs. Target Accuracy (45&deg; Fit)</div>
+                <span class="badge indigo">Closer to line = tighter fit</span>
+              </div>
+              <div class="chart-box">
+                <canvas id="mlCalibrationChart"></canvas>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Feature Drivers (+15m Delay)</div>
+                <div style="display:flex;gap:6px">
+                  <span class="badge crimson">&uarr; More Delay</span>
+                  <span class="badge emerald">&darr; Less Delay</span>
+                </div>
+              </div>
+              <div class="chart-box">
+                <canvas id="mlFeatureDriversChart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title">Live Trip Predictions (+15m)</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <div class="segmented">
+                  <button class="seg-btn active" data-pred-filter="all" type="button">All</button>
+                  <button class="seg-btn" data-pred-filter="late" type="button">Late &gt;5m</button>
+                  <button class="seg-btn" data-pred-filter="worsening" type="button">Worsening &uarr;</button>
+                </div>
+                <input type="text" id="ml-pred-search" placeholder="Route / trip..." style="width:155px" />
+                <span class="badge indigo mono" id="ml-pred-count">0</span>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Route</th>
+                    <th>Trip</th>
+                    <th>UTC</th>
+                    <th>Now</th>
+                    <th>Pred +15m</th>
+                    <th>Trend</th>
+                    <th>Target</th>
+                    <th>Err</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="ml-predictions-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================
+             PAGE 5: PIPELINE HEALTH (/pipeline)
+             ================================================================= -->
+        <section class="page-view" id="page-pipeline">
+          <!-- 4-Stage Medallion Architecture with Visual Connecting Arrows -->
+          <div class="medallion-flow-grid">
+            <article class="stage-card bronze">
+              <div class="stage-step"><span>1 &middot; Bronze</span><span class="badge amber">SeaweedFS</span></div>
+              <div class="stage-title">Live Pollers</div>
+              <div class="stage-stat">2 Feeds</div>
+              <div class="stage-sub">WMATA &middot; TomTom</div>
+            </article>
+
+            <div class="flow-arrow">&rarr;</div>
+
+            <article class="stage-card silver">
+              <div class="stage-step"><span>2 &middot; Silver</span><span class="badge sky">Spark + Spock</span></div>
+              <div class="stage-title">Normalized</div>
+              <div class="stage-stat" id="pipe-silver-buses">—</div>
+              <div class="stage-sub mono" id="pipe-silver-sub">—</div>
+            </article>
+
+            <div class="flow-arrow">&rarr;</div>
+
+            <article class="stage-card gold">
+              <div class="stage-step"><span>3 &middot; Gold</span><span class="badge emerald">Spock Gold</span></div>
+              <div class="stage-title">Features</div>
+              <div class="stage-stat" id="pipe-gold-features">—</div>
+              <div class="stage-sub mono" id="pipe-gold-sub">—</div>
+            </article>
+
+            <div class="flow-arrow">&rarr;</div>
+
+            <article class="stage-card ml">
+              <div class="stage-step"><span>4 &middot; Serve</span><span class="badge indigo">MLflow + SSE</span></div>
+              <div class="stage-title">Predictions</div>
+              <div class="stage-stat" id="pipe-gold-preds">—</div>
+              <div class="stage-sub">NATS JetStream Push</div>
+            </article>
+          </div>
+
+          <!-- Freshness Cards with Visual Health Bars -->
+          <div class="grid-4">
+            <article class="kpi-card">
+              <div class="kpi-top"><span class="kpi-label">WMATA Freshness</span><span class="badge emerald" id="pipe-snap-badge">Live</span></div>
+              <div class="kpi-value" id="pipe-snap-age">—</div>
+              <div class="kpi-bar"><span id="pipe-snap-bar" style="width:90%;background:var(--emerald)"></span></div>
+              <div class="kpi-foot"><span class="mono" id="pipe-snap-ts">—</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top"><span class="kpi-label">ML Inference</span><span class="badge indigo" id="pipe-pred-badge">Active</span></div>
+              <div class="kpi-value" id="pipe-pred-age">—</div>
+              <div class="kpi-bar"><span id="pipe-pred-bar" style="width:95%;background:var(--indigo)"></span></div>
+              <div class="kpi-foot"><span class="mono" id="pipe-pred-ts">—</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top"><span class="kpi-label">TomTom Traffic</span><span class="badge sky" id="pipe-tomtom-badge">Active</span></div>
+              <div class="kpi-value" id="pipe-tomtom-age">—</div>
+              <div class="kpi-bar"><span id="pipe-tomtom-bar" style="width:80%;background:var(--sky)"></span></div>
+              <div class="kpi-foot"><span class="mono" id="pipe-tomtom-ts">—</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top"><span class="kpi-label">NATS SSE Bus</span><span class="badge emerald" id="pipe-nats-badge">Online</span></div>
+              <div class="kpi-value" id="pipe-sse-clients">—</div>
+              <div class="kpi-bar"><span id="pipe-sr-bar" style="width:100%;background:var(--emerald)"></span></div>
+              <div class="kpi-foot"><span class="mono" id="pipe-success-rate">—</span></div>
+            </article>
+          </div>
+
+          <div class="grid-main-side">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Pipeline Runs (<span class="mono">pipeline_runs</span>)</div>
+                <div class="segmented">
+                  <button class="seg-btn active" data-layer-filter="all" type="button">All</button>
+                  <button class="seg-btn" data-layer-filter="bronze" type="button">Bronze</button>
+                  <button class="seg-btn" data-layer-filter="silver" type="button">Silver</button>
+                  <button class="seg-btn" data-layer-filter="gold" type="button">Gold</button>
+                </div>
+              </div>
+              <div class="table-scroll table-compact">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Job</th>
+                      <th>Layer</th>
+                      <th>Status</th>
+                      <th>UTC</th>
+                      <th>Dur</th>
+                      <th>Summary</th>
+                    </tr>
+                  </thead>
+                  <tbody id="pipe-runs-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">TomTom Incidents</div>
+                <span class="badge crimson mono" id="pipe-inc-total">0</span>
+              </div>
+              <div class="chart-box short">
+                <canvas id="pipeIncChart"></canvas>
+              </div>
+              <div class="table-scroll table-compact" style="max-height:190px">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Category</th>
+                      <th>Count</th>
+                      <th>Avg Delay</th>
+                      <th>Len</th>
+                    </tr>
+                  </thead>
+                  <tbody id="pipe-inc-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
     </div>
   </div>
 
-  <main class="workspace">
-    <!-- =================================================================
-         ROW 1 (F-PATTERN TOP SWEEP): 4 Core F-13 Operational KPI Cards
-         ================================================================= -->
-    <section class="kpi-strip">
-      <!-- KPI 1: On-Time Reliability with Radial Ring -->
-      <article class="kpi-card teal">
-        <div class="kpi-header">
-          <span class="kpi-title">On-Time Reliability (&le; 5m)</span>
-          <span class="badge teal" id="kpi-sla-badge">SLA 80%</span>
-        </div>
-        <div class="kpi-body">
-          <div>
-            <div class="kpi-number" id="kpi-ontime">—</div>
-            <div style="font-size:12px;color:var(--text-secondary);margin-top:4px" id="kpi-late-sub">Late (&gt; 5m): —</div>
-          </div>
-          <svg class="kpi-ring" viewBox="0 0 44 44" aria-hidden="true">
-            <circle cx="22" cy="22" r="18" fill="none" stroke="#1e2838" stroke-width="4.5" />
-            <circle
-              id="kpi-ontime-ring"
-              cx="22"
-              cy="22"
-              r="18"
-              fill="none"
-              stroke="#14b8a6"
-              stroke-width="4.5"
-              stroke-linecap="round"
-              stroke-dasharray="113.1"
-              stroke-dashoffset="113.1"
-              transform="rotate(-90 22 22)"
-              style="transition: stroke-dashoffset 0.55s ease"
-            />
-          </svg>
-        </div>
-        <div class="kpi-footer">
-          <span id="kpi-active-routes">Active Routes: —</span>
-          <span class="mono" id="kpi-total-trips">— trips</span>
-        </div>
-      </article>
-
-      <!-- KPI 2: Average Schedule Deviation -->
-      <article class="kpi-card amber">
-        <div class="kpi-header">
-          <span class="kpi-title">Average Schedule Delay</span>
-          <span class="badge amber" id="kpi-p90-badge">P90: —</span>
-        </div>
-        <div class="kpi-body">
-          <div class="kpi-number" id="kpi-avg-delay">—</div>
-          <span class="badge cobalt mono" id="kpi-speed-pill">— km/h</span>
-        </div>
-        <div class="kpi-meter">
-          <div class="kpi-meter-fill" id="kpi-delay-bar" style="width:0%;background:var(--amber)"></div>
-        </div>
-        <div class="kpi-footer">
-          <span id="kpi-median-delay">Median: —</span>
-          <span class="mono" id="kpi-date-window">—</span>
-        </div>
-      </article>
-
-      <!-- KPI 3: Real-Time ML Prediction (+15m Horizon) -->
-      <article class="kpi-card indigo">
-        <div class="kpi-header">
-          <span class="kpi-title">ML Forecast (+15m Horizon)</span>
-          <span class="badge indigo" id="kpi-ml-late-badge">Pred Late: —</span>
-        </div>
-        <div class="kpi-body">
-          <div class="kpi-number" id="kpi-ml-pred">—</div>
-          <span class="badge teal mono" id="kpi-ml-acc-badge">Acc —</span>
-        </div>
-        <div class="kpi-meter">
-          <div class="kpi-meter-fill" id="kpi-ml-bar" style="width:0%;background:var(--indigo)"></div>
-        </div>
-        <div class="kpi-footer">
-          <span class="mono" id="kpi-ml-mae">MAE: — &middot; RMSE: —</span>
-          <span class="mono" id="kpi-ml-scored">— scored</span>
-        </div>
-      </article>
-
-      <!-- KPI 4: Live TomTom DC Traffic Flow & Incidents -->
-      <article class="kpi-card cobalt">
-        <div class="kpi-header">
-          <span class="kpi-title">DC Traffic Flow (TomTom)</span>
-          <span class="badge crimson" id="kpi-incidents-badge">0 Incidents</span>
-        </div>
-        <div class="kpi-body">
-          <div class="kpi-number" id="kpi-flow-ratio">—</div>
-          <span class="badge cobalt mono" id="kpi-live-buses-pill">0 buses</span>
-        </div>
-        <div class="kpi-meter">
-          <div class="kpi-meter-fill" id="kpi-flow-bar" style="width:0%;background:var(--cobalt)"></div>
-        </div>
-        <div class="kpi-footer">
-          <span id="kpi-flow-speed">Avg Flow: — km/h</span>
-          <span id="kpi-flow-delay">Avg Delay: —</span>
-        </div>
-      </article>
-    </section>
-
-    <!-- =================================================================
-         ROW 2 (F-PATTERN SECOND SWEEP): Live Map (Left) + Ops Watchlist (Right)
-         ================================================================= -->
-    <section class="f-row-primary">
-      <!-- Left Primary Spatial Anchor -->
-      <div class="panel">
-        <div class="panel-head">
-          <div class="panel-heading">
-            <div class="panel-title">Live Washington DC Transit &amp; Congestion Map</div>
-            <div class="panel-desc">Real-time WMATA GPS fleet predictions overlaid on TomTom flow corridors &amp; traffic incidents</div>
-          </div>
-          <div style="display:flex;gap:6px;align-items:center">
-            <button id="toggle-map-theme-btn" style="padding:5px 10px;font-size:11.5px">Light Map</button>
-            <button id="reset-map-btn" style="padding:5px 10px;font-size:11.5px">&#x2316; Reset DC</button>
-          </div>
-        </div>
-
-        <div class="map-stage">
-          <div class="map-overlay-top">
-            <button class="map-chip active" id="toggle-buses-btn">
-              <span class="swatch" style="background:#38bdf8"></span> Buses (<span id="layer-bus-count">0</span>)
-            </button>
-            <button class="map-chip active" id="toggle-corridors-btn">
-              <span class="swatch" style="background:#14b8a6"></span> Flow Corridors (<span id="layer-corridor-count">0</span>)
-            </button>
-            <button class="map-chip active" id="toggle-incidents-btn">
-              <span class="swatch" style="background:#f43f5e"></span> Incidents (<span id="layer-incident-count">0</span>)
-            </button>
-          </div>
-          <div id="dc-map" class="map-dark"></div>
-        </div>
-
-        <div class="map-legend-bar">
-          <div class="legend-items">
-            <span class="legend-item"><i class="dot-sm" style="background:var(--teal)"></i> On-Time / Free-Flow (&ge;78%)</span>
-            <span class="legend-item"><i class="dot-sm" style="background:var(--amber)"></i> Moderate (2–5m / 55–77%)</span>
-            <span class="legend-item"><i class="dot-sm" style="background:var(--crimson)"></i> Late &gt;5m / Heavy Jam (&lt;55%)</span>
-          </div>
-          <span class="mono" style="color:var(--text-muted)">OpenStreetMap &middot; Click markers for telemetry</span>
-        </div>
-      </div>
-
-      <!-- Right Operations Watchlist (3 Tabs: Bottleneck Routes | Flow Corridors | Incidents) -->
-      <div class="panel">
-        <div class="panel-head">
-          <div class="segmented" role="tablist">
-            <button class="seg-btn active" id="tab-routes-btn">Hotspot Routes</button>
-            <button class="seg-btn" id="tab-corridors-btn">TomTom Flow</button>
-            <button class="seg-btn" id="tab-incidents-btn">Incidents (<span id="tab-inc-count">0</span>)</button>
-          </div>
-          <input
-            type="text"
-            id="watchlist-search"
-            placeholder="Filter route / road..."
-            style="width:155px;padding:5px 9px;font-size:11.5px"
-          />
-        </div>
-
-        <!-- Tab 1: Delayed Hotspot Routes -->
-        <div class="table-scroll" id="pane-routes">
-          <table>
-            <thead>
-              <tr>
-                <th>Route</th>
-                <th>Trips</th>
-                <th>Avg Delay</th>
-                <th>P90</th>
-                <th>On-Time %</th>
-              </tr>
-            </thead>
-            <tbody id="hotspot-routes-tbody"></tbody>
-          </table>
-        </div>
-
-        <!-- Tab 2: TomTom Flow Corridors -->
-        <div class="table-scroll" id="pane-corridors" style="display:none">
-          <table>
-            <thead>
-              <tr>
-                <th>Corridor</th>
-                <th>Routes</th>
-                <th>Speed</th>
-                <th>Flow</th>
-                <th>Delay</th>
-              </tr>
-            </thead>
-            <tbody id="corridor-tbody"></tbody>
-          </table>
-        </div>
-
-        <!-- Tab 3: Live TomTom Incidents -->
-        <div class="table-scroll" id="pane-incidents" style="display:none">
-          <table>
-            <thead>
-              <tr>
-                <th>Type</th>
-                <th>Road</th>
-                <th>Segment</th>
-                <th>Delay</th>
-                <th>Len</th>
-              </tr>
-            </thead>
-            <tbody id="incidents-tbody"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <!-- =================================================================
-         ROW 3 (F-PATTERN ANALYTICS STEM): Route Delay & Reliability + ML Calibration
-         ================================================================= -->
-    <section class="f-row-analytics">
-      <div class="panel">
-        <div class="panel-head">
-          <div class="panel-heading">
-            <div class="panel-title" id="primary-chart-title">Route Delay Comparison (Avg vs P90 Minutes)</div>
-            <div class="panel-desc">Click any bar to isolate that WMATA route across the entire dashboard</div>
-          </div>
-          <div class="segmented">
-            <button class="seg-btn active" id="chart-mode-delay">Delay (min)</button>
-            <button class="seg-btn" id="chart-mode-reliability">On-Time %</button>
-            <button class="seg-btn" id="chart-sort-btn" title="Toggle sort order">Sort: Delayed</button>
-          </div>
-        </div>
-        <div class="chart-stage">
-          <canvas id="routeDelayChart"></canvas>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head">
-          <div class="panel-heading">
-            <div class="panel-title" id="secondary-chart-title">Hourly Delay &amp; Fleet Speed Profile</div>
-            <div class="panel-desc" id="secondary-chart-desc">Schedule deviation (min) vs. average speed (km/h) in Eastern Time</div>
-          </div>
-          <div class="segmented">
-            <button class="seg-btn active" id="sec-mode-hourly">Hourly</button>
-            <button class="seg-btn" id="sec-mode-ml">ML Forecast</button>
-          </div>
-        </div>
-        <div class="chart-stage">
-          <canvas id="secondaryChart"></canvas>
-        </div>
-      </div>
-    </section>
-
-    <!-- =================================================================
-         ROW 4 (F-PATTERN AUDIT LEDGER): ML Predictions (Left) + Medallion Lineage (Right)
-         ================================================================= -->
-    <section class="f-row-primary">
-      <div class="panel">
-        <div class="panel-head">
-          <div class="panel-heading">
-            <div class="panel-title">Real-Time ML Trip-Delay Predictions (+15m Lookahead)</div>
-            <div class="panel-desc">Scored by <span class="mono">models:/trip_delay_lgbm@champion</span> &rarr; <span class="mono">gold.public.model_predictions</span></div>
-          </div>
-          <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
-            <div class="segmented">
-              <button class="seg-btn active" id="pred-filter-all">All</button>
-              <button class="seg-btn" id="pred-filter-late">Late &gt;5m</button>
-            </div>
-            <input type="text" id="pred-search" placeholder="Search route / trip..." style="width:150px;padding:5px 9px;font-size:11.5px" />
-            <span class="badge indigo mono" id="predictions-count-badge">0</span>
-          </div>
-        </div>
-        <div class="table-scroll compact">
-          <table>
-            <thead>
-              <tr>
-                <th>Route</th>
-                <th>Trip Key</th>
-                <th>Snapshot (UTC)</th>
-                <th>Pred (+15m)</th>
-                <th>Target / Actual</th>
-                <th>Abs Err</th>
-                <th>Status</th>
-                <th>Ver</th>
-              </tr>
-            </thead>
-            <tbody id="predictions-tbody"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head">
-          <div class="panel-heading">
-            <div class="panel-title">Medallion Stream &amp; Pipeline Lineage</div>
-            <div class="panel-desc">Live table volume across Spock Silver/Gold &amp; <span class="mono">public.pipeline_runs</span></div>
-          </div>
-          <span class="badge teal" id="stream-health-badge">Pipeline Healthy</span>
-        </div>
-
-        <div class="medallion-flow">
-          <div class="flow-node">
-            <span class="fn-label">Silver Buses</span>
-            <span class="fn-val" id="flow-silver-buses">—</span>
-          </div>
-          <div class="flow-node">
-            <span class="fn-label">TomTom Flow</span>
-            <span class="fn-val" id="flow-tomtom">—</span>
-          </div>
-          <div class="flow-node">
-            <span class="fn-label">Gold Features</span>
-            <span class="fn-val" id="flow-gold-feat">—</span>
-          </div>
-          <div class="flow-node">
-            <span class="fn-label">Predictions</span>
-            <span class="fn-val" id="flow-gold-pred">—</span>
-          </div>
-        </div>
-
-        <div class="table-scroll compact" style="max-height:245px">
-          <table>
-            <thead>
-              <tr>
-                <th>Job</th>
-                <th>Layer</th>
-                <th>Status</th>
-                <th>Started (UTC)</th>
-                <th>Summary</th>
-              </tr>
-            </thead>
-            <tbody id="runs-tbody"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <script>
-    // -----------------------------------------------------------------------
-    // Constants & Offline Fallback Data
-    // -----------------------------------------------------------------------
-    const INCIDENT_CATEGORIES = {
-      0: "Incident",
-      1: "Accident",
-      2: "Fog",
-      3: "Hazard",
-      4: "Rain",
-      5: "Ice",
-      6: "Traffic Jam",
-      7: "Lane Closed",
-      8: "Road Closed",
-      9: "Road Works",
-      10: "Wind",
-      11: "Flooding",
-      14: "Disabled Veh"
-    };
-
-    const DEMO_CORRIDORS = [
-      { corridor_id: "dc_16th_st_nw", corridor_name: "16th St NW & U St NW", route_hint: "S2,S9", query_lat: 38.9169, query_lon: -77.0365, current_speed_kmh: 14.0, free_flow_speed_kmh: 20.0, speed_ratio: 0.70, delay_sec: 73 },
-      { corridor_id: "dc_georgia_ave_nw", corridor_name: "Georgia Ave NW & Columbia Rd", route_hint: "70,79", query_lat: 38.9283, query_lon: -77.0232, current_speed_kmh: 18.2, free_flow_speed_kmh: 36.0, speed_ratio: 0.51, delay_sec: 145 },
-      { corridor_id: "dc_conn_ave_nw", corridor_name: "Connecticut Ave NW & Dupont", route_hint: "L2,42,43", query_lat: 38.9096, query_lon: -77.0434, current_speed_kmh: 19.8, free_flow_speed_kmh: 35.0, speed_ratio: 0.57, delay_sec: 112 },
-      { corridor_id: "dc_k_st_downtown", corridor_name: "K St NW & 15th St Downtown", route_hint: "D6,32,36", query_lat: 38.9025, query_lon: -77.0345, current_speed_kmh: 15.1, free_flow_speed_kmh: 32.0, speed_ratio: 0.47, delay_sec: 178 }
-    ];
-
-    const DEMO_ROUTE_DELAY = [
-      { route_id: "X2", service_date: "2026-11-21", trips: 21, avg_deviation: 5.34, median_deviation: 4.6, p90_deviation: 11.8, on_time_pct: 64.1, late_pct: 35.9, avg_speed_kmh: 14.7 },
-      { route_id: "70", service_date: "2026-11-21", trips: 18, avg_deviation: 4.82, median_deviation: 4.1, p90_deviation: 10.4, on_time_pct: 68.5, late_pct: 31.5, avg_speed_kmh: 15.8 },
-      { route_id: "S2", service_date: "2026-11-21", trips: 16, avg_deviation: 4.15, median_deviation: 3.6, p90_deviation: 9.2, on_time_pct: 72.8, late_pct: 27.2, avg_speed_kmh: 16.9 },
-      { route_id: "F8", service_date: "2026-11-21", trips: 12, avg_deviation: 2.40, median_deviation: 1.9, p90_deviation: 5.8, on_time_pct: 84.6, late_pct: 15.4, avg_speed_kmh: 22.3 }
-    ];
-
-    // Global State
-    let mapInstance = null;
-    let busLayer = null;
-    let corridorLayer = null;
-    let incidentLayer = null;
-
-    let showBuses = true;
-    let showCorridors = true;
-    let showIncidents = true;
-    let mapDarkMode = true;
-
-    let primaryChartMode = "delay";       // "delay" | "reliability"
-    let primaryChartSort = "delayed";     // "delayed" | "busiest"
-    let secondaryChartMode = "hourly";    // "hourly" | "ml"
-    let predFilterMode = "all";           // "all" | "late"
-
-    let routeDelayChart = null;
-    let secondaryChart = null;
-    let sseSource = null;
-    let sseEnabled = true;
-    let syncDebounceTimer = null;
-    let dateInitialized = false;
-
-    let cachedRouteRows = [];
-    let cachedDailyRows = [];
-    let cachedHourlyRows = [];
-    let cachedModelRows = [];
-    let cachedBuses = [];
-    let cachedCorridors = [];
-    let cachedIncidents = [];
-    let cachedPredictions = [];
-    let cachedRuns = [];
-
-    // -----------------------------------------------------------------------
-    // Utilities
-    // -----------------------------------------------------------------------
-    function pctValue(v) {
-      if (v === null || v === undefined) return 0;
-      const n = Number(v);
-      return n <= 1.0 && n > 0 ? n * 100 : n;
-    }
-
-    function shiftDateIso(isoDateStr, deltaDays) {
-      const dt = new Date(isoDateStr + "T00:00:00Z");
-      dt.setUTCDate(dt.getUTCDate() + deltaDays);
-      return dt.toISOString().slice(0, 10);
-    }
-
-    function parseGeoJsonCoords(geomStr) {
-      if (!geomStr) return null;
-      try {
-        const g = typeof geomStr === "string" ? JSON.parse(geomStr) : geomStr;
-        if (!g || !g.coordinates) return null;
-        if (g.type === "LineString") {
-          return g.coordinates.map(pt => [Number(pt[1]), Number(pt[0])]);
-        }
-        if (g.type === "MultiLineString" && g.coordinates[0]) {
-          return g.coordinates[0].map(pt => [Number(pt[1]), Number(pt[0])]);
-        }
-      } catch (_e) {
-        return null;
-      }
-      return null;
-    }
-
-    async function fetchJsonOrNull(url) {
-      try {
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        return await res.json();
-      } catch (_e) {
-        return null;
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // Map Setup & Rendering
-    // -----------------------------------------------------------------------
-    function initMap() {
-      mapInstance = L.map("dc-map", { preferCanvas: true, zoomControl: true }).setView([38.9072, -77.0269], 12);
-      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        attribution: "&copy; OpenStreetMap &middot; TomTom &middot; WMATA",
-        maxZoom: 19
-      }).addTo(mapInstance);
-      corridorLayer = L.layerGroup().addTo(mapInstance);
-      incidentLayer = L.layerGroup().addTo(mapInstance);
-      busLayer = L.layerGroup().addTo(mapInstance);
-    }
-
-    function flyToPoint(lat, lon, zoom = 15) {
-      if (mapInstance && lat && lon) {
-        mapInstance.flyTo([Number(lat), Number(lon)], zoom, { duration: 0.65 });
-      }
-    }
-
-    function selectRoute(routeId) {
-      const sel = document.getElementById("route-filter");
-      if (routeId) {
-        let found = false;
-        for (const opt of sel.options) {
-          if (opt.value === routeId) { found = true; break; }
-        }
-        if (!found) {
-          const opt = document.createElement("option");
-          opt.value = routeId;
-          opt.textContent = `Route ${routeId}`;
-          sel.appendChild(opt);
-        }
-      }
-      sel.value = routeId || "";
-      updateActiveRouteUI(routeId || "");
-      loadDashboard(Boolean(routeId));
-    }
-
-    function updateActiveRouteUI(routeId) {
-      const pill = document.getElementById("active-route-pill");
-      const clearBtn = document.getElementById("clear-route-btn");
-      if (routeId) {
-        pill.style.display = "inline-flex";
-        pill.textContent = `Route ${routeId}`;
-        clearBtn.style.display = "inline-flex";
-      } else {
-        pill.style.display = "none";
-        clearBtn.style.display = "none";
-      }
-    }
-
-    function renderMapLayers(zoomToBuses = false) {
-      busLayer.clearLayers();
-      corridorLayer.clearLayers();
-      incidentLayer.clearLayers();
-
-      document.getElementById("layer-bus-count").textContent = cachedBuses.length;
-      document.getElementById("layer-corridor-count").textContent = cachedCorridors.length;
-      document.getElementById("layer-incident-count").textContent = cachedIncidents.length;
-      document.getElementById("tab-inc-count").textContent = cachedIncidents.length;
-
-      // Layer 1: TomTom Flow Corridors
-      if (showCorridors) {
-        cachedCorridors.forEach(c => {
-          const ratio = c.speed_ratio !== null && c.speed_ratio !== undefined ? Number(c.speed_ratio) : 0.72;
-          const curSpd = Number(c.current_speed_kmh || 24.0);
-          const freeSpd = Number(c.free_flow_speed_kmh || 35.0);
-          const delaySec = Number(c.delay_sec || 0);
-          const color = ratio >= 0.78 ? "#14b8a6" : ratio >= 0.55 ? "#f59e0b" : "#f43f5e";
-          const routes = String(c.route_hint || "").split(",").map(s => s.trim()).filter(Boolean);
-
-          const popup = `
-            <div style="font-family:'Plus Jakarta Sans',sans-serif;min-width:215px">
-              <div style="font-size:10px;font-weight:700;color:${color};text-transform:uppercase;letter-spacing:0.06em">TomTom Live Flow</div>
-              <div style="font-size:13.5px;font-weight:700;margin:2px 0">${c.corridor_name || c.corridor_id}</div>
-              <div style="font-size:11.5px;color:#94a3b8;margin-bottom:6px">WMATA Corridors: <strong style="color:#f1f5f9">${routes.join(", ") || "—"}</strong></div>
-              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;padding-top:6px;border-top:1px solid #232e42;font-size:11.5px">
-                <div><span style="color:#94a3b8">Speed:</span> <strong class="mono">${curSpd.toFixed(1)} km/h</strong></div>
-                <div><span style="color:#94a3b8">Free:</span> <strong class="mono">${freeSpd.toFixed(0)} km/h</strong></div>
-                <div><span style="color:#94a3b8">Ratio:</span> <strong class="mono" style="color:${color}">${(ratio * 100).toFixed(0)}%</strong></div>
-                <div><span style="color:#94a3b8">Delay:</span> <strong class="mono">+${delaySec}s</strong></div>
-              </div>
-            </div>
-          `;
-
-          const latLngs = parseGeoJsonCoords(c.geometry);
-          if (latLngs && latLngs.length >= 2) {
-            L.polyline(latLngs, { color, weight: 5, opacity: 0.85 }).bindPopup(popup).addTo(corridorLayer);
-          }
-          if (c.query_lat && c.query_lon) {
-            L.circleMarker([Number(c.query_lat), Number(c.query_lon)], {
-              radius: 7.5,
-              color,
-              weight: 2,
-              fillColor: color,
-              fillOpacity: 0.35
-            }).bindPopup(popup).addTo(corridorLayer);
-          }
-        });
-      }
-
-      // Layer 2: TomTom Traffic Incidents
-      if (showIncidents) {
-        cachedIncidents.forEach(inc => {
-          const cat = INCIDENT_CATEGORIES[Number(inc.icon_category)] || "Incident";
-          const delayMin = ((Number(inc.delay_sec) || 0) / 60).toFixed(1);
-          const severe = Number(inc.magnitude_of_delay) >= 3 || Number(inc.icon_category) === 8;
-          const color = severe ? "#f43f5e" : "#f59e0b";
-          const popup = `
-            <div style="font-family:'Plus Jakarta Sans',sans-serif;min-width:225px">
-              <div style="font-size:10px;font-weight:700;color:${color};text-transform:uppercase;letter-spacing:0.06em">TomTom ${cat}</div>
-              <div style="font-size:13px;font-weight:700;margin:2px 0">${inc.road_numbers || inc.from_location || "DC Roadway"}</div>
-              <div style="font-size:11.5px;color:#94a3b8;margin-bottom:6px">${inc.from_location || "—"} &rarr; ${inc.to_location || "—"}</div>
-              <div style="padding-top:6px;border-top:1px solid #232e42;font-size:11.5px">
-                ${inc.description ? `<div style="margin-bottom:4px;color:#e2e8f0">${inc.description}</div>` : ""}
-                Delay: <strong class="mono" style="color:${color}">+${delayMin} min</strong> &middot; Length: <strong class="mono">${Math.round(Number(inc.length_m || 0))}m</strong>
-              </div>
-            </div>
-          `;
-          const latLngs = parseGeoJsonCoords(inc.geometry);
-          if (latLngs && latLngs.length >= 2) {
-            L.polyline(latLngs, { color, weight: 3.5, dashArray: "5, 6", opacity: 0.85 }).bindPopup(popup).addTo(incidentLayer);
-          } else if (inc.lat && inc.lon) {
-            L.circleMarker([Number(inc.lat), Number(inc.lon)], {
-              radius: 5,
-              color: "#090c10",
-              weight: 1.2,
-              fillColor: color,
-              fillOpacity: 0.92
-            }).bindPopup(popup).addTo(incidentLayer);
-          }
-        });
-      }
-
-      // Layer 3: Live WMATA Buses
-      const busCoords = [];
-      if (showBuses) {
-        cachedBuses.forEach(b => {
-          if (!b.lat || !b.lon) return;
-          const lat = Number(b.lat);
-          const lon = Number(b.lon);
-          busCoords.push([lat, lon]);
-          const dev = Number(b.deviation_min || 0);
-          const pred = Number(b.predicted_delay_min !== null && b.predicted_delay_min !== undefined ? b.predicted_delay_min : dev);
-          const isLate = pred > 5 || dev > 5;
-          const isMod = !isLate && (pred > 2 || dev > 2);
-          const color = isLate ? "#f43f5e" : isMod ? "#f59e0b" : "#14b8a6";
-
-          L.circleMarker([lat, lon], {
-            radius: 5,
-            color: "#090c10",
-            weight: 1.2,
-            fillColor: color,
-            fillOpacity: 0.96
-          }).bindPopup(`
-            <div style="font-family:'Plus Jakarta Sans',sans-serif;min-width:225px">
-              <div style="font-size:10px;font-weight:700;color:#38bdf8;text-transform:uppercase;letter-spacing:0.06em">
-                WMATA Live Bus &middot; #${b.vehicle_id || "—"}
-              </div>
-              <div style="font-size:14px;font-weight:800;margin:2px 0">
-                Route ${b.route_id || "—"} <span style="font-weight:500;color:#94a3b8">&rarr; ${b.trip_headsign || b.direction || "In Service"}</span>
-              </div>
-              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;padding-top:6px;margin-top:6px;border-top:1px solid #232e42;font-size:11.5px">
-                <div><span style="color:#94a3b8">Now Dev:</span> <strong class="mono">${dev >= 0 ? "+" : ""}${dev.toFixed(1)}m</strong></div>
-                <div><span style="color:#94a3b8">ML +15m:</span> <strong class="mono" style="color:${color}">${pred >= 0 ? "+" : ""}${pred.toFixed(2)}m</strong></div>
-                <div><span style="color:#94a3b8">Speed:</span> <strong class="mono">${b.speed_kmh ? Number(b.speed_kmh).toFixed(1) : "18.5"} km/h</strong></div>
-                <div><span style="color:#94a3b8">Status:</span> <strong style="color:${color}">${isLate ? "LATE >5m" : "ON-TIME"}</strong></div>
-              </div>
-            </div>
-          `).addTo(busLayer);
-        });
-      }
-
-      if (zoomToBuses && busCoords.length > 0 && mapInstance) {
-        mapInstance.fitBounds(L.latLngBounds(busCoords).pad(0.22), { maxZoom: 14 });
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // KPI Rendering
-    // -----------------------------------------------------------------------
-    function renderKPIs(startDate, endDate, counts) {
-      const rows = cachedRouteRows;
-      if (rows.length > 0) {
-        const avgOnTime = rows.reduce((s, r) => s + pctValue(r.on_time_pct), 0) / rows.length;
-        const avgDelay = rows.reduce((s, r) => s + Number(r.avg_deviation || 0), 0) / rows.length;
-        const avgMed = rows.reduce((s, r) => s + Number(r.median_deviation ?? r.avg_deviation ?? 0), 0) / rows.length;
-        const avgP90 = rows.reduce((s, r) => s + Number(r.p90_deviation || r.avg_deviation || 0), 0) / rows.length;
-        const avgSpeed = rows.reduce((s, r) => s + Number(r.avg_speed_kmh || 18.5), 0) / rows.length;
-        const totalTrips = rows.reduce((s, r) => s + Number(r.trips || 0), 0);
-        const distinctRoutes = new Set(rows.map(r => r.route_id)).size;
-
-        document.getElementById("kpi-ontime").textContent = `${avgOnTime.toFixed(1)}%`;
-        document.getElementById("kpi-late-sub").textContent = `Late (> 5m): ${(100 - avgOnTime).toFixed(1)}%`;
-        document.getElementById("kpi-active-routes").textContent = `${distinctRoutes} Active Routes`;
-        document.getElementById("kpi-total-trips").textContent = `${totalTrips.toLocaleString()} trips`;
-
-        const ring = document.getElementById("kpi-ontime-ring");
-        const circumference = 113.1;
-        ring.style.strokeDashoffset = String(circumference - (Math.min(100, Math.max(0, avgOnTime)) / 100) * circumference);
-        ring.style.stroke = avgOnTime >= 80 ? "#14b8a6" : avgOnTime >= 65 ? "#f59e0b" : "#f43f5e";
-
-        document.getElementById("kpi-avg-delay").textContent = `${avgDelay >= 0 ? "+" : ""}${avgDelay.toFixed(2)}m`;
-        document.getElementById("kpi-p90-badge").textContent = `P90 ${avgP90.toFixed(1)}m`;
-        document.getElementById("kpi-median-delay").textContent = `Median: ${avgMed.toFixed(1)}m`;
-        document.getElementById("kpi-speed-pill").textContent = `${avgSpeed.toFixed(1)} km/h`;
-        document.getElementById("kpi-date-window").textContent = startDate === endDate ? startDate : `${startDate.slice(5)} → ${endDate.slice(5)}`;
-        document.getElementById("kpi-delay-bar").style.width = `${Math.min(100, Math.max(8, Math.abs(avgDelay) * 12))}%`;
-      }
-
-      if (cachedPredictions.length > 0) {
-        const avgPred = cachedPredictions.reduce((s, p) => s + Number(p.predicted_delay_min || 0), 0) / cachedPredictions.length;
-        const lateCount = cachedPredictions.filter(p => Number(p.predicted_late) === 1 || Number(p.predicted_delay_min) > 5).length;
-        const latePct = (lateCount / cachedPredictions.length) * 100;
-        const mv = cachedPredictions[0].model_version || "v1";
-
-        document.getElementById("kpi-ml-pred").textContent = `${avgPred >= 0 ? "+" : ""}${avgPred.toFixed(2)}m`;
-        document.getElementById("kpi-ml-late-badge").textContent = `Late ${latePct.toFixed(1)}%`;
-        document.getElementById("kpi-ml-bar").style.width = `${Math.min(100, Math.max(12, 100 - latePct))}%`;
-        document.getElementById("kpi-ml-scored").textContent = `${(counts.gold_predictions || cachedPredictions.length).toLocaleString()} scored`;
-        document.getElementById("model-version-pill").textContent = `trip_delay_lgbm ${mv}`;
-      }
-
-      if (cachedModelRows.length > 0) {
-        const mae = cachedModelRows.reduce((s, r) => s + Number(r.mae || 0), 0) / cachedModelRows.length;
-        const rmse = cachedModelRows.reduce((s, r) => s + Number(r.rmse || 0), 0) / cachedModelRows.length;
-        const acc = cachedModelRows.reduce((s, r) => s + pctValue(r.accuracy_late_5 ?? 0.95), 0) / cachedModelRows.length;
-        document.getElementById("kpi-ml-mae").textContent = `MAE ${mae.toFixed(3)}m · RMSE ${rmse.toFixed(2)}m`;
-        document.getElementById("kpi-ml-acc-badge").textContent = `Acc ${acc.toFixed(0)}%`;
-      }
-
-      // KPI 4: TomTom DC Corridor Flow & Incidents
-      if (cachedCorridors.length > 0) {
-        const avgRatio = cachedCorridors.reduce((s, c) => s + Number(c.speed_ratio ?? 0.72), 0) / cachedCorridors.length;
-        const avgSpd = cachedCorridors.reduce((s, c) => s + Number(c.current_speed_kmh ?? 24), 0) / cachedCorridors.length;
-        const avgDel = cachedCorridors.reduce((s, c) => s + Number(c.delay_sec ?? 60), 0) / cachedCorridors.length;
-        document.getElementById("kpi-flow-ratio").textContent = `${(avgRatio * 100).toFixed(0)}%`;
-        document.getElementById("kpi-flow-bar").style.width = `${Math.min(100, Math.round(avgRatio * 100))}%`;
-        document.getElementById("kpi-flow-bar").style.background = avgRatio >= 0.78 ? "var(--teal)" : avgRatio >= 0.55 ? "var(--amber)" : "var(--crimson)";
-        document.getElementById("kpi-flow-speed").textContent = `Avg Flow: ${avgSpd.toFixed(1)} km/h`;
-        document.getElementById("kpi-flow-delay").textContent = `Avg Delay: +${Math.round(avgDel)}s`;
-      }
-      document.getElementById("kpi-incidents-badge").textContent = `${cachedIncidents.length} Incidents`;
-      document.getElementById("kpi-live-buses-pill").textContent = `${(counts.active_vehicles || cachedBuses.length || 0).toLocaleString()} buses`;
-
-      // Medallion Flow Nodes
-      document.getElementById("flow-silver-buses").textContent = (counts.silver_bus_snapshots || cachedBuses.length || 0).toLocaleString();
-      document.getElementById("flow-tomtom").textContent = `${cachedCorridors.length} / ${cachedIncidents.length}`;
-      document.getElementById("flow-gold-feat").textContent = (counts.gold_features || 0).toLocaleString();
-      document.getElementById("flow-gold-pred").textContent = (counts.gold_predictions || cachedPredictions.length || 0).toLocaleString();
-    }
-
-    // -----------------------------------------------------------------------
-    // Watchlist Tables (Hotspot Routes | TomTom Corridors | Live Incidents)
-    // -----------------------------------------------------------------------
-    function aggregateByRoute(rows) {
-      const map = {};
-      rows.forEach(r => {
-        const id = r.route_id || "—";
-        if (!map[id]) map[id] = { trips: 0, dev: 0, p90: 0, onTime: 0, count: 0 };
-        map[id].trips += Number(r.trips || 0);
-        map[id].dev += Number(r.avg_deviation || 0);
-        map[id].p90 += Number(r.p90_deviation || r.avg_deviation || 0);
-        map[id].onTime += pctValue(r.on_time_pct);
-        map[id].count += 1;
-      });
-      return Object.entries(map).map(([route_id, a]) => ({
-        route_id,
-        trips: a.trips,
-        avg_dev: a.dev / a.count,
-        p90_dev: a.p90 / a.count,
-        on_time: a.onTime / a.count
-      }));
-    }
-
-    function renderWatchlistTables() {
-      const q = (document.getElementById("watchlist-search").value || "").toLowerCase().trim();
-
-      // 1. Hotspot Routes (ranked worst delay first)
-      const routesAgg = aggregateByRoute(cachedRouteRows)
-        .filter(r => !q || r.route_id.toLowerCase().includes(q))
-        .sort((a, b) => b.avg_dev - a.avg_dev);
-
-      const hTbody = document.getElementById("hotspot-routes-tbody");
-      hTbody.innerHTML = "";
-      routesAgg.slice(0, 40).forEach(r => {
-        const isLate = r.avg_dev > 5;
-        const isMod = !isLate && r.avg_dev > 2.5;
-        const cls = isLate ? "crimson" : isMod ? "amber" : "teal";
-        const barColor = r.on_time >= 80 ? "#14b8a6" : r.on_time >= 65 ? "#f59e0b" : "#f43f5e";
-        const tr = document.createElement("tr");
-        tr.className = "clickable";
-        tr.onclick = () => selectRoute(r.route_id);
-        tr.innerHTML = `
-          <td><span class="route-chip">${r.route_id}</span></td>
-          <td class="mono">${r.trips}</td>
-          <td><span class="badge ${cls} mono">${r.avg_dev >= 0 ? "+" : ""}${r.avg_dev.toFixed(2)}m</span></td>
-          <td class="mono" style="color:var(--text-secondary)">${r.p90_dev.toFixed(1)}m</td>
-          <td>
-            <div class="mini-bar-wrap">
-              <div class="mini-bar"><span style="width:${Math.min(100, Math.round(r.on_time))}%;background:${barColor}"></span></div>
-              <span class="mono">${r.on_time.toFixed(0)}%</span>
-            </div>
-          </td>
-        `;
-        hTbody.appendChild(tr);
-      });
-
-      // 2. TomTom Corridors (ranked most congested first)
-      const cTbody = document.getElementById("corridor-tbody");
-      cTbody.innerHTML = "";
-      [...cachedCorridors]
-        .sort((a, b) => Number(a.speed_ratio ?? 1) - Number(b.speed_ratio ?? 1))
-        .filter(c => !q || String(c.corridor_name || "").toLowerCase().includes(q) || String(c.route_hint || "").toLowerCase().includes(q))
-        .forEach(c => {
-          const ratio = Number(c.speed_ratio ?? 0.72);
-          const curSpd = Number(c.current_speed_kmh ?? 24);
-          const freeSpd = Number(c.free_flow_speed_kmh ?? 35);
-          const delaySec = Number(c.delay_sec ?? 0);
-          const cls = ratio >= 0.78 ? "teal" : ratio >= 0.55 ? "amber" : "crimson";
-          const routes = String(c.route_hint || "").split(",").map(s => s.trim()).filter(Boolean).slice(0, 3);
-          const chips = routes.map(rt => `<span class="route-chip" onclick="event.stopPropagation();selectRoute('${rt}')">${rt}</span>`).join("");
-
-          const tr = document.createElement("tr");
-          tr.className = "clickable";
-          tr.onclick = () => flyToPoint(c.query_lat, c.query_lon, 15);
-          tr.innerHTML = `
-            <td style="max-width:165px;overflow:hidden;text-overflow:ellipsis" title="${c.corridor_name || c.corridor_id}"><strong>${c.corridor_name || c.corridor_id}</strong></td>
-            <td>${chips || "—"}</td>
-            <td class="mono">${curSpd.toFixed(0)}/${freeSpd.toFixed(0)}</td>
-            <td><span class="badge ${cls} mono">${(ratio * 100).toFixed(0)}%</span></td>
-            <td class="mono">+${delaySec}s</td>
-          `;
-          cTbody.appendChild(tr);
-        });
-
-      // 3. TomTom Live Incidents
-      const iTbody = document.getElementById("incidents-tbody");
-      iTbody.innerHTML = "";
-      cachedIncidents
-        .filter(inc => !q || String(inc.road_numbers || "").toLowerCase().includes(q) || String(inc.from_location || "").toLowerCase().includes(q) || String(inc.description || "").toLowerCase().includes(q))
-        .slice(0, 60)
-        .forEach(inc => {
-          const cat = INCIDENT_CATEGORIES[Number(inc.icon_category)] || "Incident";
-          const delayMin = ((Number(inc.delay_sec) || 0) / 60).toFixed(1);
-          const severe = Number(inc.magnitude_of_delay) >= 3 || Number(inc.icon_category) === 8;
-          const tr = document.createElement("tr");
-          tr.className = "clickable";
-          tr.onclick = () => flyToPoint(inc.lat, inc.lon, 15);
-          tr.innerHTML = `
-            <td><span class="badge ${severe ? "crimson" : "amber"}">${cat}</span></td>
-            <td><strong>${inc.road_numbers || "DC"}</strong></td>
-            <td style="max-width:170px;overflow:hidden;text-overflow:ellipsis" title="${inc.from_location || ""} -> ${inc.to_location || ""}">${inc.from_location || "—"}</td>
-            <td class="mono">+${delayMin}m</td>
-            <td class="mono">${Math.round(Number(inc.length_m || 0))}m</td>
-          `;
-          iTbody.appendChild(tr);
-        });
-    }
-
-    // -----------------------------------------------------------------------
-    // Charts (Primary Route Chart + Secondary Hourly / ML Chart)
-    // -----------------------------------------------------------------------
-    const CHART_GRID = "rgba(30, 40, 56, 0.75)";
-    const CHART_TICK = "#94a3b8";
-
-    function renderPrimaryChart() {
-      const agg = aggregateByRoute(cachedRouteRows);
-      const sorted = agg
-        .sort((a, b) => primaryChartSort === "delayed" ? b.avg_dev - a.avg_dev : b.trips - a.trips)
-        .slice(0, 14);
-
-      if (routeDelayChart) routeDelayChart.destroy();
-
-      if (primaryChartMode === "delay") {
-        document.getElementById("primary-chart-title").textContent = "Route Delay Comparison (Avg vs P90 Minutes)";
-        routeDelayChart = new Chart(document.getElementById("routeDelayChart"), {
-          type: "bar",
-          data: {
-            labels: sorted.map(r => r.route_id),
-            datasets: [
-              {
-                label: "Avg Delay (min)",
-                data: sorted.map(r => Number(r.avg_dev.toFixed(2))),
-                backgroundColor: "#38bdf8",
-                borderRadius: 5,
-                maxBarThickness: 22
-              },
-              {
-                label: "P90 Delay (min)",
-                data: sorted.map(r => Number(r.p90_dev.toFixed(2))),
-                backgroundColor: "rgba(245, 158, 11, 0.85)",
-                borderRadius: 5,
-                maxBarThickness: 22
-              }
-            ]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            onClick: (_e, els) => {
-              if (els && els.length > 0) {
-                const rt = sorted[els[0].index]?.route_id;
-                if (rt) selectRoute(rt);
-              }
-            },
-            plugins: { legend: { labels: { color: CHART_TICK, boxWidth: 10, usePointStyle: true } } },
-            scales: {
-              x: { ticks: { color: CHART_TICK }, grid: { display: false } },
-              y: { ticks: { color: CHART_TICK }, grid: { color: CHART_GRID } }
-            }
-          }
-        });
-      } else {
-        document.getElementById("primary-chart-title").textContent = "Route Reliability Breakdown (On-Time % vs Late %)";
-        routeDelayChart = new Chart(document.getElementById("routeDelayChart"), {
-          type: "bar",
-          data: {
-            labels: sorted.map(r => r.route_id),
-            datasets: [
-              {
-                label: "On-Time <= 5m (%)",
-                data: sorted.map(r => Number(r.on_time.toFixed(1))),
-                backgroundColor: "#14b8a6",
-                borderRadius: 4,
-                maxBarThickness: 24
-              },
-              {
-                label: "Late > 5m (%)",
-                data: sorted.map(r => Number(Math.max(0, 100 - r.on_time).toFixed(1))),
-                backgroundColor: "#f43f5e",
-                borderRadius: 4,
-                maxBarThickness: 24
-              }
-            ]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            onClick: (_e, els) => {
-              if (els && els.length > 0) {
-                const rt = sorted[els[0].index]?.route_id;
-                if (rt) selectRoute(rt);
-              }
-            },
-            plugins: { legend: { labels: { color: CHART_TICK, boxWidth: 10, usePointStyle: true } } },
-            scales: {
-              x: { stacked: true, ticks: { color: CHART_TICK }, grid: { display: false } },
-              y: { stacked: true, min: 0, max: 100, ticks: { color: CHART_TICK }, grid: { color: CHART_GRID } }
-            }
-          }
-        });
-      }
-    }
-
-    function renderSecondaryChart() {
-      if (secondaryChart) secondaryChart.destroy();
-
-      if (secondaryChartMode === "hourly") {
-        document.getElementById("secondary-chart-title").textContent = "Hourly Delay & Fleet Speed Profile";
-        document.getElementById("secondary-chart-desc").textContent = "Schedule deviation (min) vs. average speed (km/h) in Eastern Time";
-
-        const byHour = {};
-        cachedHourlyRows.forEach(r => {
-          const h = Number(r.hour_local ?? 17);
-          if (!byHour[h]) byHour[h] = { dev: 0, spd: 0, count: 0 };
-          byHour[h].dev += Number(r.avg_deviation || 0);
-          byHour[h].spd += Number(r.avg_speed_kmh || 18.5);
-          byHour[h].count += 1;
-        });
-        const hours = Object.keys(byHour).map(Number).sort((a, b) => a - b);
-
-        secondaryChart = new Chart(document.getElementById("secondaryChart"), {
-          type: hours.length <= 2 ? "bar" : "line",
-          data: {
-            labels: hours.map(h => `${String(h).padStart(2, "0")}:00 ET`),
-            datasets: [
-              {
-                label: "Avg Delay (min)",
-                data: hours.map(h => Number((byHour[h].dev / byHour[h].count).toFixed(2))),
-                borderColor: "#f59e0b",
-                backgroundColor: hours.length <= 2 ? "rgba(245, 158, 11, 0.85)" : "rgba(245, 158, 11, 0.16)",
-                fill: true,
-                tension: 0.35,
-                borderRadius: 5,
-                maxBarThickness: 32
-              },
-              {
-                label: "Avg Speed (km/h)",
-                data: hours.map(h => Number((byHour[h].spd / byHour[h].count).toFixed(1))),
-                borderColor: "#38bdf8",
-                backgroundColor: hours.length <= 2 ? "rgba(56, 189, 248, 0.82)" : "transparent",
-                tension: 0.35,
-                borderRadius: 5,
-                maxBarThickness: 32
-              }
-            ]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { labels: { color: CHART_TICK, boxWidth: 10, usePointStyle: true } } },
-            scales: {
-              x: { ticks: { color: CHART_TICK }, grid: { display: false } },
-              y: { ticks: { color: CHART_TICK }, grid: { color: CHART_GRID } }
-            }
-          }
-        });
-      } else {
-        document.getElementById("secondary-chart-title").textContent = "LightGBM +15m Forecast Calibration";
-        document.getElementById("secondary-chart-desc").textContent = "Predicted +15m delay vs. target/actual across latest scored trips";
-
-        const sample = cachedPredictions.slice(0, 16);
-        secondaryChart = new Chart(document.getElementById("secondaryChart"), {
-          type: "bar",
-          data: {
-            labels: sample.map(p => `${p.route_id || "Bus"}`),
-            datasets: [
-              {
-                label: "Predicted (+15m)",
-                data: sample.map(p => Number(Number(p.predicted_delay_min || 0).toFixed(2))),
-                backgroundColor: "#818cf8",
-                borderRadius: 4,
-                maxBarThickness: 18
-              },
-              {
-                label: "Target / Actual",
-                data: sample.map(p => Number(Number(p.actual_delay_min ?? p.predicted_delay_min ?? 0).toFixed(2))),
-                backgroundColor: "#14b8a6",
-                borderRadius: 4,
-                maxBarThickness: 18
-              }
-            ]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { labels: { color: CHART_TICK, boxWidth: 10, usePointStyle: true } } },
-            scales: {
-              x: { ticks: { color: CHART_TICK }, grid: { display: false } },
-              y: { ticks: { color: CHART_TICK }, grid: { color: CHART_GRID } }
-            }
-          }
-        });
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // Ledger Tables (ML Predictions + Pipeline Lineage)
-    // -----------------------------------------------------------------------
-    function renderPredictionsAndLineage() {
-      const q = (document.getElementById("pred-search").value || "").toLowerCase().trim();
-      const filtered = cachedPredictions.filter(p => {
-        const isLate = Number(p.predicted_late) === 1 || Number(p.predicted_delay_min) > 5;
-        if (predFilterMode === "late" && !isLate) return false;
-        if (!q) return true;
-        return String(p.route_id || "").toLowerCase().includes(q) || String(p.trip_key || "").toLowerCase().includes(q);
-      });
-
-      document.getElementById("predictions-count-badge").textContent = `${filtered.length} rows`;
-      const pTbody = document.getElementById("predictions-tbody");
-      pTbody.innerHTML = "";
-      filtered.slice(0, 40).forEach(p => {
-        const pred = Number(p.predicted_delay_min || 0);
-        const isLate = Number(p.predicted_late) === 1 || pred > 5;
-        const fullKey = String(p.trip_key || "");
-        const shortTrip = fullKey.includes("|") ? `#${fullKey.split("|")[0]}` : fullKey.slice(0, 12);
-        const fullSnap = String(p.snapshot_ts || "").replace("T", " ").slice(0, 19);
-        const shortSnap = fullSnap.length >= 19 ? fullSnap.slice(11, 19) : fullSnap;
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td><span class="route-chip" onclick="selectRoute('${p.route_id || ""}')">${p.route_id || "—"}</span></td>
-          <td class="mono" style="font-size:11.5px;color:var(--text-secondary)" title="${fullKey}">${shortTrip}</td>
-          <td class="mono" title="${fullSnap} UTC">${shortSnap}</td>
-          <td class="mono"><strong>${pred >= 0 ? "+" : ""}${pred.toFixed(2)}m</strong></td>
-          <td class="mono">${p.actual_delay_min !== null && p.actual_delay_min !== undefined ? Number(p.actual_delay_min).toFixed(2) + "m" : "—"}</td>
-          <td class="mono" style="color:var(--text-secondary)">${p.abs_error !== null && p.abs_error !== undefined ? Number(p.abs_error).toFixed(3) + "m" : "—"}</td>
-          <td><span class="badge ${isLate ? "crimson" : "teal"}">${isLate ? "LATE >5m" : "ON-TIME"}</span></td>
-          <td class="mono">${p.model_version || "v1"}</td>
-        `;
-        pTbody.appendChild(tr);
-      });
-
-      function formatRunSummary(jobName, rc) {
-        if (!rc || typeof rc !== "object") return "—";
-        if (rc.scored !== undefined) {
-          return `scored ${Number(rc.scored).toLocaleString()} · late ${Number(rc.predicted_late || 0).toLocaleString()} · ${rc.model_version || "v1"}`;
-        }
-        if (rc.bus_positions !== undefined) {
-          return `${Number(rc.bus_positions).toLocaleString()} buses · ${rc.distinct_routes || 0} routes`;
-        }
-        if (rc.tomtom_flow_records !== undefined) {
-          return `${rc.tomtom_flow_records} flow · ${rc.tomtom_incident_records || 0} incidents`;
-        }
-        const mergedParts = Object.entries(rc)
-          .filter(([, val]) => val && typeof val === "object" && Number(val.merged || 0) > 0)
-          .map(([tbl, val]) => `${tbl.split(".").pop()}: +${Number(val.merged).toLocaleString()}`);
-        if (mergedParts.length > 0) return mergedParts.join(" · ");
-        return Object.entries(rc)
-          .filter(([k]) => !["run_id", "status"].includes(k))
-          .slice(0, 3)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join(" · ") || "ok";
-      }
-
-      const rTbody = document.getElementById("runs-tbody");
-      rTbody.innerHTML = "";
-      cachedRuns.forEach(r => {
-        const st = String(r.status || "").toLowerCase();
-        const stCls = st === "success" ? "teal" : st === "running" ? "cobalt" : "crimson";
-        const lyCls = r.layer === "gold" ? "indigo" : r.layer === "silver" ? "teal" : "cobalt";
-        const fullStart = String(r.started_at || "").replace("T", " ").slice(0, 19);
-        const shortStart = fullStart.length >= 19 ? fullStart.slice(11, 19) : fullStart;
-        const summaryText = formatRunSummary(r.job_name, r.row_counts);
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td><strong>${r.job_name || "—"}</strong></td>
-          <td><span class="badge ${lyCls}">${String(r.layer || "—").toUpperCase()}</span></td>
-          <td><span class="badge ${stCls}">${st.toUpperCase()}</span></td>
-          <td class="mono" style="color:var(--text-secondary)" title="${fullStart} UTC">${shortStart}</td>
-          <td class="mono" style="font-size:11px;color:var(--text-secondary)" title='${JSON.stringify(r.row_counts || {})}'>${summaryText}</td>
-        `;
-        rTbody.appendChild(tr);
-      });
-    }
-
-    // -----------------------------------------------------------------------
-    // Data Orchestration
-    // -----------------------------------------------------------------------
-    async function populateRoutesDropdown() {
-      const sel = document.getElementById("route-filter");
-      const listResp = await fetchJsonOrNull("/v1/routes/list");
-      const routes = (listResp && listResp.routes && listResp.routes.length)
-        ? listResp.routes
-        : DEMO_ROUTE_DELAY.map(r => r.route_id);
-      const current = sel.value;
-      sel.innerHTML = `<option value="">All Active Routes (${routes.length})</option>`;
-      routes.forEach(r => {
-        const opt = document.createElement("option");
-        opt.value = r;
-        opt.textContent = `Route ${r}`;
-        sel.appendChild(opt);
-      });
-      sel.value = current;
-    }
-
-    async function loadDashboard(zoomToBuses = false) {
-      const streamResp = await fetchJsonOrNull("/v1/stream/status");
-      const fresh = (streamResp && streamResp.freshness) || {};
-
-      if (!dateInitialized) {
-        const maxDate = fresh.max_service_date || "2026-11-21";
-        document.getElementById("end-date").value = maxDate;
-        document.getElementById("start-date").value = shiftDateIso(maxDate, -7);
-        dateInitialized = true;
-      }
-
-      const startDate = document.getElementById("start-date").value || "2026-11-15";
-      const endDate = document.getElementById("end-date").value || "2026-11-21";
-      const routeId = document.getElementById("route-filter").value;
-      const routeParam = routeId ? `&route_id=${encodeURIComponent(routeId)}` : "";
-
-      const [
-        delayResp,
-        dailyResp,
-        hourlyResp,
-        predResp,
-        perfResp,
-        corridorsResp,
-        incidentsResp,
-        busesResp
-      ] = await Promise.all([
-        fetchJsonOrNull(`/v1/routes/delay?start_date=${startDate}&end_date=${endDate}${routeParam}`),
-        fetchJsonOrNull(`/v1/reliability/daily?start_date=${startDate}&end_date=${endDate}${routeParam}`),
-        fetchJsonOrNull(`/v1/routes/hourly?start_date=${startDate}&end_date=${endDate}${routeParam}`),
-        fetchJsonOrNull(`/v1/predictions/latest?limit=150${routeParam}`),
-        fetchJsonOrNull(`/v1/model/performance?start_date=${startDate}&end_date=${endDate}`),
-        fetchJsonOrNull(`/v1/traffic/corridors`),
-        fetchJsonOrNull(`/v1/traffic/incidents?limit=200`),
-        fetchJsonOrNull(`/v1/buses/live?limit=600${routeParam}`)
-      ]);
-
-      const isLive = Boolean(streamResp || (delayResp && delayResp.data));
-      const dot = document.getElementById("connection-dot");
-      const txt = document.getElementById("connection-text");
-      if (isLive) {
-        dot.className = "pulse-dot";
-        txt.textContent = (sseSource && sseSource.readyState === EventSource.OPEN)
-          ? "Real-Time Push (NATS SSE)"
-          : "Live Stream Active";
-      } else {
-        dot.className = "pulse-dot demo";
-        txt.textContent = "Offline Preview";
-      }
-
-      document.getElementById("freshness-snapshot").textContent = String(fresh.max_snapshot_ts || "—").slice(0, 19);
-      document.getElementById("freshness-prediction").textContent = String(fresh.max_predicted_at || "—").slice(11, 19) + " UTC";
-
-      const counts = (streamResp && streamResp.counts) || {};
-      cachedRouteRows = (delayResp && delayResp.data && delayResp.data.length) ? delayResp.data : DEMO_ROUTE_DELAY;
-      cachedDailyRows = (dailyResp && dailyResp.data && dailyResp.data.length) ? dailyResp.data : cachedRouteRows;
-      cachedHourlyRows = (hourlyResp && hourlyResp.data && hourlyResp.data.length) ? hourlyResp.data : cachedRouteRows;
-      cachedModelRows = (perfResp && perfResp.data && perfResp.data.length) ? perfResp.data : [];
-      cachedBuses = (busesResp && busesResp.data) ? busesResp.data : [];
-      cachedCorridors = (corridorsResp && corridorsResp.data && corridorsResp.data.length) ? corridorsResp.data : DEMO_CORRIDORS;
-      cachedIncidents = (incidentsResp && incidentsResp.data) ? incidentsResp.data : [];
-      cachedPredictions = (predResp && predResp.data) ? predResp.data : [];
-      cachedRuns = (streamResp && streamResp.pipeline_runs) ? streamResp.pipeline_runs : [];
-
-      renderKPIs(startDate, endDate, counts);
-      renderMapLayers(zoomToBuses);
-      renderWatchlistTables();
-      renderPrimaryChart();
-      renderSecondaryChart();
-      renderPredictionsAndLineage();
-    }
-
-    function schedulePushSync(labelText) {
-      const ticker = document.getElementById("live-push-ticker");
-      if (ticker && labelText) {
-        ticker.textContent = labelText;
-        ticker.style.borderColor = "var(--teal)";
-        ticker.style.color = "#2dd4bf";
-        setTimeout(() => {
-          ticker.style.borderColor = "";
-          ticker.style.color = "";
-        }, 1400);
-      }
-      if (syncDebounceTimer) clearTimeout(syncDebounceTimer);
-      syncDebounceTimer = setTimeout(() => {
-        loadDashboard(false);
-      }, 350);
-    }
-
-    function connectRealtimeSSE() {
-      if (sseSource) {
-        sseSource.close();
-        sseSource = null;
-      }
-      if (!sseEnabled || typeof EventSource === "undefined") {
-        return;
-      }
-      sseSource = new EventSource("/v1/stream/events");
-
-      sseSource.addEventListener("connected", ev => {
-        try {
-          const info = JSON.parse(ev.data || "{}");
-          document.getElementById("connection-text").textContent = info.nats_connected
-            ? "Real-Time Push (NATS SSE)"
-            : "SSE Connected (Waiting NATS)";
-          document.getElementById("live-push-ticker").textContent = info.nats_connected
-            ? "NATS SSE ready"
-            : "SSE ready";
-        } catch (_e) {}
-      });
-
-      sseSource.addEventListener("inference", ev => {
-        try {
-          const d = JSON.parse(ev.data || "{}");
-          const scored = d.scored_count ? `${Number(d.scored_count).toLocaleString()} scored` : "new forecast";
-          const avg = d.avg_predicted_delay_min !== undefined ? `avg ${Number(d.avg_predicted_delay_min).toFixed(2)}m` : "";
-          schedulePushSync(`Push · ML ${scored}${avg ? " · " + avg : ""}`);
-        } catch (_e) {
-          schedulePushSync("Push · ML inference updated");
-        }
-      });
-
-      sseSource.addEventListener("silver_merged", ev => {
-        try {
-          const d = JSON.parse(ev.data || "{}");
-          const parts = [];
-          if (d.wmata_files) parts.push(`WMATA +${d.wmata_files}`);
-          if (d.traffic_files) parts.push(`TomTom +${d.traffic_files}`);
-          schedulePushSync(`Push · Silver (${parts.join(", ") || "updated"})`);
-        } catch (_e) {
-          schedulePushSync("Push · Silver merged");
-        }
-      });
-
-      sseSource.addEventListener("bronze_wmata", () => {
-        const ticker = document.getElementById("live-push-ticker");
-        if (ticker) ticker.textContent = "Ingesting live WMATA GPS…";
-      });
-
-      sseSource.addEventListener("bronze_traffic", () => {
-        const ticker = document.getElementById("live-push-ticker");
-        if (ticker) ticker.textContent = "Ingesting live TomTom traffic…";
-      });
-
-      sseSource.onerror = () => {
-        const ticker = document.getElementById("live-push-ticker");
-        if (ticker && sseEnabled) ticker.textContent = "Reconnecting SSE…";
-      };
-    }
-
-    function updateSseButtonUI() {
-      const btn = document.getElementById("sse-toggle-btn");
-      const lbl = document.getElementById("sse-btn-label");
-      const dot = document.getElementById("sse-btn-dot");
-      btn.classList.toggle("active", sseEnabled);
-      lbl.textContent = sseEnabled ? "Real-Time Push: ON" : "Real-Time Push: PAUSED";
-      dot.style.background = sseEnabled ? "var(--teal)" : "var(--text-muted)";
-      if (!sseEnabled) {
-        document.getElementById("live-push-ticker").textContent = "Stream paused";
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // Event Bindings
-    // -----------------------------------------------------------------------
-    window.addEventListener("DOMContentLoaded", async () => {
-      initMap();
-      await populateRoutesDropdown();
-      await loadDashboard(false);
-      connectRealtimeSSE();
-
-      // Filters & Sync
-      document.getElementById("route-filter").addEventListener("change", e => {
-        updateActiveRouteUI(e.target.value);
-        loadDashboard(Boolean(e.target.value));
-      });
-      document.getElementById("clear-route-btn").addEventListener("click", () => selectRoute(""));
-      document.getElementById("apply-btn").addEventListener("click", () => loadDashboard(false));
-      document.getElementById("refresh-now-btn").addEventListener("click", () => loadDashboard(false));
-      document.getElementById("sse-toggle-btn").addEventListener("click", () => {
-        sseEnabled = !sseEnabled;
-        updateSseButtonUI();
-        if (sseEnabled) {
-          connectRealtimeSSE();
-          loadDashboard(false);
-        } else if (sseSource) {
-          sseSource.close();
-          sseSource = null;
-        }
-      });
-
-      document.getElementById("preset-live-btn").addEventListener("click", async () => {
-        document.getElementById("preset-live-btn").classList.add("active");
-        document.getElementById("preset-archive-btn").classList.remove("active");
-        dateInitialized = false;
-        await loadDashboard(false);
-      });
-      document.getElementById("preset-archive-btn").addEventListener("click", () => {
-        document.getElementById("preset-archive-btn").classList.add("active");
-        document.getElementById("preset-live-btn").classList.remove("active");
-        document.getElementById("start-date").value = "2020-02-01";
-        document.getElementById("end-date").value = "2020-02-08";
-        loadDashboard(false);
-      });
-
-      // Map Layer & Theme Toggles
-      document.getElementById("toggle-buses-btn").addEventListener("click", e => {
-        showBuses = !showBuses;
-        e.currentTarget.classList.toggle("active", showBuses);
-        renderMapLayers(false);
-      });
-      document.getElementById("toggle-corridors-btn").addEventListener("click", e => {
-        showCorridors = !showCorridors;
-        e.currentTarget.classList.toggle("active", showCorridors);
-        renderMapLayers(false);
-      });
-      document.getElementById("toggle-incidents-btn").addEventListener("click", e => {
-        showIncidents = !showIncidents;
-        e.currentTarget.classList.toggle("active", showIncidents);
-        renderMapLayers(false);
-      });
-      document.getElementById("toggle-map-theme-btn").addEventListener("click", e => {
-        mapDarkMode = !mapDarkMode;
-        document.getElementById("dc-map").classList.toggle("map-dark", mapDarkMode);
-        e.currentTarget.textContent = mapDarkMode ? "Light Map" : "Dark Map";
-      });
-      document.getElementById("reset-map-btn").addEventListener("click", () => {
-        if (mapInstance) mapInstance.flyTo([38.9072, -77.0269], 12, { duration: 0.6 });
-      });
-
-      // Watchlist Tabs
-      const tabs = [
-        ["tab-routes-btn", "pane-routes"],
-        ["tab-corridors-btn", "pane-corridors"],
-        ["tab-incidents-btn", "pane-incidents"]
-      ];
-      tabs.forEach(([btnId, paneId]) => {
-        document.getElementById(btnId).addEventListener("click", () => {
-          tabs.forEach(([b, p]) => {
-            document.getElementById(b).classList.toggle("active", b === btnId);
-            document.getElementById(p).style.display = p === paneId ? "block" : "none";
-          });
-        });
-      });
-      document.getElementById("watchlist-search").addEventListener("input", renderWatchlistTables);
-
-      // Chart Mode Toggles
-      document.getElementById("chart-mode-delay").addEventListener("click", () => {
-        primaryChartMode = "delay";
-        document.getElementById("chart-mode-delay").classList.add("active");
-        document.getElementById("chart-mode-reliability").classList.remove("active");
-        renderPrimaryChart();
-      });
-      document.getElementById("chart-mode-reliability").addEventListener("click", () => {
-        primaryChartMode = "reliability";
-        document.getElementById("chart-mode-reliability").classList.add("active");
-        document.getElementById("chart-mode-delay").classList.remove("active");
-        renderPrimaryChart();
-      });
-      document.getElementById("chart-sort-btn").addEventListener("click", e => {
-        primaryChartSort = primaryChartSort === "delayed" ? "busiest" : "delayed";
-        e.currentTarget.textContent = primaryChartSort === "delayed" ? "Sort: Delayed" : "Sort: Busiest";
-        renderPrimaryChart();
-      });
-
-      document.getElementById("sec-mode-hourly").addEventListener("click", () => {
-        secondaryChartMode = "hourly";
-        document.getElementById("sec-mode-hourly").classList.add("active");
-        document.getElementById("sec-mode-ml").classList.remove("active");
-        renderSecondaryChart();
-      });
-      document.getElementById("sec-mode-ml").addEventListener("click", () => {
-        secondaryChartMode = "ml";
-        document.getElementById("sec-mode-ml").classList.add("active");
-        document.getElementById("sec-mode-hourly").classList.remove("active");
-        renderSecondaryChart();
-      });
-
-      // Predictions Filter
-      document.getElementById("pred-filter-all").addEventListener("click", () => {
-        predFilterMode = "all";
-        document.getElementById("pred-filter-all").classList.add("active");
-        document.getElementById("pred-filter-late").classList.remove("active");
-        renderPredictionsAndLineage();
-      });
-      document.getElementById("pred-filter-late").addEventListener("click", () => {
-        predFilterMode = "late";
-        document.getElementById("pred-filter-late").classList.add("active");
-        document.getElementById("pred-filter-all").classList.remove("active");
-        renderPredictionsAndLineage();
-      });
-      document.getElementById("pred-search").addEventListener("input", renderPredictionsAndLineage);
-    });
-  </script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>

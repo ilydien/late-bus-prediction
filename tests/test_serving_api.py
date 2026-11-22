@@ -129,6 +129,37 @@ class ServingApiTest(unittest.TestCase):
         self.assertIn("text/event-stream", response.headers.get("content-type", ""))
         self.assertIn("event: connected", response.text)
 
+    def test_multipage_routes_and_static_assets(self):
+        for route in ("/", "/dashboard", "/live-map", "/root-cause", "/ml-forecast", "/pipeline"):
+            resp = self.client.get(route)
+            self.assertEqual(resp.status_code, 200, f"failed route {route}")
+            self.assertIn("MetroPulse", resp.text)
+        css_resp = self.client.get("/static/styles.css")
+        self.assertEqual(css_resp.status_code, 200)
+        js_resp = self.client.get("/static/app.js")
+        self.assertEqual(js_resp.status_code, 200)
+
+    def test_analytics_root_cause(self):
+        response = self.client.get(
+            "/v1/analytics/root-cause?start_date=2020-02-01&end_date=2020-02-08"
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        for key in (
+            "executive_summary",
+            "delay_distribution",
+            "progress_curve",
+            "congestion_tiers",
+            "driver_attribution",
+            "incident_breakdown",
+            "feature_drivers",
+            "route_diagnostics",
+            "freshness",
+        ):
+            self.assertIn(key, body)
+        self.assertEqual(len(body["delay_distribution"]), 5)
+        self.assertEqual(len(body["progress_curve"]), 5)
+
 
 if __name__ == "__main__":
     unittest.main()
