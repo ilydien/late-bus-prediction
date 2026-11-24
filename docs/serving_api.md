@@ -19,13 +19,20 @@ http://127.0.0.1:18000/openapi.json
 
 | Method | Path | Parameters | Description |
 |---|---|---|---|
+| GET | `/` or `/dashboard` | — | Real-time interactive web dashboard (`F-13`) |
 | GET | `/health` | — | DB healthcheck |
 | GET | `/v1/freshness` | — | latest snapshot/service/prediction time |
+| GET | `/v1/routes/list` | — | distinct WMATA routes for filter selector |
 | GET | `/v1/routes/delay` | `start_date`, `end_date`, `route_id?` | delay per route/day |
 | GET | `/v1/reliability/daily` | `start_date`, `end_date`, `route_id?` | on-time/late reliability |
 | GET | `/v1/routes/hourly` | `start_date`, `end_date`, `route_id?` | hourly delay |
 | GET | `/v1/predictions/latest` | `route_id?`, `limit` | latest successful predictions |
 | GET | `/v1/model/performance` | `start_date?`, `end_date?` | model metrics per day |
+| GET | `/v1/traffic/corridors` | `limit` | latest TomTom corridor flow & speed ratios |
+| GET | `/v1/traffic/incidents` | `limit` | active TomTom traffic incidents |
+| GET | `/v1/buses/live` | `route_id?`, `limit` | live WMATA bus GPS enriched with ML delay forecasts |
+| GET | `/v1/stream/status` | — | freshness, medallion counts, `pipeline_runs` lineage |
+| GET | `/v1/stream/events` | `oneshot?` | real-time Server-Sent Events (SSE) stream bridged from NATS |
 
 ## Status codes
 

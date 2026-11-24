@@ -45,10 +45,17 @@ def format_prometheus_line(
     return f"{name}{label_str} {float(value)}{ts_part}\n"
 
 
-def push_metrics_batch(lines: list[str], timeout: int = 5) -> bool:
+_VM_COOLDOWN_UNTIL: float = 0.0
+
+
+def push_metrics_batch(lines: list[str], timeout: int = 2) -> bool:
     """Push multiple Prometheus exposition lines to VictoriaMetrics in one POST."""
+    global _VM_COOLDOWN_UNTIL
     if not lines:
         return True
+    now = time.monotonic()
+    if now < _VM_COOLDOWN_UNTIL:
+        return False
     payload = "".join(lines).encode("utf-8")
     req = urllib.request.Request(
         _vm_import_url(),
@@ -58,8 +65,10 @@ def push_metrics_batch(lines: list[str], timeout: int = 5) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _VM_COOLDOWN_UNTIL = 0.0
             return 200 <= resp.status < 300
     except Exception as exc:
+        _VM_COOLDOWN_UNTIL = time.monotonic() + 60.0
         logger.warning("Failed to push metrics batch to VictoriaMetrics: %s", exc)
         return False
 

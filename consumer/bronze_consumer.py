@@ -21,17 +21,31 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import boto3
-import nats
-from botocore.config import Config
-from botocore.exceptions import ClientError
-from nats.errors import TimeoutError as NatsTimeout
+try:
+    import boto3
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+except ImportError:  # pragma: no cover - allows pure helper tests without boto3
+    boto3 = None  # type: ignore[assignment]
+    Config = None  # type: ignore[assignment]
+    ClientError = Exception  # type: ignore[assignment,misc]
 
-from governance import run_log
+try:
+    import nats
+    from nats.errors import TimeoutError as NatsTimeout
+except ImportError:  # pragma: no cover - allows pure helper tests without nats-py
+    nats = None  # type: ignore[assignment]
+    NatsTimeout = TimeoutError  # type: ignore[assignment,misc]
+
+try:
+    from governance import run_log
+except ImportError:  # pragma: no cover
+    run_log = None  # type: ignore[assignment]
 
 NATS_URL = os.environ.get("NATS_URL", "nats://nats:4222")
 SPARK_MASTER = os.environ.get("SPARK_MASTER", "spark://spark-master:7077")
 SPARK_JOB = os.environ.get("SPARK_JOB", "/opt/spark/jobs/bronze_to_silver.py")
+SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
 MERGE_SCRIPT = os.environ.get("SILVER_MERGE", "/app/merge_silver.py")
 STATE_PATH = os.environ.get("CONSUMER_STATE", "/work/consumer_state.json")
 MANIFEST = os.environ.get("BRONZE_MANIFEST", "/work/bronze_batch.json")
@@ -53,14 +67,19 @@ WMATA_PREFIXES = tuple(
     if p.strip()
 )
 TRAFFIC_PREFIX = os.environ.get("TRAFFIC_BRONZE_PREFIX", "ddot/")
+TOMTOM_PREFIX = os.environ.get("TOMTOM_BRONZE_PREFIX", "tomtom/")
 
-S3 = boto3.client(
-    "s3",
-    endpoint_url=S3_ENDPOINT,
-    aws_access_key_id=ACCESS,
-    aws_secret_access_key=SECRET,
-    region_name=REGION,
-    config=Config(s3={"addressing_style": "path"}),
+S3 = (
+    boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=ACCESS,
+        aws_secret_access_key=SECRET,
+        region_name=REGION,
+        config=Config(s3={"addressing_style": "path"}),
+    )
+    if boto3 is not None
+    else None
 )
 
 SUBS = [
@@ -77,7 +96,15 @@ def wanted(bucket: str, key: str) -> bool:
             and key.startswith(WMATA_PREFIXES)
         )
     if bucket == "traffic":
-        return key.startswith(TRAFFIC_PREFIX) and key.endswith(".geojson")
+        if key.startswith(TRAFFIC_PREFIX) and key.endswith(".geojson"):
+            return True
+        if (
+            key.startswith(TOMTOM_PREFIX)
+            and key.endswith(".jsonl.gz")
+            and ("/flow/" in key or "/incidents/" in key)
+        ):
+            return True
+        return False
     return False
 
 
@@ -331,9 +358,9 @@ async def main() -> int:
                         "--master",
                         SPARK_MASTER,
                         "--conf",
-                        "spark.sql.shuffle.partitions=32",
+                        "spark.sql.shuffle.partitions=16",
                         "--conf",
-                        "spark.driver.memory=2g",
+                        f"spark.driver.memory={SPARK_DRIVER_MEMORY}",
                         SPARK_JOB,
                         "--manifest",
                         MANIFEST,
@@ -364,6 +391,16 @@ async def main() -> int:
             for item in batch:
                 await safe_ack(item["msg"])
             try:
+                notify = json.dumps(
+                    {
+                        "run_id": run_id,
+                        "wmata_files": counts["wmata"],
+                        "traffic_files": counts["traffic"],
+                        "merged_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                await nc.publish("realtime.silver.merged", notify)
                 await nc.flush(timeout=10)
             except Exception as exc:  # noqa: BLE001 - ack will be retried by NATS
                 print(f"WARN flush failed: {exc}", flush=True)

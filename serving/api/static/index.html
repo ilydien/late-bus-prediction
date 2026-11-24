@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MetroPulse DC — WMATA &amp; TomTom Real-Time Transit Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- =====================================================================
+         PERSISTENT SIDEBAR NAVIGATION (Clean 1-Line Items)
+         ===================================================================== -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        <div class="logo-wrap">
+          <img class="logo-img" src="/bus-logo.jpg?v=3" alt="MetroPulse DC Logo" />
+        </div>
+        <div>
+          <div class="brand-name">MetroPulse <span class="dc-pill">DC</span></div>
+          <div class="brand-tagline">WMATA &middot; TomTom</div>
+        </div>
+      </div>
+
+      <div class="nav-group-label">Monitor</div>
+      <nav class="sidebar-nav" aria-label="Primary navigation">
+        <button class="nav-item active" data-page="overview" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="9" rx="1.5" />
+            <rect x="14" y="3" width="7" height="5" rx="1.5" />
+            <rect x="14" y="12" width="7" height="9" rx="1.5" />
+            <rect x="3" y="16" width="7" height="5" rx="1.5" />
+          </svg>
+          <span class="nav-label">Executive Pulse</span>
+        </button>
+
+        <button class="nav-item" data-page="live-map" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21" />
+            <line x1="9" y1="3" x2="9" y2="18" />
+            <line x1="15" y1="6" x2="15" y2="21" />
+          </svg>
+          <span class="nav-label">Live Fleet Map</span>
+          <span class="nav-badge" id="nav-badge-buses">0</span>
+        </button>
+
+        <button class="nav-item" data-page="root-cause" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            <line x1="11" y1="8" x2="11" y2="12" />
+            <line x1="11" y1="15" x2="11.01" y2="15" />
+          </svg>
+          <span class="nav-label">Root Cause</span>
+          <span class="nav-badge alert" id="nav-badge-late">0</span>
+        </button>
+
+        <div class="nav-group-label" style="padding:12px 6px 4px">Systems</div>
+
+        <button class="nav-item" data-page="ml-forecast" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5z" />
+            <path d="M2 17l10 5 10-5" />
+            <path d="M2 12l10 5 10-5" />
+          </svg>
+          <span class="nav-label">ML Forecast</span>
+        </button>
+
+        <button class="nav-item" data-page="pipeline" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+          </svg>
+          <span class="nav-label">Pipeline Health</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="stream-status-box">
+          <div class="stream-row">
+            <span class="pulse-dot" id="sse-dot"></span>
+            <span id="sse-status-label">Connecting...</span>
+          </div>
+          <div class="stream-meta mono">
+            <span id="sidebar-snap-age">—</span>
+            <span id="sidebar-model-ver">lgbm v1</span>
+          </div>
+        </div>
+
+        <div class="theme-switch" role="group" aria-label="Theme">
+          <button class="theme-btn active" id="theme-light-btn" type="button">&#9728; Daylight</button>
+          <button class="theme-btn" id="theme-dark-btn" type="button">&#9790; Night</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- =====================================================================
+         MAIN WORKSPACE
+         ===================================================================== -->
+    <div class="main-area">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="mobile-menu-btn" id="mobile-menu-btn" aria-label="Menu" type="button">&#9776;</button>
+          <div class="page-title">
+            <span id="current-page-title">Executive Pulse</span>
+            <span class="badge brand" id="active-route-badge" style="display:none"></span>
+          </div>
+        </div>
+
+        <div class="topbar-controls">
+          <div class="ctrl-group">
+            <select id="route-filter" aria-label="WMATA Route">
+              <option value="">All Routes</option>
+            </select>
+            <button class="btn btn-soft-danger" id="clear-route-btn" style="display:none" type="button">&times;</button>
+          </div>
+
+          <div class="segmented" role="group" aria-label="Window">
+            <button class="seg-btn" id="preset-today-btn" type="button">Today</button>
+            <button class="seg-btn active" id="preset-live7-btn" type="button">7d</button>
+            <button class="seg-btn" id="preset-archive-btn" type="button">2020</button>
+          </div>
+
+          <div class="ctrl-group">
+            <input type="date" id="start-date" aria-label="Start date" />
+            <span style="color:var(--text-muted)">&rarr;</span>
+            <input type="date" id="end-date" aria-label="End date" />
+            <button class="btn btn-primary" id="apply-date-btn" type="button">Apply</button>
+          </div>
+
+          <button class="ticker-pill mono" id="sse-toggle-btn" title="Toggle NATS SSE Push" type="button">
+            <span class="dot-sm" id="ticker-dot" style="background:var(--emerald)"></span>
+            <span id="live-ticker-text">Push: ON</span>
+          </button>
+
+          <button class="btn" id="refresh-now-btn" title="Refresh" type="button">&#x21bb;</button>
+        </div>
+      </header>
+
+      <main class="content-wrap">
+        <!-- =================================================================
+             PAGE 1: EXECUTIVE PULSE (/)
+             ================================================================= -->
+        <section class="page-view active" id="page-overview">
+          <!-- Compact Visual Signal Strip (No prose paragraphs!) -->
+          <div class="signal-strip warn" id="exec-signal-strip">
+            <div class="signal-items">
+              <span class="badge amber" id="sig-sla-pill">SLA —</span>
+              <span class="signal-chip">
+                <span class="k">Top Cause</span>
+                <strong id="sig-cause-val">—</strong>
+              </span>
+              <span class="signal-chip">
+                <span class="k">Snowball</span>
+                <strong class="mono" id="sig-snowball-val">— &rarr; —</strong>
+              </span>
+              <span class="signal-chip">
+                <span class="k">Hotspot</span>
+                <strong class="mono" id="sig-hotspot-val">—</strong>
+              </span>
+            </div>
+            <div style="display:flex;gap:7px">
+              <button class="btn btn-primary" id="btn-go-root-cause" type="button">Root Cause &rarr;</button>
+              <button class="btn" id="btn-go-map" type="button">Live Map</button>
+            </div>
+          </div>
+
+          <!-- 4 Hero KPI Cards -->
+          <div class="grid-4">
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">On-Time (&le; 5m)</span>
+                <span class="badge emerald" id="ov-sla-badge">SLA 80%</span>
+              </div>
+              <div class="kpi-mid">
+                <div>
+                  <div class="kpi-value" id="ov-ontime">—</div>
+                  <div class="kpi-sub mono" id="ov-sla-gap">—</div>
+                </div>
+                <svg class="kpi-ring" viewBox="0 0 48 48" aria-hidden="true">
+                  <circle cx="24" cy="24" r="19" fill="none" stroke="var(--bg-elevated)" stroke-width="5" />
+                  <circle
+                    id="ov-ontime-ring"
+                    cx="24" cy="24" r="19"
+                    fill="none" stroke="var(--emerald)" stroke-width="5"
+                    stroke-linecap="round"
+                    stroke-dasharray="119.4" stroke-dashoffset="119.4"
+                    transform="rotate(-90 24 24)"
+                    style="transition: stroke-dashoffset 0.45s ease, stroke 0.25s ease"
+                  />
+                </svg>
+              </div>
+              <div class="kpi-foot">
+                <span id="ov-routes-count">— Routes</span>
+                <span class="mono" id="ov-trips-count">— trips</span>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Avg Delay</span>
+                <span class="badge amber mono" id="ov-p90-badge">P90 —</span>
+              </div>
+              <div class="kpi-mid">
+                <div>
+                  <div class="kpi-value" id="ov-avg-delay">—</div>
+                  <div class="kpi-sub mono" id="ov-median-sub">Med —</div>
+                </div>
+                <span class="badge sky mono" id="ov-speed-badge">— km/h</span>
+              </div>
+              <div class="kpi-bar">
+                <span id="ov-delay-bar" style="width:0%;background:var(--amber)"></span>
+              </div>
+              <div class="kpi-foot">
+                <span>Window</span>
+                <span class="mono" id="ov-window-label">—</span>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">ML +15m Forecast</span>
+                <span class="badge indigo mono" id="ov-ml-late-badge">Late —</span>
+              </div>
+              <div class="kpi-mid">
+                <div>
+                  <div class="kpi-value" id="ov-ml-pred">—</div>
+                  <div class="kpi-sub mono" id="ov-ml-err-sub">MAE —</div>
+                </div>
+                <span class="badge neutral mono" id="ov-ml-ver-badge">v1</span>
+              </div>
+              <div class="kpi-bar">
+                <span id="ov-ml-bar" style="width:0%;background:var(--indigo)"></span>
+              </div>
+              <div class="kpi-foot">
+                <span>LightGBM</span>
+                <span class="mono" id="ov-ml-scored">—</span>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">DC Road Flow</span>
+                <span class="badge crimson" id="ov-inc-badge">0 Inc</span>
+              </div>
+              <div class="kpi-mid">
+                <div>
+                  <div class="kpi-value" id="ov-flow-pct">—</div>
+                  <div class="kpi-sub mono" id="ov-flow-speed">— km/h</div>
+                </div>
+                <span class="badge brand mono" id="ov-buses-pill">0 buses</span>
+              </div>
+              <div class="kpi-bar">
+                <span id="ov-flow-bar" style="width:0%;background:var(--emerald)"></span>
+              </div>
+              <div class="kpi-foot">
+                <span>TomTom 16 Corridors</span>
+                <span class="mono" id="ov-flow-delay">+0s</span>
+              </div>
+            </article>
+          </div>
+
+          <!-- 2 High-Signal Visuals (Zero Redundancy) -->
+          <div class="grid-main-side">
+            <!-- Left: Donut Ring + Proportional Schedule Bars -->
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Fleet Schedule Composition</div>
+                <span class="badge neutral mono" id="ov-dist-total">—</span>
+              </div>
+              <div class="donut-split" style="flex:1">
+                <div class="donut-wrap">
+                  <canvas id="ovDonutChart"></canvas>
+                  <div class="donut-center">
+                    <div class="donut-center-val" id="ov-donut-center">—</div>
+                    <div class="donut-center-lbl">On-Time &le;5m</div>
+                  </div>
+                </div>
+                <div class="visual-bar-list" id="ov-dist-bars"></div>
+              </div>
+            </div>
+
+            <!-- Right: Top 10 Delayed Routes with 5m SLA Line + Direct Labels -->
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title" id="ov-bottleneck-title">Top 10 Delayed Routes</div>
+                <div class="segmented">
+                  <button class="seg-btn active" id="ov-chart-delay-btn" type="button">Avg / P90</button>
+                  <button class="seg-btn" id="ov-chart-ontime-btn" type="button">On-Time %</button>
+                </div>
+              </div>
+              <div class="chart-box tall">
+                <canvas id="ovBottleneckChart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <!-- 3 Compact Visual Spotlight Action Tiles -->
+          <div class="grid-3">
+            <div class="spotlight-card" id="spot-route-card">
+              <div class="spot-left">
+                <div class="spot-icon" style="background:var(--crimson-soft);color:var(--crimson)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                    <line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" />
+                  </svg>
+                </div>
+                <div style="min-width:0">
+                  <div class="spot-kicker">Worst Route</div>
+                  <div class="spot-title" id="spot-route-title">—</div>
+                  <div class="spot-meta mono" id="spot-route-meta">—</div>
+                </div>
+              </div>
+              <span class="badge crimson mono" id="spot-route-badge">—</span>
+            </div>
+
+            <div class="spotlight-card" id="spot-corridor-card">
+              <div class="spot-left">
+                <div class="spot-icon" style="background:var(--amber-soft);color:var(--amber)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <path d="M4 19L8 5M16 5l4 14M12 5v3M12 11v3M12 17v2" />
+                  </svg>
+                </div>
+                <div style="min-width:0">
+                  <div class="spot-kicker">Slowest Corridor</div>
+                  <div class="spot-title" id="spot-corridor-title">—</div>
+                  <div class="spot-meta mono" id="spot-corridor-meta">—</div>
+                </div>
+              </div>
+              <span class="badge amber mono" id="spot-corridor-badge">—</span>
+            </div>
+
+            <div class="spotlight-card" id="spot-incident-card">
+              <div class="spot-left">
+                <div class="spot-icon" style="background:var(--crimson-soft);color:var(--crimson)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
+                  </svg>
+                </div>
+                <div style="min-width:0">
+                  <div class="spot-kicker">Top Incident</div>
+                  <div class="spot-title" id="spot-incident-title">—</div>
+                  <div class="spot-meta mono" id="spot-incident-meta">—</div>
+                </div>
+              </div>
+              <span class="badge crimson mono" id="spot-incident-badge">—</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================
+             PAGE 2: LIVE FLEET MAP (/live-map)
+             ================================================================= -->
+        <section class="page-view" id="page-live-map">
+          <div class="grid-map-layout">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">DC Live Fleet &amp; Roadway Telemetry</div>
+                <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+                  <div class="segmented" role="group">
+                    <button class="seg-btn active" data-bus-filter="all" type="button">All</button>
+                    <button class="seg-btn" data-bus-filter="late" type="button">Late &gt;5m</button>
+                    <button class="seg-btn" data-bus-filter="moderate" type="button">2–5m</button>
+                    <button class="seg-btn" data-bus-filter="ontime" type="button">On-Time</button>
+                  </div>
+                  <button class="btn" id="reset-map-btn" type="button">&#x2316; Reset</button>
+                </div>
+              </div>
+
+              <div class="map-stage">
+                <div class="map-overlay-bar">
+                  <button class="map-chip active" id="toggle-buses-btn" type="button">
+                    <span class="dot-sm" style="background:var(--brand)"></span> Buses (<span id="map-bus-count">0</span>)
+                  </button>
+                  <button class="map-chip active" id="toggle-corridors-btn" type="button">
+                    <span class="dot-sm" style="background:var(--emerald)"></span> Corridors (<span id="map-corridor-count">0</span>)
+                  </button>
+                  <button class="map-chip active" id="toggle-incidents-btn" type="button">
+                    <span class="dot-sm" style="background:var(--crimson)"></span> Incidents (<span id="map-incident-count">0</span>)
+                  </button>
+                </div>
+                <div id="dc-map"></div>
+              </div>
+
+              <div class="map-legend">
+                <div class="legend-items">
+                  <span class="legend-item"><i class="dot-sm" style="background:var(--emerald)"></i> On-Time / Free (&ge;78%)</span>
+                  <span class="legend-item"><i class="dot-sm" style="background:var(--amber)"></i> 2–5m / Dense (55–77%)</span>
+                  <span class="legend-item"><i class="dot-sm" style="background:var(--crimson)"></i> Late &gt;5m / Jam (&lt;55%)</span>
+                </div>
+                <span class="mono" style="color:var(--text-muted)">OSM &middot; TomTom &middot; WMATA</span>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="segmented" role="tablist">
+                  <button class="seg-btn active" id="insp-tab-buses" type="button">Late (<span id="insp-late-count">0</span>)</button>
+                  <button class="seg-btn" id="insp-tab-flow" type="button">Flow (16)</button>
+                  <button class="seg-btn" id="insp-tab-inc" type="button">Incidents (<span id="insp-inc-count">0</span>)</button>
+                </div>
+                <input type="text" id="map-inspector-search" placeholder="Search..." style="width:100%" />
+              </div>
+
+              <div class="table-scroll tall table-compact" id="insp-pane-buses">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Route</th>
+                      <th>Delay</th>
+                      <th>Speed</th>
+                      <th>Cause</th>
+                    </tr>
+                  </thead>
+                  <tbody id="insp-buses-tbody"></tbody>
+                </table>
+              </div>
+
+              <div class="table-scroll tall table-compact" id="insp-pane-flow" style="display:none">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Corridor</th>
+                      <th>Speed</th>
+                      <th>Flow</th>
+                      <th>Delay</th>
+                    </tr>
+                  </thead>
+                  <tbody id="insp-flow-tbody"></tbody>
+                </table>
+              </div>
+
+              <div class="table-scroll tall table-compact" id="insp-pane-inc" style="display:none">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Type</th>
+                      <th>Road</th>
+                      <th>Delay</th>
+                      <th>Len</th>
+                    </tr>
+                  </thead>
+                  <tbody id="insp-inc-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================
+             PAGE 3: ROOT CAUSE (/root-cause)
+             ================================================================= -->
+        <section class="page-view" id="page-root-cause">
+          <div class="grid-4">
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Top Delay Driver</span>
+                <span class="badge crimson mono" id="rc-dom-share">—</span>
+              </div>
+              <div class="kpi-value" id="rc-dom-cause" style="font-size:21px;font-family:inherit">—</div>
+              <div class="kpi-foot"><span class="mono" id="rc-dom-sub">—</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Trip Snowball</span>
+                <span class="badge amber mono" id="rc-snowball-mult">—</span>
+              </div>
+              <div class="kpi-value" id="rc-snowball-val" style="font-size:22px">— &rarr; —</div>
+              <div class="kpi-foot"><span>Start (0–20%) &rarr; End (80–100%)</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Incident Zone (&le;1.5km)</span>
+                <span class="badge crimson" id="rc-inc-active">0</span>
+              </div>
+              <div class="kpi-value" id="rc-inc-exposed">—</div>
+              <div class="kpi-foot"><span>Late buses near incidents</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Congestion Impact</span>
+                <span class="badge brand" id="rc-cong-badge">TomTom</span>
+              </div>
+              <div class="kpi-value" id="rc-cong-penalty">—</div>
+              <div class="kpi-foot"><span class="mono" id="rc-cong-sub">—</span></div>
+            </article>
+          </div>
+
+          <!-- Row 1: Visual Donut Attribution + Snowball Curve with Direct Labels -->
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Late-Bus Cause Breakdown</div>
+                <span class="badge crimson mono" id="rc-late-total-badge">0 late</span>
+              </div>
+              <div class="donut-split" style="flex:1">
+                <div class="donut-wrap">
+                  <canvas id="rcCauseDonut"></canvas>
+                  <div class="donut-center">
+                    <div class="donut-center-val" id="rc-donut-center">0</div>
+                    <div class="donut-center-lbl">Late &gt;5m</div>
+                  </div>
+                </div>
+                <div class="visual-bar-list" id="rc-driver-bars"></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Delay Snowball: Trip Start &rarr; End</div>
+                <span class="badge amber">Avg Min vs % Late</span>
+              </div>
+              <div class="chart-box">
+                <canvas id="rcProgressChart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <!-- Row 2: Tinted Quadrant Scatter (with Route Labels!) + Dual-Axis Hourly -->
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Speed vs. Delay Quadrant</div>
+                <span class="badge neutral">Click bubble to filter</span>
+              </div>
+              <div class="chart-box">
+                <canvas id="rcQuadrantChart"></canvas>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title" id="rc-hourly-title">Hourly Delay vs. On-Time %</div>
+                <div class="segmented">
+                  <button class="seg-btn active" id="rc-sec-hourly" type="button">Hourly</button>
+                  <button class="seg-btn" id="rc-sec-congestion" type="button">Flow Tier</button>
+                </div>
+              </div>
+              <div class="chart-box">
+                <canvas id="rcHourlyChart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <!-- Row 3: Visual Route Diagnostic Table (Compact Signal Chips & Progress Gauges!) -->
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title">Route Root-Cause Matrix</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <div class="segmented">
+                  <button class="seg-btn active" data-cause-filter="all" type="button">All</button>
+                  <button class="seg-btn" data-cause-filter="issues" type="button">Delayed</button>
+                  <button class="seg-btn" data-cause-filter="incident" type="button">Incident</button>
+                </div>
+                <input type="text" id="rc-table-search" placeholder="Route / cause..." style="width:165px" />
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Route</th>
+                    <th>Trips</th>
+                    <th>Avg</th>
+                    <th>P90</th>
+                    <th>On-Time</th>
+                    <th>Speed</th>
+                    <th>Late Stage</th>
+                    <th>Cause</th>
+                    <th>Key Signal</th>
+                  </tr>
+                </thead>
+                <tbody id="rc-routes-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================
+             PAGE 4: ML FORECAST (/ml-forecast)
+             ================================================================= -->
+        <section class="page-view" id="page-ml-forecast">
+          <div class="grid-4">
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Avg +15m Forecast</span>
+                <span class="badge indigo mono" id="ml-model-badge">lgbm v1</span>
+              </div>
+              <div class="kpi-value" id="ml-kpi-avg">—</div>
+              <div class="kpi-foot"><span class="badge amber" id="ml-eval-mode-badge">Live Bootstrap</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Predicted Late (&gt;5m)</span>
+                <span class="badge crimson mono" id="ml-kpi-late-cnt">0</span>
+              </div>
+              <div class="kpi-value" id="ml-kpi-late-pct">—</div>
+              <div class="kpi-foot"><span>Forecast breaching 5m SLA</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">MAE / RMSE</span>
+                <span class="badge emerald mono" id="ml-kpi-acc">Acc —</span>
+              </div>
+              <div class="kpi-value" id="ml-kpi-mae">—</div>
+              <div class="kpi-foot"><span class="mono" id="ml-kpi-rmse">RMSE —</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top">
+                <span class="kpi-label">Total Scored</span>
+                <span class="badge brand mono" id="ml-kpi-ver">v1</span>
+              </div>
+              <div class="kpi-value" id="ml-kpi-total">—</div>
+              <div class="kpi-foot"><span class="mono" id="ml-kpi-last-scored">—</span></div>
+            </article>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Predicted vs. Target Accuracy (45&deg; Fit)</div>
+                <span class="badge indigo">Closer to line = tighter fit</span>
+              </div>
+              <div class="chart-box">
+                <canvas id="mlCalibrationChart"></canvas>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Feature Drivers (+15m Delay)</div>
+                <div style="display:flex;gap:6px">
+                  <span class="badge crimson">&uarr; More Delay</span>
+                  <span class="badge emerald">&darr; Less Delay</span>
+                </div>
+              </div>
+              <div class="chart-box">
+                <canvas id="mlFeatureDriversChart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title">Live Trip Predictions (+15m)</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <div class="segmented">
+                  <button class="seg-btn active" data-pred-filter="all" type="button">All</button>
+                  <button class="seg-btn" data-pred-filter="late" type="button">Late &gt;5m</button>
+                  <button class="seg-btn" data-pred-filter="worsening" type="button">Worsening &uarr;</button>
+                </div>
+                <input type="text" id="ml-pred-search" placeholder="Route / trip..." style="width:155px" />
+                <span class="badge indigo mono" id="ml-pred-count">0</span>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Route</th>
+                    <th>Trip</th>
+                    <th>UTC</th>
+                    <th>Now</th>
+                    <th>Pred +15m</th>
+                    <th>Trend</th>
+                    <th>Target</th>
+                    <th>Err</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="ml-predictions-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================
+             PAGE 5: PIPELINE HEALTH (/pipeline)
+             ================================================================= -->
+        <section class="page-view" id="page-pipeline">
+          <!-- 4-Stage Medallion Architecture with Visual Connecting Arrows -->
+          <div class="medallion-flow-grid">
+            <article class="stage-card bronze">
+              <div class="stage-step"><span>1 &middot; Bronze</span><span class="badge amber">SeaweedFS</span></div>
+              <div class="stage-title">Live Pollers</div>
+              <div class="stage-stat">2 Feeds</div>
+              <div class="stage-sub">WMATA &middot; TomTom</div>
+            </article>
+
+            <div class="flow-arrow">&rarr;</div>
+
+            <article class="stage-card silver">
+              <div class="stage-step"><span>2 &middot; Silver</span><span class="badge sky">Spark + Spock</span></div>
+              <div class="stage-title">Normalized</div>
+              <div class="stage-stat" id="pipe-silver-buses">—</div>
+              <div class="stage-sub mono" id="pipe-silver-sub">—</div>
+            </article>
+
+            <div class="flow-arrow">&rarr;</div>
+
+            <article class="stage-card gold">
+              <div class="stage-step"><span>3 &middot; Gold</span><span class="badge emerald">Spock Gold</span></div>
+              <div class="stage-title">Features</div>
+              <div class="stage-stat" id="pipe-gold-features">—</div>
+              <div class="stage-sub mono" id="pipe-gold-sub">—</div>
+            </article>
+
+            <div class="flow-arrow">&rarr;</div>
+
+            <article class="stage-card ml">
+              <div class="stage-step"><span>4 &middot; Serve</span><span class="badge indigo">MLflow + SSE</span></div>
+              <div class="stage-title">Predictions</div>
+              <div class="stage-stat" id="pipe-gold-preds">—</div>
+              <div class="stage-sub">NATS JetStream Push</div>
+            </article>
+          </div>
+
+          <!-- Freshness Cards with Visual Health Bars -->
+          <div class="grid-4">
+            <article class="kpi-card">
+              <div class="kpi-top"><span class="kpi-label">WMATA Freshness</span><span class="badge emerald" id="pipe-snap-badge">Live</span></div>
+              <div class="kpi-value" id="pipe-snap-age">—</div>
+              <div class="kpi-bar"><span id="pipe-snap-bar" style="width:90%;background:var(--emerald)"></span></div>
+              <div class="kpi-foot"><span class="mono" id="pipe-snap-ts">—</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top"><span class="kpi-label">ML Inference</span><span class="badge indigo" id="pipe-pred-badge">Active</span></div>
+              <div class="kpi-value" id="pipe-pred-age">—</div>
+              <div class="kpi-bar"><span id="pipe-pred-bar" style="width:95%;background:var(--indigo)"></span></div>
+              <div class="kpi-foot"><span class="mono" id="pipe-pred-ts">—</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top"><span class="kpi-label">TomTom Traffic</span><span class="badge sky" id="pipe-tomtom-badge">Active</span></div>
+              <div class="kpi-value" id="pipe-tomtom-age">—</div>
+              <div class="kpi-bar"><span id="pipe-tomtom-bar" style="width:80%;background:var(--sky)"></span></div>
+              <div class="kpi-foot"><span class="mono" id="pipe-tomtom-ts">—</span></div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-top"><span class="kpi-label">NATS SSE Bus</span><span class="badge emerald" id="pipe-nats-badge">Online</span></div>
+              <div class="kpi-value" id="pipe-sse-clients">—</div>
+              <div class="kpi-bar"><span id="pipe-sr-bar" style="width:100%;background:var(--emerald)"></span></div>
+              <div class="kpi-foot"><span class="mono" id="pipe-success-rate">—</span></div>
+            </article>
+          </div>
+
+          <div class="grid-main-side">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Pipeline Runs (<span class="mono">pipeline_runs</span>)</div>
+                <div class="segmented">
+                  <button class="seg-btn active" data-layer-filter="all" type="button">All</button>
+                  <button class="seg-btn" data-layer-filter="bronze" type="button">Bronze</button>
+                  <button class="seg-btn" data-layer-filter="silver" type="button">Silver</button>
+                  <button class="seg-btn" data-layer-filter="gold" type="button">Gold</button>
+                </div>
+              </div>
+              <div class="table-scroll table-compact">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Job</th>
+                      <th>Layer</th>
+                      <th>Status</th>
+                      <th>UTC</th>
+                      <th>Dur</th>
+                      <th>Summary</th>
+                    </tr>
+                  </thead>
+                  <tbody id="pipe-runs-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">TomTom Incidents</div>
+                <span class="badge crimson mono" id="pipe-inc-total">0</span>
+              </div>
+              <div class="chart-box short">
+                <canvas id="pipeIncChart"></canvas>
+              </div>
+              <div class="table-scroll table-compact" style="max-height:190px">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Category</th>
+                      <th>Count</th>
+                      <th>Avg Delay</th>
+                      <th>Len</th>
+                    </tr>
+                  </thead>
+                  <tbody id="pipe-inc-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=8"></script>
+</body>
+</html>

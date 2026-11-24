@@ -4,7 +4,8 @@ RUN pip install --no-cache-dir \
   fastapi \
   uvicorn \
   psycopg2-binary \
-  httpx
+  httpx \
+  nats-py
 
 WORKDIR /app
 COPY . /app

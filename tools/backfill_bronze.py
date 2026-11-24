@@ -28,10 +28,11 @@ SECRET = os.environ.get("SEAWEEDFS_SECRET_KEY", "seaweedfs-secret-key")
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 LOG_PATH = os.environ.get("BACKFILL_LOG", "/work/backfill_bronze.json")
 
-# bucket -> (prefix, suffix filter)
+# target_name -> (bucket, prefix, suffix filter)
 TARGETS = {
-    "wmata": ("bronze_2020/bus_positions/", ".jsonl.gz"),
-    "traffic": ("ddot/", ".geojson"),
+    "wmata": ("wmata", "bronze_2020/bus_positions/", ".jsonl.gz"),
+    "traffic_ddot": ("traffic", "ddot/", ".geojson"),
+    "traffic_tomtom": ("traffic", "tomtom/", ".jsonl.gz"),
 }
 SUBJECTS = {
     "wmata": "wmata.realtime.bronze_data",
@@ -95,8 +96,9 @@ def parse_dt(value: str | None):
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wmata-prefix", default=TARGETS["wmata"][0])
-    ap.add_argument("--traffic-prefix", default=TARGETS["traffic"][0])
+    ap.add_argument("--wmata-prefix", default=TARGETS["wmata"][1])
+    ap.add_argument("--traffic-prefix", default=TARGETS["traffic_ddot"][1])
+    ap.add_argument("--tomtom-prefix", default=TARGETS["traffic_tomtom"][1])
     ap.add_argument("--since")
     ap.add_argument("--until")
     ap.add_argument("--limit", type=int, default=0)
@@ -105,10 +107,11 @@ async def main() -> None:
 
     since = parse_dt(args.since)
     until = parse_dt(args.until)
-    targets = {
-        "wmata": (args.wmata_prefix, TARGETS["wmata"][1]),
-        "traffic": (args.traffic_prefix, TARGETS["traffic"][1]),
-    }
+    targets = [
+        ("wmata", "wmata", args.wmata_prefix, TARGETS["wmata"][2]),
+        ("traffic", "traffic", args.traffic_prefix, TARGETS["traffic_ddot"][2]),
+        ("tomtom", "traffic", args.tomtom_prefix, TARGETS["traffic_tomtom"][2]),
+    ]
 
     client = s3_client()
     nc = await nats.connect(NATS_URL, max_reconnect_attempts=10)
@@ -122,7 +125,7 @@ async def main() -> None:
     }
 
     try:
-        for bucket, (prefix, suffix) in targets.items():
+        for label, bucket, prefix, suffix in targets:
             subject = SUBJECTS[bucket]
             count = 0
             for key, etag, modified, size in objects(
@@ -142,8 +145,8 @@ async def main() -> None:
                 )
                 count += 1
                 print(f"{'DRY' if args.dry_run else 'PUB'} {bucket}/{key}", flush=True)
-            print(f"{bucket}: {count} events -> {subject}", flush=True)
-            log[f"{bucket}_count"] = count
+            print(f"{label} ({bucket}): {count} events -> {subject}", flush=True)
+            log[f"{label}_count"] = count
         if not args.dry_run:
             await nc.flush(timeout=10)
     finally:

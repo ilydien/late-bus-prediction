@@ -13,3 +13,11 @@ CREATE TABLE IF NOT EXISTS public.ddot_am_speed_2019_staging (
 CREATE TABLE IF NOT EXISTS public.ddot_taz_staging (
     LIKE public.ddot_taz INCLUDING DEFAULTS
 );
+
+CREATE TABLE IF NOT EXISTS public.tomtom_flow_segment_staging (
+    LIKE public.tomtom_flow_segment INCLUDING DEFAULTS
+);
+
+CREATE TABLE IF NOT EXISTS public.tomtom_traffic_incident_staging (
+    LIKE public.tomtom_traffic_incident INCLUDING DEFAULTS
+);
