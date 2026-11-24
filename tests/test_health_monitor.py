@@ -26,6 +26,7 @@ def test_run_checks_and_render_prometheus_metrics():
         "vmalert",
         "spark-master",
         "spark-worker",
+        "dagster-daemon",
         "dagster-user-code",
         "consumer",
         "wmata-poller",

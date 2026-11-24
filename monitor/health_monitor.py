@@ -120,6 +120,7 @@ def _build_checks() -> list[tuple[str, Callable[[], bool]]]:
         ("debezium-wmata", lambda: _http_ok(f"{DEBEZIUM_WMATA_URL}/q/health/ready")),
         ("debezium-traffic", lambda: _http_ok(f"{DEBEZIUM_TRAFFIC_URL}/q/health/ready")),
         ("dagster-webserver", lambda: _http_ok(f"{DAGSTER_URL}/dagit_info")),
+        ("dagster-daemon", lambda: _cadvisor_up("dagster-daemon")),
         ("dagster-user-code", lambda: _tcp_ok(DAGSTER_USER_CODE_HOST, DAGSTER_USER_CODE_PORT)),
         ("mlflow", lambda: _http_ok(f"{MLFLOW_URL}/health")),
         ("trino", lambda: _http_ok(f"{TRINO_URL}/v1/info")),
@@ -374,6 +375,15 @@ def build_monitoring_summary() -> dict[str, object]:
             "pg_up": _query_vm("pg_up"),
             "spock_replicating": _query_vm("spock_subscription_is_replicating"),
             "haproxy_active_servers": _query_vm('haproxy_backend_active_servers{proxy=~"silver_.*|gold_.*"}'),
+            "haproxy_server_status": _query_vm('haproxy_server_status{proxy=~"silver_rw_backend|gold_rw_backend",state="UP"}'),
+            "pg_connections_by_layer": _query_vm("sum by (layer) (pg_stat_activity_count)"),
+            "pg_dead_tuples_by_layer": _query_vm("sum by (layer) (pg_table_live_tuples_n_dead_tup)"),
+            "vm_scrape_targets": _query_vm("up"),
+            "tomtom_poll_requests": _query_vm("wmata_tomtom_poll_requests_total"),
+            "stream_events_total": _query_vm("wmata_stream_events_total"),
+            "stream_processing_lag": _query_vm("wmata_stream_processing_lag_seconds"),
+            "inference_scored_total": _query_vm("wmata_stream_inference_scored_total"),
+            "alert_notifications_total": _query_vm("wmata_alert_notifications_total"),
         },
     }
 

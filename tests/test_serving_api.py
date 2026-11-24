@@ -181,7 +181,17 @@ class ServingApiTest(unittest.TestCase):
             self.assertEqual(resp.status_code, 200, f"failed route {route}")
             self.assertIn("MetroPulse", resp.text)
         pipe_resp = self.client.get("/pipeline")
-        for marker in ("ops-signal-strip", "ops-svc-grid", "pipePerfChart", "ops-logs-tbody"):
+        for marker in (
+            "ops-signal-strip",
+            "ops-tier1-tbody",
+            "ops-tier2-grid",
+            "ops-tier3-strip",
+            "ops-node-grid",
+            "pipePerfChart",
+            "ops-logs-tbody",
+            "log-live-toggle-btn",
+            "ops-log-json-panel",
+        ):
             self.assertIn(marker, pipe_resp.text)
         css_resp = self.client.get("/static/styles.css")
         self.assertEqual(css_resp.status_code, 200)
@@ -214,7 +224,40 @@ class ServingApiTest(unittest.TestCase):
                             {"labels": {"layer": "silver", "datname": "wmata", "subscription_name": "sub_1"}, "value": 1.0}
                         ],
                         "haproxy_active_servers": [
-                            {"labels": {"proxy": "silver_rw_backend"}, "value": 1.0}
+                            {"labels": {"proxy": "silver_rw_backend"}, "value": 1.0},
+                            {"labels": {"proxy": "gold_rw_backend"}, "value": 1.0},
+                        ],
+                        "haproxy_server_status": [
+                            {"labels": {"proxy": "silver_rw_backend", "server": "spock-silver-1"}, "value": 1.0},
+                            {"labels": {"proxy": "silver_rw_backend", "server": "spock-silver-2"}, "value": 1.0},
+                            {"labels": {"proxy": "gold_rw_backend", "server": "spock-gold-1"}, "value": 1.0},
+                            {"labels": {"proxy": "gold_rw_backend", "server": "spock-gold-2"}, "value": 1.0},
+                        ],
+                        "pg_connections_by_layer": [
+                            {"labels": {"layer": "infra"}, "value": 9.0},
+                            {"labels": {"layer": "silver"}, "value": 6.0},
+                        ],
+                        "pg_dead_tuples_by_layer": [
+                            {"labels": {"layer": "silver"}, "value": 12.0},
+                        ],
+                        "vm_scrape_targets": [
+                            {"labels": {"job": "health-monitor"}, "value": 1.0},
+                            {"labels": {"job": "haproxy"}, "value": 1.0},
+                        ],
+                        "tomtom_poll_requests": [
+                            {"labels": {"mode": "realtime"}, "value": 140.0},
+                        ],
+                        "stream_events_total": [
+                            {"labels": {"status": "processed"}, "value": 42.0},
+                        ],
+                        "stream_processing_lag": [
+                            {"labels": {"bucket": "wmata"}, "value": 1.5},
+                        ],
+                        "inference_scored_total": [
+                            {"labels": {"model_version": "v1"}, "value": 125.0},
+                        ],
+                        "alert_notifications_total": [
+                            {"labels": {"status": "FIRING"}, "value": 2.0},
                         ],
                         "container_cpu_pct": [
                             {"labels": {"name": "wmata-lateness-serving-api-1"}, "value": 2.4}
@@ -262,6 +305,15 @@ class ServingApiTest(unittest.TestCase):
         self.assertEqual(body["pipeline_performance"]["by_job"][0]["job_name"], "silver_consumer")
         self.assertEqual(body["pipeline_performance"]["recent_errors"][0]["run_id"], "run-fail-1")
         self.assertEqual(body["data_quality"]["summary"]["pass"], 1)
+        self.assertEqual(body["services_tiered"]["overall_state"], "critical")
+        self.assertEqual(len(body["services_tiered"]["tier1"]), 11)
+        self.assertEqual(len(body["services_tiered"]["tier2"]), 8)
+        self.assertEqual(body["services_tiered"]["vm_targets"]["up"], 2)
+        self.assertEqual(len(body["replication"]["nodes"]), 4)
+        self.assertEqual(body["replication"]["pg_connections"]["infra"], 9)
+        self.assertEqual(body["stream_telemetry"]["tomtom_quota_used"], 140)
+        self.assertEqual(body["stream_telemetry"]["inference_scored_total"], 125)
+        self.assertEqual(body["alerts"]["notifications"]["firing"], 2)
 
     def test_ops_logs(self):
         ndjson = (
