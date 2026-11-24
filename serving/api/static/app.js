@@ -1458,7 +1458,11 @@
       document.getElementById("ml-kpi-acc").textContent = `Acc ${acc.toFixed(1)}%`;
 
       const evalBadge = document.getElementById("ml-eval-mode-badge");
-      if (acc >= 98.5 && mae < 0.75) {
+      const obsCount = Number(counts.gold_observed_ground_truth || 0);
+      if (obsCount >= 20) {
+        evalBadge.className = "badge emerald mono";
+        evalBadge.textContent = `Observed +15m (${obsCount.toLocaleString()})`;
+      } else if (acc >= 98.5 && mae < 0.75) {
         evalBadge.className = "badge amber";
         evalBadge.textContent = "Bootstrap Target";
       } else {
@@ -1686,12 +1690,15 @@
     const natsBadge = document.getElementById("pipe-nats-badge");
     natsBadge.className = `badge ${st.nats_connected ? "emerald" : "amber"}`;
     natsBadge.textContent = st.nats_connected ? "Online" : "Retry";
-    document.getElementById("pipe-sse-clients").textContent = `${tel.sse_subscribers || 1} SSE`;
+    const jsTel = tel.jetstream || {};
+    const lagVal = jsTel.total_pending !== undefined ? jsTel.total_pending : 0;
+    const dlqVal = jsTel.dlq_messages !== undefined ? jsTel.dlq_messages : 0;
+    document.getElementById("pipe-sse-clients").textContent = `Lag ${lagVal} · DLQ ${dlqVal}`;
 
     const finished = runs.filter(r => ["success", "failed"].includes(String(r.status || "").toLowerCase()));
     const ok = finished.filter(r => String(r.status || "").toLowerCase() === "success");
     const sr = finished.length ? Math.round((ok.length / finished.length) * 100) : 100;
-    document.getElementById("pipe-success-rate").textContent = `Success ${sr}% (${ok.length}/${finished.length})`;
+    document.getElementById("pipe-success-rate").textContent = `${tel.sse_subscribers || 1} SSE · Jobs ${sr}%`;
     document.getElementById("pipe-sr-bar").style.width = `${sr}%`;
 
     const filteredRuns = runs.filter(r => state.pipeLayerFilter === "all" || String(r.layer || "").toLowerCase() === state.pipeLayerFilter);

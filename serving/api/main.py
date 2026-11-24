@@ -40,6 +40,7 @@ SILVER_USER = os.environ.get("POSTGRES_SILVER_USER", "postgres")
 SILVER_PASSWORD = os.environ.get("POSTGRES_SILVER_PASSWORD", "postgres")
 
 NATS_URL = os.environ.get("NATS_URL", "nats://nats:4222")
+NATS_MON_URL = os.environ.get("NATS_MON_URL", "http://nats:8222")
 MONITOR_URL = os.environ.get("MONITOR_URL", "http://monitor:8090")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -1215,6 +1216,44 @@ def analytics_root_cause(
     }
 
 
+def _fetch_jetstream_telemetry() -> dict[str, Any]:
+    """Query NATS JetStream monitoring endpoint for stream depths, consumer lag & DLQ count."""
+    if not NATS_MON_URL:
+        return {}
+    url = f"{NATS_MON_URL.rstrip('/')}/jsz?streams=true&consumers=true"
+    try:
+        with urllib.request.urlopen(url, timeout=1.5) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+    streams_out: dict[str, int] = {}
+    pending_out: dict[str, int] = {}
+    dlq_messages = 0
+    total_pending = 0
+    for acc in raw.get("account_details") or []:
+        for st in acc.get("stream_detail") or []:
+            sname = str(st.get("name") or "")
+            msgs = int((st.get("state") or {}).get("messages") or 0)
+            if sname:
+                streams_out[sname] = msgs
+            if sname == "wmata-dlq":
+                dlq_messages += msgs
+            for cons in st.get("consumer_detail") or []:
+                cname = str(cons.get("name") or "")
+                pend = int(cons.get("num_pending") or 0)
+                if cname:
+                    pending_out[cname] = pend
+                total_pending += pend
+
+    return {
+        "streams": streams_out,
+        "consumer_pending": pending_out,
+        "total_pending": total_pending,
+        "dlq_messages": dlq_messages,
+    }
+
+
 @app.get("/v1/stream/status")
 def stream_status(conn=Depends(get_conn)):
     fresh = _freshness(conn)
@@ -1247,6 +1286,7 @@ def stream_status(conn=Depends(get_conn)):
             """
             SELECT
               (SELECT count(*) FROM public.trip_delay_features) AS gold_features,
+              (SELECT count(*) FROM public.trip_delay_features WHERE split = 'live_observed') AS gold_observed_ground_truth,
               (SELECT count(*) FROM public.model_predictions) AS gold_predictions,
               (SELECT count(DISTINCT route_id) FROM public.route_daily_reliability) AS gold_routes
             """,
@@ -1286,6 +1326,7 @@ def stream_status(conn=Depends(get_conn)):
     snap_dt = _parse_iso_dt(fresh.get("max_snapshot_ts"))
     pred_dt = _parse_iso_dt(fresh.get("max_predicted_at"))
     tomtom_dt = _parse_iso_dt(tomtom_max_ts)
+    js_tel = _fetch_jetstream_telemetry()
 
     telemetry = {
         "snapshot_age_sec": int(max(0.0, (now_utc - snap_dt).total_seconds())) if snap_dt else None,
@@ -1293,6 +1334,7 @@ def stream_status(conn=Depends(get_conn)):
         "tomtom_age_sec": int(max(0.0, (now_utc - tomtom_dt).total_seconds())) if tomtom_dt else None,
         "tomtom_max_ts": tomtom_max_ts,
         "sse_subscribers": len(_SSE_SUBSCRIBERS),
+        "jetstream": js_tel,
         "server_time_utc": now_utc.isoformat(),
     }
 

@@ -96,7 +96,23 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * r * asin(sqrt(a))
 
 
-HAVERSINE = F.udf(haversine_km, DoubleType())
+def haversine_km_col(lat1: str, lon1: str, lat2: str, lon2: str):
+    """Native Spark SQL Haversine distance in km (avoids Python UDF worker overhead)."""
+    c_lat1, c_lon1 = F.col(lat1), F.col(lon1)
+    c_lat2, c_lon2 = F.col(lat2), F.col(lon2)
+    dlat = F.radians(c_lat2 - c_lat1)
+    dlon = F.radians(c_lon2 - c_lon1)
+    a = (
+        F.pow(F.sin(dlat / F.lit(2.0)), 2)
+        + F.cos(F.radians(c_lat1))
+        * F.cos(F.radians(c_lat2))
+        * F.pow(F.sin(dlon / F.lit(2.0)), 2)
+    )
+    clamped = F.least(F.lit(1.0), F.greatest(F.lit(0.0), a))
+    return F.when(
+        c_lat1.isNotNull() & c_lon1.isNotNull() & c_lat2.isNotNull() & c_lon2.isNotNull(),
+        F.lit(2.0 * 6371.0) * F.asin(F.sqrt(clamped)),
+    )
 
 
 def silver_wmata(spark: SparkSession, keys: list[str]) -> None:
@@ -137,7 +153,7 @@ def silver_wmata(spark: SparkSession, keys: list[str]) -> None:
         base.withColumn("prev_lat", F.lag("lat").over(w))
         .withColumn("prev_lon", F.lag("lon").over(w))
         .withColumn("prev_ts", F.lag("event_time").over(w))
-        .withColumn("dist_km", HAVERSINE("prev_lat", "prev_lon", "lat", "lon"))
+        .withColumn("dist_km", haversine_km_col("prev_lat", "prev_lon", "lat", "lon"))
         .withColumn(
             "secs",
             F.unix_timestamp("event_time") - F.unix_timestamp("prev_ts"),
@@ -191,41 +207,62 @@ def parse_hms(value: str) -> int | None:
         return None
 
 
+_GTFS_STATE: str | None = None  # None | "loaded" | "missing"
+
+
+def reset_caches() -> None:
+    """Reset process-local reference caches (e.g., on SparkSession recovery)."""
+    global _GTFS_STATE
+    _GTFS_STATE = None
+
+
+def _route_stats_from_staging(spark: SparkSession) -> None:
+    url = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/wmata"
+    props = {
+        "user": PG_USER,
+        "password": PG_PASSWORD,
+        "driver": "org.postgresql.Driver",
+    }
+    snap = spark.read.jdbc(url, "public.bus_trip_snapshot_staging", properties=props)
+    dur_min = (F.unix_timestamp("trip_end") - F.unix_timestamp("trip_start")) / 60.0
+    agg = (
+        snap.filter(F.col("route_id").isNotNull())
+        .withColumn("sched_dur_min", F.when(dur_min > 0, dur_min).otherwise(F.lit(45.0)))
+        .groupBy("route_id")
+        .agg(
+            F.first("trip_headsign", ignorenulls=True).alias("route_long_name"),
+            F.countDistinct("trip_id").cast("int").alias("trips_Observed"),
+            F.expr("percentile_approx(sched_dur_min, 0.5)").cast("double").alias("median_scheduled_duration_min"),
+        )
+        .select(
+            F.col("route_id"),
+            F.col("route_id").alias("route_short_name"),
+            F.coalesce(F.col("route_long_name"), F.col("route_id")).alias("route_long_name"),
+            F.lit(3).cast("int").alias("route_type"),
+            F.greatest(F.lit(20), F.col("trips_Observed") * 12).cast("int").alias("trips_total"),
+            F.lit(15.0).cast("double").alias("median_headway_min"),
+            F.coalesce(F.col("median_scheduled_duration_min"), F.lit(45.0)).cast("double").alias("median_scheduled_duration_min"),
+            F.lit(28).cast("int").alias("n_stops"),
+        )
+    )
+    write_jdbc(agg, "wmata", "public.route_stats_staging")
+
+
 def route_stats(spark: SparkSession) -> None:
+    global _GTFS_STATE
+    if _GTFS_STATE == "loaded":
+        return
+    if _GTFS_STATE == "missing":
+        _route_stats_from_staging(spark)
+        return
+
     client = s3()
     try:
         body = client.get_object(Bucket="wmata", Key=GTFS_ZIP)["Body"].read()
     except Exception as exc:  # noqa: BLE001 - derive fallback route_stats from staging snapshots
         print(f"WARN GTFS zip unavailable ({exc}); deriving route_stats from staging snapshots", flush=True)
-        url = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/wmata"
-        props = {
-            "user": PG_USER,
-            "password": PG_PASSWORD,
-            "driver": "org.postgresql.Driver",
-        }
-        snap = spark.read.jdbc(url, "public.bus_trip_snapshot_staging", properties=props)
-        dur_min = (F.unix_timestamp("trip_end") - F.unix_timestamp("trip_start")) / 60.0
-        agg = (
-            snap.filter(F.col("route_id").isNotNull())
-            .withColumn("sched_dur_min", F.when(dur_min > 0, dur_min).otherwise(F.lit(45.0)))
-            .groupBy("route_id")
-            .agg(
-                F.first("trip_headsign", ignorenulls=True).alias("route_long_name"),
-                F.countDistinct("trip_id").cast("int").alias("trips_Observed"),
-                F.expr("percentile_approx(sched_dur_min, 0.5)").cast("double").alias("median_scheduled_duration_min"),
-            )
-            .select(
-                F.col("route_id"),
-                F.col("route_id").alias("route_short_name"),
-                F.coalesce(F.col("route_long_name"), F.col("route_id")).alias("route_long_name"),
-                F.lit(3).cast("int").alias("route_type"),
-                F.greatest(F.lit(20), F.col("trips_Observed") * 12).cast("int").alias("trips_total"),
-                F.lit(15.0).cast("double").alias("median_headway_min"),
-                F.coalesce(F.col("median_scheduled_duration_min"), F.lit(45.0)).cast("double").alias("median_scheduled_duration_min"),
-                F.lit(28).cast("int").alias("n_stops"),
-            )
-        )
-        write_jdbc(agg, "wmata", "public.route_stats_staging")
+        _GTFS_STATE = "missing"
+        _route_stats_from_staging(spark)
         return
     zf = zipfile.ZipFile(io.BytesIO(body))
 
@@ -286,6 +323,7 @@ def route_stats(spark: SparkSession) -> None:
 
     df = spark.createDataFrame(rows)
     write_jdbc(df, "wmata", "public.route_stats_staging")
+    _GTFS_STATE = "loaded"
     print(f"silver route_stats_staging rows={len(rows):,}", flush=True)
 
 
@@ -574,6 +612,32 @@ def silver_tomtom_incidents(spark: SparkSession, keys: list[str]) -> None:
     print("silver tomtom_traffic_incident_staging written", flush=True)
 
 
+def process_manifest(spark: SparkSession, manifest: dict) -> dict[str, int]:
+    """Process one bronze batch manifest using an existing SparkSession."""
+    wmata_keys = [x["s3_key"] for x in manifest.get("wmata", []) if x.get("s3_key")]
+    traffic_keys = [x["s3_key"] for x in manifest.get("traffic", []) if x.get("s3_key")]
+    ddot_keys = [k for k in traffic_keys if k.startswith("ddot/")]
+    tomtom_flow_keys = [k for k in traffic_keys if k.startswith("tomtom/flow/")]
+    tomtom_incident_keys = [k for k in traffic_keys if k.startswith("tomtom/incidents/")]
+
+    if wmata_keys:
+        silver_wmata(spark, wmata_keys)
+        route_stats(spark)
+    if ddot_keys:
+        silver_ddot(spark, ddot_keys)
+    if tomtom_flow_keys:
+        silver_tomtom_flow(spark, tomtom_flow_keys)
+    if tomtom_incident_keys:
+        silver_tomtom_incidents(spark, tomtom_incident_keys)
+
+    return {
+        "wmata_files": len(wmata_keys),
+        "ddot_files": len(ddot_keys),
+        "tomtom_flow_files": len(tomtom_flow_keys),
+        "tomtom_incident_files": len(tomtom_incident_keys),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
@@ -583,29 +647,14 @@ def main() -> None:
 
     spark = (
         SparkSession.builder.appName("wmata-bronze-to-silver")
-        .config("spark.sql.shuffle.partitions", "32")
+        .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "16"))
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
-
-    wmata_keys = [x["s3_key"] for x in manifest.get("wmata", [])]
-    traffic_keys = [x["s3_key"] for x in manifest.get("traffic", [])]
-
-    if wmata_keys:
-        silver_wmata(spark, wmata_keys)
-        route_stats(spark)
-    if traffic_keys:
-        ddot_keys = [k for k in traffic_keys if k.startswith("ddot/")]
-        tomtom_flow_keys = [k for k in traffic_keys if k.startswith("tomtom/flow/")]
-        tomtom_incident_keys = [k for k in traffic_keys if k.startswith("tomtom/incidents/")]
-        if ddot_keys:
-            silver_ddot(spark, ddot_keys)
-        if tomtom_flow_keys:
-            silver_tomtom_flow(spark, tomtom_flow_keys)
-        if tomtom_incident_keys:
-            silver_tomtom_incidents(spark, tomtom_incident_keys)
-
-    spark.stop()
+    try:
+        process_manifest(spark, manifest)
+    finally:
+        spark.stop()
 
 
 if __name__ == "__main__":

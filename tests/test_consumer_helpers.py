@@ -1,11 +1,33 @@
+import asyncio
 import gzip
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from consumer.bronze_consumer import dedup_key, event_etag, s3_key_of, wanted
+from consumer.bronze_consumer import (
+    SparkRunner,
+    build_dlq_payload,
+    build_tombstone_payload,
+    collect,
+    dedup_key,
+    ensure_pyspark_paths,
+    event_etag,
+    extract_event_time,
+    handle_batch_failure,
+    is_delete_event,
+    is_late_event,
+    is_live_stream_event,
+    load_consumer_state,
+    prune_dedup_keys,
+    run_batch_persistent,
+    s3_key_of,
+    save_consumer_state,
+    wanted,
+)
+from ml.stream_inference import match_future_observations
+from tools.replay_dlq import build_replay_envelope, matches_filter
 from dlt.poll_tomtom_traffic import (
     DEFAULT_CORRIDORS,
     _DETECTED_MODE_CACHE,
@@ -343,6 +365,329 @@ class ConsumerHelpersTest(unittest.TestCase):
                 )
                 self.assertEqual(res2["status"], "move_ready")
                 self.assertEqual(res2["flow_records"], 0)
+
+    def test_watermark_allowed_lateness_and_live_scope(self):
+        wm = datetime(2026, 11, 22, 18, 0, 0, tzinfo=timezone.utc)
+        on_time = wm - timedelta(minutes=5)
+        too_late = wm - timedelta(minutes=25)
+        self.assertFalse(is_late_event(on_time, wm, allowed_lateness_min=20))
+        self.assertTrue(is_late_event(too_late, wm, allowed_lateness_min=20))
+        self.assertFalse(is_late_event(too_late, None, allowed_lateness_min=20))
+
+        # Historical 2020 & explicit replay/backfill bypass live watermark rejection
+        self.assertTrue(is_live_stream_event("wmata", "bronze_2026/bus_positions/a.jsonl.gz", {"source": "seaweedfs"}))
+        self.assertFalse(is_live_stream_event("wmata", "bronze_2020/bus_positions/a.jsonl.gz", {"source": "seaweedfs"}))
+        self.assertFalse(is_live_stream_event("wmata", "bronze_2026/bus_positions/a.jsonl.gz", {"source": "replay"}))
+        self.assertTrue(is_live_stream_event("traffic", "tomtom/flow/date=2026-11-22/f.jsonl.gz", {}))
+
+    def test_delete_tombstone_detection_and_payload(self):
+        ev_del = {
+            "event_type": "delete",
+            "s3_key": "bronze_2026/bus_positions/x.jsonl.gz",
+            "etag": "e1",
+            "event_time": "2026-11-22T18:00:00+00:00",
+        }
+        ev_old_only = {"message": {"old_entry": {"attributes": {"md5": "e2"}}}}
+        ev_create = {"event_type": "create", "message": {"new_entry": {"attributes": {"md5": "e3"}}}}
+        self.assertTrue(is_delete_event(ev_del))
+        self.assertTrue(is_delete_event(ev_old_only))
+        self.assertFalse(is_delete_event(ev_create))
+        tomb = build_tombstone_payload("wmata", "bronze_2026/bus_positions/x.jsonl.gz", ev_del)
+        self.assertEqual(tomb["bucket"], "wmata")
+        self.assertEqual(tomb["etag"], "e1")
+        self.assertEqual(extract_event_time(ev_del), datetime(2026, 11, 22, 18, 0, tzinfo=timezone.utc))
+
+    def test_dedup_state_ttl_pruning_and_legacy_migration(self):
+        now_ts = 1_800_000_000.0
+        pruned = prune_dedup_keys(
+            {"fresh": now_ts - 60, "stale": now_ts - (80 * 3600)},
+            now_ts=now_ts,
+            ttl_hours=72,
+            max_keys=10,
+        )
+        self.assertIn("fresh", pruned)
+        self.assertNotIn("stale", pruned)
+
+        # Max-keys cap keeps newest entries
+        many = {f"k{i}": now_ts - (100 - i) for i in range(10)}
+        capped = prune_dedup_keys(many, now_ts=now_ts, ttl_hours=72, max_keys=3)
+        self.assertEqual(set(capped.keys()), {"k7", "k8", "k9"})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            st_path = f"{tmpdir}/state.json"
+            with open(st_path, "w", encoding="utf-8") as fh:
+                json.dump({"keys": ["wmata|a|e1", "wmata|b|e2"]}, fh)
+            loaded = load_consumer_state(st_path)
+            self.assertIn("wmata|a|e1", loaded["keys"])
+            loaded["watermarks"]["wmata"] = "2026-11-22T18:00:00+00:00"
+            save_consumer_state(loaded, st_path)
+            reloaded = load_consumer_state(st_path)
+            self.assertEqual(reloaded["watermarks"]["wmata"], "2026-11-22T18:00:00+00:00")
+
+    def test_collect_routes_malformed_late_and_delete_events(self):
+        async def _run():
+            js = AsyncMock()
+            malformed = MagicMock(data=b"{bad json", metadata=MagicMock(num_delivered=1))
+            malformed.ack = AsyncMock()
+            malformed.nak = AsyncMock()
+
+            late_ev = {
+                "bucket": "wmata",
+                "s3_key": "bronze_2026/bus_positions/old.jsonl.gz",
+                "etag": "etag_old",
+                "event_type": "create",
+                "event_time": "2026-11-22T17:00:00+00:00",
+                "source": "seaweedfs",
+            }
+            late_msg = MagicMock(data=json.dumps(late_ev).encode(), metadata=MagicMock(num_delivered=1))
+            late_msg.ack = AsyncMock()
+            late_msg.nak = AsyncMock()
+
+            del_ev = {
+                "bucket": "wmata",
+                "s3_key": "bronze_2026/bus_positions/del.jsonl.gz",
+                "etag": "etag_del",
+                "event_type": "delete",
+                "event_time": "2026-11-22T18:05:00+00:00",
+            }
+            del_msg = MagicMock(data=json.dumps(del_ev).encode(), metadata=MagicMock(num_delivered=1))
+            del_msg.ack = AsyncMock()
+            del_msg.nak = AsyncMock()
+
+            sub = MagicMock()
+            sub.fetch = AsyncMock(side_effect=[[malformed, late_msg, del_msg], asyncio.TimeoutError()])
+            batch = []
+            with patch("consumer.bronze_consumer.vm_metrics", None):
+                await collect(
+                    js,
+                    sub,
+                    "wmata",
+                    state_keys={},
+                    batch=batch,
+                    seen=set(),
+                    watermarks={"wmata": "2026-11-22T18:00:00+00:00"},
+                )
+            self.assertEqual(len(batch), 0)
+            malformed.ack.assert_awaited_once()
+            late_msg.ack.assert_awaited_once()
+            del_msg.ack.assert_awaited_once()
+            published_subjects = [call.args[0] for call in js.publish.call_args_list]
+            self.assertIn("wmata.dlq.malformed_json", published_subjects)
+            self.assertIn("wmata.dlq.late_event", published_subjects)
+            self.assertIn("realtime.tombstone.wmata", published_subjects)
+
+        asyncio.run(_run())
+
+    def test_poison_pill_routed_to_dlq_on_max_deliver(self):
+        async def _run():
+            js = AsyncMock()
+            poison_msg = MagicMock()
+            poison_msg.ack = AsyncMock()
+            poison_msg.nak = AsyncMock()
+
+            retry_msg = MagicMock()
+            retry_msg.ack = AsyncMock()
+            retry_msg.nak = AsyncMock()
+
+            batch = [
+                {"bucket": "wmata", "s3_key": "bronze_2026/bus_positions/bad.jsonl.gz", "delivery_count": 3, "event": {"s3_key": "bronze_2026/bus_positions/bad.jsonl.gz"}, "msg": poison_msg},
+                {"bucket": "wmata", "s3_key": "bronze_2026/bus_positions/ok.jsonl.gz", "delivery_count": 1, "event": {"s3_key": "bronze_2026/bus_positions/ok.jsonl.gz"}, "msg": retry_msg},
+            ]
+            with patch("consumer.bronze_consumer.vm_metrics", None):
+                dlq_n, retry_n = await handle_batch_failure(js, batch, "Spark exit 1", max_deliver=3, backoff=10)
+            self.assertEqual((dlq_n, retry_n), (1, 1))
+            poison_msg.ack.assert_awaited_once()
+            poison_msg.nak.assert_not_awaited()
+            retry_msg.nak.assert_awaited_once()
+            retry_msg.ack.assert_not_awaited()
+            self.assertEqual(js.publish.call_args_list[0].args[0], "wmata.dlq.max_deliver_exceeded")
+
+        asyncio.run(_run())
+
+    def test_dlq_replay_envelope_and_filter(self):
+        dlq_rec = build_dlq_payload(
+            bucket="wmata",
+            reason="late_event",
+            event={"bucket": "wmata", "s3_key": "bronze_2026/bus_positions/x.jsonl.gz", "etag": "e9"},
+            delivery_count=1,
+            error="too late",
+        )
+        self.assertTrue(matches_filter(dlq_rec, bucket="wmata", reason="late_event"))
+        self.assertFalse(matches_filter(dlq_rec, bucket="traffic", reason="late_event"))
+        subject, replay_ev = build_replay_envelope(dlq_rec)
+        self.assertEqual(subject, "wmata.realtime.bronze_data")
+        self.assertEqual(replay_ev["source"], "replay")
+        self.assertEqual(replay_ev["s3_key"], "bronze_2026/bus_positions/x.jsonl.gz")
+
+    def test_match_future_observations_15m_ground_truth(self):
+        t0 = datetime(2026, 11, 22, 17, 0, 0, tzinfo=timezone.utc)
+        preds = [
+            {
+                "input_record_id": "t1|ts0",
+                "model_version": "v1",
+                "trip_key": "TRIP-1",
+                "snapshot_ts": t0,
+                "predicted_delay_min": 4.0,
+            },
+            {
+                "input_record_id": "t2|ts0",
+                "model_version": "v1",
+                "trip_key": "TRIP-2",
+                "snapshot_ts": t0,
+                "predicted_delay_min": 2.0,
+            },
+        ]
+        snaps = [
+            # Too early (+10m) — ignored
+            {"trip_key": "TRIP-1", "snapshot_ts": t0 + timedelta(minutes=10), "deviation_min": 1.0},
+            # Inside 14-16m window (+14.5m and +15.5m) — averaged -> (6.0 + 8.0)/2 = 7.0
+            {"trip_key": "TRIP-1", "snapshot_ts": t0 + timedelta(minutes=14, seconds=30), "deviation_min": 6.0},
+            {"trip_key": "TRIP-1", "snapshot_ts": t0 + timedelta(minutes=15, seconds=30), "deviation_min": 8.0},
+            # Too late (+20m) — ignored
+            {"trip_key": "TRIP-1", "snapshot_ts": t0 + timedelta(minutes=20), "deviation_min": 20.0},
+            # TRIP-2 only has +5m obs — no match yet
+            {"trip_key": "TRIP-2", "snapshot_ts": t0 + timedelta(minutes=5), "deviation_min": 2.5},
+        ]
+        matched = match_future_observations(preds, snaps)
+        self.assertEqual(len(matched), 1)
+        m = matched[0]
+        self.assertEqual(m["trip_key"], "TRIP-1")
+        self.assertAlmostEqual(m["actual_delay_min"], 7.0)
+        self.assertAlmostEqual(m["abs_error"], 3.0)
+        self.assertEqual(m["actual_late"], 1)
+
+    def test_ensure_pyspark_paths_adds_spark_python_py4j_and_jobs_dir(self):
+        import os
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spark_home = Path(tmpdir) / "spark"
+            py_lib = spark_home / "python" / "lib"
+            py_lib.mkdir(parents=True)
+            py4j_zip = py_lib / "py4j-0.10.9.9-src.zip"
+            py4j_zip.write_bytes(b"PK")
+            jobs_dir = spark_home / "jobs"
+            jobs_dir.mkdir(parents=True)
+            job_file = jobs_dir / "bronze_to_silver.py"
+            job_file.write_text("# stub\n", encoding="utf-8")
+
+            fake_sys_path = ["/usr/lib/python3"]
+            fake_env: dict[str, str] = {}
+            with (
+                patch("consumer.bronze_consumer.sys.path", fake_sys_path),
+                patch.dict(os.environ, fake_env, clear=True),
+            ):
+                added = ensure_pyspark_paths(
+                    spark_home=str(spark_home),
+                    spark_job=str(job_file),
+                    master="spark://spark-master:7077",
+                    driver_memory="1g",
+                    cores_max="2",
+                    configure_env=True,
+                )
+                self.assertIn(str(spark_home / "python"), fake_sys_path)
+                self.assertIn(str(py4j_zip), fake_sys_path)
+                self.assertIn(str(jobs_dir), fake_sys_path)
+                self.assertEqual(len(added), 3)
+                self.assertIn("--master spark://spark-master:7077", os.environ["PYSPARK_SUBMIT_ARGS"])
+                self.assertIn("--driver-memory 1g", os.environ["PYSPARK_SUBMIT_ARGS"])
+                self.assertIn("spark.cores.max=2", os.environ["PYSPARK_SUBMIT_ARGS"])
+                self.assertTrue(os.environ["PYSPARK_SUBMIT_ARGS"].endswith("pyspark-shell"))
+
+    def test_spark_runner_reuses_persistent_session_across_batches(self):
+        def make_fake_spark(stopped: bool = False):
+            spark = MagicMock()
+            spark.sparkContext._jsc.sc.return_value.isStopped.return_value = stopped
+            return spark
+
+        fake_spark = make_fake_spark(stopped=False)
+        factory = MagicMock(return_value=fake_spark)
+        processor = MagicMock(return_value={"wmata_files": 1})
+
+        runner = SparkRunner(session_factory=factory, manifest_processor=processor)
+        res1 = runner.run_manifest({"wmata": [{"s3_key": "a.jsonl.gz"}], "traffic": []})
+        res2 = runner.run_manifest({"wmata": [{"s3_key": "b.jsonl.gz"}], "traffic": []})
+
+        self.assertEqual(res1["wmata_files"], 1)
+        self.assertEqual(res2["wmata_files"], 1)
+        self.assertEqual(factory.call_count, 1)
+        self.assertEqual(processor.call_count, 2)
+        self.assertIs(processor.call_args_list[0].args[0], fake_spark)
+        self.assertIs(processor.call_args_list[1].args[0], fake_spark)
+
+        runner.stop()
+        fake_spark.stop.assert_called_once()
+        self.assertFalse(runner.is_alive())
+
+    def test_spark_runner_recovers_only_on_fatal_error_and_keeps_warm_on_transient(self):
+        def make_fake_spark(stopped: bool = False):
+            spark = MagicMock()
+            spark.sparkContext._jsc.sc.return_value.isStopped.return_value = stopped
+            return spark
+
+        s1 = make_fake_spark(stopped=False)
+        s2 = make_fake_spark(stopped=False)
+        factory = MagicMock(side_effect=[s1, s2])
+        processor = MagicMock(
+            side_effect=[
+                RuntimeError("Transient JDBC timeout"),
+                RuntimeError("Cannot call methods on a stopped SparkContext"),
+                {"wmata_files": 2},
+            ]
+        )
+        runner = SparkRunner(session_factory=factory, manifest_processor=processor)
+
+        # Transient error while SparkContext is alive keeps s1 warm
+        with self.assertRaises(RuntimeError):
+            runner.run_manifest({"wmata": [], "traffic": []})
+        self.assertTrue(runner.is_alive())
+        s1.stop.assert_not_called()
+
+        # Fatal SparkContext error resets s1
+        with self.assertRaises(RuntimeError):
+            runner.run_manifest({"wmata": [], "traffic": []})
+        self.assertFalse(runner.is_alive())
+        s1.stop.assert_called_once()
+
+        # Next batch automatically creates s2 and succeeds
+        res = runner.run_manifest({"wmata": [{"s3_key": "c.jsonl.gz"}], "traffic": []})
+        self.assertEqual(res["wmata_files"], 2)
+        self.assertEqual(factory.call_count, 2)
+        self.assertIs(processor.call_args_list[2].args[0], s2)
+
+    def test_run_batch_persistent_executes_truncate_spark_merge_in_order(self):
+        order: list[str] = []
+
+        class FakeMerger:
+            def truncate_all(self):
+                order.append("truncate")
+                return {"wmata": 2, "traffic": 5}
+
+            def merge_all(self, run_id=None):
+                order.append(f"merge:{run_id}")
+                return {"wmata.bus_trip_snapshot": {"staged": 10, "merged": 10}}
+
+        def fake_proc(spark, manifest):
+            order.append(f"spark:{len(manifest['wmata'])}")
+            return {"wmata_files": len(manifest["wmata"])}
+
+        fake_spark = MagicMock()
+        fake_spark.sparkContext._jsc.sc.return_value.isStopped.return_value = False
+        runner = SparkRunner(
+            session_factory=lambda: fake_spark,
+            manifest_processor=fake_proc,
+        )
+        out = asyncio.run(
+            run_batch_persistent(
+                runner,
+                {"wmata": [{"s3_key": "a.jsonl.gz"}], "traffic": []},
+                run_id="run-42",
+                merger=FakeMerger(),
+            )
+        )
+        self.assertEqual(order, ["truncate", "spark:1", "merge:run-42"])
+        self.assertEqual(out["spark"]["wmata_files"], 1)
+        self.assertEqual(out["merge"]["wmata.bus_trip_snapshot"]["merged"], 10)
 
 
 if __name__ == "__main__":
