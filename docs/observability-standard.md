@@ -1,6 +1,6 @@
 # Standar Observability: Log, Metrik & Healthcheck
 
-Dokumen ini adalah kontrak bersama seluruh tim (`late-bus-prediction`) agar log, metrik, dan healthcheck dari setiap komponen (ingestion, batch/dbt, MLflow/inference, API/serving, infra) seragam dan dapat ditelusuri di **VictoriaMetrics**, **VictoriaLogs**, dan **React Monitoring Dashboard**.
+Dokumen ini adalah kontrak bersama seluruh tim (`late-bus-prediction`) agar log, metrik, dan healthcheck dari setiap komponen (ingestion, streaming, batch/Spark, MLflow/inference, serving API, infra) seragam dan dapat ditelusuri di **VictoriaMetrics**, **VictoriaLogs**, dan **MetroPulse DC Monitoring Dashboard** (`/pipeline`).
 
 ---
 
@@ -8,15 +8,26 @@ Dokumen ini adalah kontrak bersama seluruh tim (`late-bus-prediction`) agar log,
 
 Seluruh service dan pipeline Python **wajib** memakai `shared.logging.setup_json_logging(service)` dan menyertakan `run_id` di setiap eksekusi job, consumer batch, atau request.
 
+### Daftar Nama `service` Kanonik
+
+| Kategori | Nama `service` | Deskripsi | Format Asli |
+|---|---|---|---|
+| Ingestion | `wmata-poller`, `tomtom-poller`, `dlt-wmata-2020` | Poller live WMATA/TomTom & arsip 2020 | JSON (`shared.logging`) |
+| Streaming | `seaweedfs-bridge`, `bronze-consumer` | Bridge webhook S3 -> NATS & NATS -> Silver | JSON (`shared.logging`) |
+| ML & Serving | `stream-inference`, `serving-api`, `dagster-etl` | Real-time scoring, FastAPI & Dagster | JSON (`shared.logging`) |
+| Ops | `health-monitor` | Probe kesehatan service & relay Telegram | JSON (`shared.logging`) |
+| Infra & DB | `postgres-infra`, `spock-silver-1`, `spock-silver-2`, `spock-gold-1`, `spock-gold-2`, `haproxy`, `nats`, `seaweedfs`, `debezium-wmata`, `debezium-traffic`, `spark-master`, `spark-worker`, `trino`, `mlflow`, `vector`, `victoriametrics`, `victorialogs`, `vmalert`, `postgres-exporter-*`, `nats-exporter`, `cadvisor` | Container infrastruktur & exporter | Text / Logfmt / JSON (dinormalisasi Vector) |
+
 ### Skema Field JSON
 
 | Field | Wajib? | Tipe | Keterangan |
 |---|---|---|---|
 | `timestamp` | Wajib | ISO-8601 UTC | Waktu log dibuat (contoh: `2026-11-15T07:30:00.123456+00:00`) |
 | `level` | Wajib | String | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
-| `service` | Wajib | String | Nama layanan/komponen (mis. `dlt-wmata`, `dagster-etl`, `inference`, `api`, `health-monitor`) |
-| `run_id` | Wajib | String | ID unik per eksekusi job/request (otomatis dari `new_run_id()` atau `run_context()`) |
+| `service` | Wajib | String | Nama layanan/komponen sesuai tabel di atas |
+| `run_id` | Wajib | String | ID unik per eksekusi job/request (otomatis dari `new_run_id()` atau `run_context()`, atau `unassigned` untuk log infra/startup) |
 | `message` | Wajib | String | Pesan singkat dan jelas |
+| `log_format` | Otomatis (Vector) | String | `json` (aplikasi terstruktur) atau `text` (plain-text / logfmt infra) |
 | `domain` | Opsional | String | `wmata`, `traffic`, atau `infra` |
 | `layer` | Opsional | String | `bronze`, `silver`, `gold`, `serving`, atau `ops` |
 | `job` | Opsional | String | Nama job/asset/endpoint |
@@ -25,13 +36,20 @@ Seluruh service dan pipeline Python **wajib** memakai `shared.logging.setup_json
 | `error_type` | Opsional | String | Nama kelas exception saat gagal |
 | `exception` | Opsional | String | Stack trace jika terjadi exception |
 
+### Kebijakan Klasifikasi Log Non-JSON (Vector VRL)
+
+Service infrastruktur (PostgreSQL, Go exporters, Java/Debezium/Spark/Trino, HAProxy, NATS) yang tidak memancarkan JSON `shared.logging` tetap masuk ke **VictoriaLogs** melalui `configs/vector/vector.yaml` dengan aturan:
+- `service` dinormalisasi dari label Docker Compose `com.docker.compose.service`.
+- `level` dideteksi otomatis ke `CRITICAL` (`FATAL`/`PANIC`), `ERROR` (`level=ERROR`, `[ERROR]`, `ERROR:`, `Traceback`, `Exception`), `WARNING` (`WARN`/`WARNING`), `DEBUG` (`DEBUG`), atau fallback `INFO`.
+- Jika `run_id` tidak ada, diisi `unassigned`.
+
 ### Contoh Pemakaian di Python
 
 ```python
 from shared.logging import setup_json_logging, run_context
 import logging
 
-setup_json_logging("dlt-wmata")
+setup_json_logging("wmata-poller")
 log = logging.getLogger(__name__)
 
 with run_context("ingest"):
@@ -79,7 +97,7 @@ with track_job(service="dagster-etl", job="silver_wmata_bus", domain="wmata", la
 
 ## 3. Kontrak `/health` dan `healthcheck` Compose
 
-Setiap layanan HTTP baru (`api`, `inference`, `dashboard-backend`, `bridge`, `monitor`) **wajib** menyediakan endpoint:
+Setiap layanan HTTP (`serving-api`, `seaweedfs-bridge`, `health-monitor`) **wajib** menyediakan endpoint:
 
 - `GET /health`
 - HTTP `200` saat sehat, `503` saat dependensi kritis gagal.

@@ -15,12 +15,17 @@ transforms:
     inputs: [docker_logs]
     source: |
       raw_msg = string(.message) ?? ""
+      compose_svc = string(get!(., ["label", "com.docker.compose.service"])) ?? ""
+      fallback_svc = if compose_svc != "" { compose_svc } else { string(.container_name) ?? "unknown" }
+
       parsed, err = parse_json(raw_msg)
       if err == null && is_object(parsed) {
-        if exists(parsed.timestamp) { .timestamp = parsed.timestamp }
-        if exists(parsed.level) { .level = upcase(string!(parsed.level)) }
-        if exists(parsed.service) { .service = parsed.service }
-        if exists(parsed.run_id) { .run_id = parsed.run_id }
+        .log_format = "json"
+        if exists(parsed.timestamp) { .timestamp = parsed.timestamp } else if exists(parsed.ts) { .timestamp = parsed.ts }
+        raw_lvl = upcase(string(parsed.level) ?? string(parsed.lvl) ?? "INFO")
+        .level = if raw_lvl == "WARN" { "WARNING" } else if raw_lvl == "ERR" { "ERROR" } else if raw_lvl == "FATAL" || raw_lvl == "PANIC" { "CRITICAL" } else { raw_lvl }
+        .service = string(parsed.service) ?? fallback_svc
+        .run_id = string(parsed.run_id) ?? "unassigned"
         if exists(parsed.domain) { .domain = parsed.domain }
         if exists(parsed.layer) { .layer = parsed.layer }
         if exists(parsed.job) { .job = parsed.job }
@@ -28,11 +33,25 @@ transforms:
         if exists(parsed.row_count) { .row_count = parsed.row_count }
         if exists(parsed.error_type) { .error_type = parsed.error_type }
         if exists(parsed.exception) { .exception = parsed.exception }
-        if exists(parsed.message) { .message = string!(parsed.message) }
+        if exists(parsed.error) && !exists(.error_type) { .error_type = string(parsed.error) ?? "" }
+        if exists(parsed.message) { .message = string!(parsed.message) } else if exists(parsed.msg) { .message = string!(parsed.msg) }
       } else {
-        if !exists(.level) { .level = "INFO" }
-        if !exists(.service) { .service = .container_name }
+        .log_format = "text"
+        .service = fallback_svc
         if !exists(.run_id) { .run_id = "unassigned" }
+        if raw_msg == "" { .message = " " }
+        upper = upcase(raw_msg)
+        if contains(upper, "FATAL") || contains(upper, "CRITICAL") || contains(upper, "PANIC") {
+          .level = "CRITICAL"
+        } else if contains(upper, "LEVEL=ERROR") || contains(upper, "[ERROR]") || contains(upper, " ERROR ") || starts_with(upper, "ERROR") || contains(upper, "TRACEBACK") || contains(upper, "EXCEPTION") || contains(upper, "BATCH FAILED") {
+          .level = "ERROR"
+        } else if contains(upper, "LEVEL=WARN") || contains(upper, "[WARN") || contains(upper, " WARN ") || contains(upper, "WARNING") || starts_with(upper, "WARN") {
+          .level = "WARNING"
+        } else if contains(upper, "LEVEL=DEBUG") || contains(upper, "[DEBUG]") || contains(upper, " DEBUG ") {
+          .level = "DEBUG"
+        } else if !exists(.level) {
+          .level = "INFO"
+        }
       }
 
 sinks:

@@ -13,17 +13,32 @@ def test_run_checks_and_render_prometheus_metrics():
     with (
         patch("monitor.health_monitor._tcp_ok", return_value=True),
         patch("monitor.health_monitor._http_ok", return_value=True),
+        patch("monitor.health_monitor._heartbeat_ok", return_value=True),
+        patch("monitor.health_monitor._cadvisor_up", return_value=True),
     ):
         results = health_monitor.run_checks()
 
-    assert "postgres-infra" in results
-    assert "mlflow" in results
-    assert "vector" in results
+    for expected in (
+        "postgres-infra",
+        "mlflow",
+        "vector",
+        "serving-api",
+        "vmalert",
+        "spark-master",
+        "spark-worker",
+        "dagster-user-code",
+        "consumer",
+        "wmata-poller",
+        "tomtom-poller",
+        "stream-inference",
+    ):
+        assert expected in results
     assert all(item["up"] is True for item in results.values())
 
     metrics_text = health_monitor.render_prometheus_metrics()
     assert 'wmata_service_up{service="mlflow"} 1' in metrics_text
-    assert 'wmata_service_up{service="nats"} 1' in metrics_text
+    assert 'wmata_service_up{service="serving-api"} 1' in metrics_text
+    assert 'wmata_service_up{service="consumer"} 1' in metrics_text
     assert "wmata_host_cpu_percent" in metrics_text
 
 
@@ -103,3 +118,22 @@ def test_build_monitoring_summary_and_query_logs():
     assert logs["logs"][0]["run_id"] == "run-123"
     assert 'service:"health-monitor"' in logs["query"]
     assert 'run_id:"run-123"' in logs["query"]
+
+
+def test_heartbeat_and_cadvisor_probes(tmp_path, monkeypatch):
+    hb = tmp_path / "hb"
+    hb.write_text('{"status":"ok"}', encoding="utf-8")
+    assert health_monitor._heartbeat_ok(str(hb), max_age_s=60) is True
+    assert health_monitor._heartbeat_ok(str(tmp_path / "missing"), max_age_s=60) is False
+
+    with patch("monitor.health_monitor._query_vm", return_value=[{"labels": {}, "value": 15.0}]):
+        assert health_monitor._cadvisor_up("stream-inference", max_age_s=120) is True
+    with patch("monitor.health_monitor._query_vm", return_value=[{"labels": {}, "value": 250.0}]):
+        assert health_monitor._cadvisor_up("stream-inference", max_age_s=120) is False
+
+    monkeypatch.delenv("TELEGRAM_BOT_API_KEY", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    assert health_monitor._telegram_configured() is False
+    monkeypatch.setenv("TELEGRAM_BOT_API_KEY", "bot-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+    assert health_monitor._telegram_configured() is True
