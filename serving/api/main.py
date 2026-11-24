@@ -6,10 +6,23 @@ import json
 import logging
 import math
 import os
+import sys
+import time
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+
+for _cand in (*(str(p) for p in Path(__file__).resolve().parents), "/opt/platform", "/app"):
+    if _cand not in sys.path:
+        sys.path.insert(0, _cand)
+
+try:
+    from shared.logging import run_context, setup_json_logging
+except ImportError:  # pragma: no cover
+    run_context = None  # type: ignore[assignment]
+    setup_json_logging = None  # type: ignore[assignment]
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +37,9 @@ try:
 except ImportError:  # pragma: no cover - optional for offline tests
     nats = None  # type: ignore[assignment]
 
+_LOG_LEVEL = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+if setup_json_logging is not None:
+    setup_json_logging("serving-api", level=_LOG_LEVEL)
 logger = logging.getLogger("serving-api")
 
 GOLD_HOST = os.environ.get("POSTGRES_GOLD_HOST", "haproxy")
@@ -42,6 +58,9 @@ SILVER_PASSWORD = os.environ.get("POSTGRES_SILVER_PASSWORD", "postgres")
 NATS_URL = os.environ.get("NATS_URL", "nats://nats:4222")
 NATS_MON_URL = os.environ.get("NATS_MON_URL", "http://nats:8222")
 MONITOR_URL = os.environ.get("MONITOR_URL", "http://monitor:8090")
+VM_URL = os.environ.get("VM_URL", "http://victoriametrics:8428")
+VL_URL = os.environ.get("VL_URL", "http://victorialogs:9428")
+VMALERT_URL = os.environ.get("VMALERT_URL", "http://vmalert:8880")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 _SSE_SUBSCRIBERS: set[asyncio.Queue[dict[str, Any]]] = set()
@@ -123,6 +142,13 @@ async def _nats_bridge_loop(stop_event: asyncio.Event) -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if setup_json_logging is not None:
+        setup_json_logging("serving-api", level=_LOG_LEVEL)
+        for uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            uv_log = logging.getLogger(uv_name)
+            uv_log.handlers.clear()
+            uv_log.propagate = True
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     stop_event = asyncio.Event()
     task = asyncio.create_task(_nats_bridge_loop(stop_event))
     try:
@@ -171,6 +197,52 @@ app = FastAPI(
     description="Read-only serving API over the WMATA gold marts with real-time NATS SSE push.",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def json_request_logging(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/static") or path == "/bus-logo.jpg":
+        return await call_next(request)
+    ctx = run_context("api") if run_context is not None else contextlib.nullcontext("unassigned")
+    t0 = time.monotonic()
+    with ctx:
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            dur_ms = round((time.monotonic() - t0) * 1000, 2)
+            logger.exception(
+                "%s %s failed",
+                request.method,
+                path,
+                extra={
+                    "domain": "wmata",
+                    "layer": "serving",
+                    "job": path,
+                    "duration_ms": dur_ms,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
+        dur_ms = round((time.monotonic() - t0) * 1000, 2)
+        if path != "/health":
+            lvl = logging.ERROR if response.status_code >= 500 else logging.WARNING if response.status_code >= 400 else logging.INFO
+            logger.log(
+                lvl,
+                "%s %s -> %s",
+                request.method,
+                path,
+                response.status_code,
+                extra={
+                    "domain": "wmata",
+                    "layer": "serving",
+                    "job": path,
+                    "duration_ms": dur_ms,
+                },
+            )
+        return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1277,6 +1349,8 @@ def stream_status(conn=Depends(get_conn)):
             else:
                 r["duration_sec"] = None
     except Exception:  # noqa: BLE001
+        with contextlib.suppress(Exception):
+            conn.rollback()
         runs = []
 
     counts: dict[str, int] = {}
@@ -1294,7 +1368,8 @@ def stream_status(conn=Depends(get_conn)):
         if g_counts:
             counts.update({k: int(v or 0) for k, v in g_counts[0].items()})
     except Exception:  # noqa: BLE001
-        pass
+        with contextlib.suppress(Exception):
+            conn.rollback()
 
     s_wmata = _try_silver_query(
         SILVER_WMATA_DB,
@@ -1345,6 +1420,409 @@ def stream_status(conn=Depends(get_conn)):
         "telemetry": telemetry,
         "nats_connected": _NATS_CONNECTED,
     }
+
+
+def _fetch_json_url(url: str, timeout: float = 2.0) -> dict[str, Any] | None:
+    if not url:
+        return None
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _query_vm_instant(promql: str) -> list[dict[str, Any]]:
+    if not VM_URL:
+        return []
+    encoded = urllib.parse.urlencode({"query": promql})
+    raw = _fetch_json_url(f"{VM_URL.rstrip('/')}/api/v1/query?{encoded}", timeout=2.0)
+    if not raw:
+        return []
+    out: list[dict[str, Any]] = []
+    for item in (raw.get("data") or {}).get("result") or []:
+        val = item.get("value") or [None, None]
+        out.append(
+            {
+                "labels": item.get("metric") or {},
+                "value": _safe_float(val[1] if len(val) > 1 else None, 0.0),
+            }
+        )
+    return out
+
+
+def _safe_gold_fetch(conn, sql: str, params=()) -> list[dict[str, Any]]:
+    try:
+        return _fetch(conn, sql, params)
+    except Exception:  # noqa: BLE001
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        return []
+
+
+def _query_vl_logs(
+    service: str = "",
+    level: str = "",
+    run_id: str = "",
+    log_format: str = "",
+    q: str = "",
+    limit: int = 80,
+) -> dict[str, Any]:
+    terms: list[str] = []
+    for key, val in (
+        ("service", service),
+        ("level", level),
+        ("run_id", run_id),
+        ("log_format", log_format),
+    ):
+        clean = val.strip().replace('"', "")
+        if clean:
+            terms.append(f'{key}:"{clean}"')
+    clean_q = q.strip().replace('"', "")
+    if clean_q:
+        terms.append(f'"{clean_q}"')
+    logsql = " ".join(terms) if terms else "*"
+    bounded_limit = max(1, min(int(limit), 300))
+
+    if not VL_URL:
+        return {"query": logsql, "reachable": False, "count": 0, "logs": []}
+
+    params = urllib.parse.urlencode({"query": logsql, "limit": str(bounded_limit)})
+    url = f"{VL_URL.rstrip('/')}/select/logsql/query?{params}"
+    entries: list[dict[str, Any]] = []
+    reachable = False
+    try:
+        with urllib.request.urlopen(url, timeout=2.5) as resp:
+            reachable = True
+            for raw_line in resp.read().decode("utf-8", errors="replace").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(d, dict):
+                    entries.append(
+                        {
+                            "timestamp": d.get("_time") or d.get("timestamp"),
+                            "level": d.get("level") or "INFO",
+                            "service": d.get("service") or d.get("container_name") or "unknown",
+                            "run_id": d.get("run_id") or "unassigned",
+                            "log_format": d.get("log_format") or "text",
+                            "domain": d.get("domain"),
+                            "layer": d.get("layer"),
+                            "job": d.get("job"),
+                            "duration_ms": d.get("duration_ms"),
+                            "row_count": d.get("row_count"),
+                            "error_type": d.get("error_type"),
+                            "exception": d.get("exception"),
+                            "message": d.get("_msg") or d.get("message") or "",
+                        }
+                    )
+    except Exception:  # noqa: BLE001
+        reachable = False
+
+    entries.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+    return {
+        "query": logsql,
+        "reachable": reachable,
+        "count": len(entries),
+        "logs": entries[:bounded_limit],
+    }
+
+
+@app.get("/v1/ops/overview")
+def ops_overview(conn=Depends(get_conn)):
+    """Unified observability, pipeline performance, replication, and data quality summary."""
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Monitor health probes + host metrics
+    mon_summary = _fetch_json_url(f"{MONITOR_URL.rstrip('/')}/api/monitoring/summary", timeout=2.5)
+    mon_health = None if mon_summary else _fetch_json_url(f"{MONITOR_URL.rstrip('/')}/health", timeout=2.0)
+
+    services: dict[str, Any] = {}
+    host_metrics: dict[str, Any] = {}
+    last_probe_ts = None
+    telegram_configured = False
+    monitor_reachable = False
+
+    if mon_summary:
+        monitor_reachable = True
+        raw_svcs = mon_summary.get("services") or {}
+        if isinstance(raw_svcs, dict):
+            services = raw_svcs
+        host_metrics = mon_summary.get("host") or {}
+        last_probe_ts = mon_summary.get("last_probe_ts")
+        telegram_configured = bool(mon_summary.get("telegram_configured"))
+    elif mon_health:
+        monitor_reachable = True
+        for k, v in (mon_health.get("checks") or {}).items():
+            ok = str(v).lower() == "ok"
+            services[k] = {"up": ok, "status": str(v), "duration_s": None}
+        last_probe_ts = mon_health.get("last_probe_ts")
+        telegram_configured = bool(mon_health.get("telegram_configured"))
+
+    up_count = sum(1 for item in services.values() if isinstance(item, dict) and item.get("up"))
+
+    # 2. vmalert rules & firing alerts
+    rules_raw = _fetch_json_url(f"{VMALERT_URL.rstrip('/')}/api/v1/rules", timeout=2.0)
+    all_rules: list[dict[str, Any]] = []
+    active_alerts: list[dict[str, Any]] = []
+    if rules_raw:
+        for grp in (rules_raw.get("data") or {}).get("groups") or []:
+            for rule in grp.get("rules") or []:
+                state_str = str(rule.get("state") or "inactive")
+                r_item = {
+                    "name": rule.get("name"),
+                    "state": state_str,
+                    "health": rule.get("health"),
+                    "labels": rule.get("labels") or {},
+                    "annotations": rule.get("annotations") or {},
+                }
+                all_rules.append(r_item)
+                for al in rule.get("alerts") or []:
+                    al_state = str(al.get("state") or state_str)
+                    if al_state in ("firing", "pending"):
+                        active_alerts.append(
+                            {
+                                "name": rule.get("name"),
+                                "state": al_state,
+                                "labels": al.get("labels") or rule.get("labels") or {},
+                                "annotations": al.get("annotations") or rule.get("annotations") or {},
+                                "active_at": al.get("activeAt"),
+                                "value": al.get("value"),
+                            }
+                        )
+    elif mon_summary and isinstance(mon_summary.get("alerts"), list):
+        for al in mon_summary["alerts"]:
+            al_state = str(al.get("state") or "inactive")
+            if al_state in ("firing", "pending"):
+                active_alerts.append(al)
+
+    firing_count = sum(1 for a in active_alerts if a.get("state") == "firing")
+    pending_count = sum(1 for a in active_alerts if a.get("state") == "pending")
+
+    # 3. Replication & HAProxy metrics (from monitor summary or VictoriaMetrics)
+    vm_metrics = (mon_summary or {}).get("metrics") or {}
+    spock_raw = vm_metrics.get("spock_replicating") or _query_vm_instant("spock_subscription_is_replicating")
+    spock_rows = [
+        {
+            "layer": (r.get("labels") or {}).get("layer") or "unknown",
+            "datname": (r.get("labels") or {}).get("datname") or "unknown",
+            "subscription_name": (r.get("labels") or {}).get("subscription_name") or "unknown",
+            "is_replicating": int(round(_safe_float(r.get("value"), 0.0))),
+        }
+        for r in spock_raw
+    ]
+    haproxy_raw = vm_metrics.get("haproxy_active_servers") or _query_vm_instant(
+        'haproxy_backend_active_servers{proxy=~"silver_.*|gold_.*"}'
+    )
+    haproxy_rows = [
+        {
+            "proxy": (r.get("labels") or {}).get("proxy") or "unknown",
+            "active_servers": int(round(_safe_float(r.get("value"), 0.0))),
+        }
+        for r in haproxy_raw
+    ]
+
+    # 4. Container CPU / Memory top consumers
+    cpu_raw = vm_metrics.get("container_cpu_pct") or _query_vm_instant(
+        'sum by (name) (rate(container_cpu_usage_seconds_total{name!=""}[1m])) * 100'
+    )
+    mem_raw = vm_metrics.get("container_memory_bytes") or _query_vm_instant(
+        'container_memory_working_set_bytes{name!=""}'
+    )
+    top_cpu = sorted(
+        [
+            {
+                "name": str((r.get("labels") or {}).get("name") or "").removeprefix("wmata-lateness-").removesuffix("-1"),
+                "cpu_pct": round(_safe_float(r.get("value"), 0.0), 2),
+            }
+            for r in cpu_raw
+            if (r.get("labels") or {}).get("name")
+        ],
+        key=lambda x: x["cpu_pct"],
+        reverse=True,
+    )
+    top_memory = sorted(
+        [
+            {
+                "name": str((r.get("labels") or {}).get("name") or "").removeprefix("wmata-lateness-").removesuffix("-1"),
+                "mem_mb": round(_safe_float(r.get("value"), 0.0) / (1024 * 1024), 1),
+            }
+            for r in mem_raw
+            if (r.get("labels") or {}).get("name")
+        ],
+        key=lambda x: x["mem_mb"],
+        reverse=True,
+    )
+    total_memory_mb = round(sum(x["mem_mb"] for x in top_memory), 1)
+
+    # 5. Pipeline performance & recent errors from public.pipeline_runs
+    job_perf_rows = _safe_gold_fetch(
+        conn,
+        """
+        WITH recent AS (
+            SELECT run_id, job_name, layer, status, started_at, finished_at, error,
+                   CASE
+                     WHEN started_at IS NOT NULL AND finished_at IS NOT NULL
+                     THEN GREATEST(0.0, EXTRACT(EPOCH FROM (finished_at - started_at)))
+                     ELSE NULL
+                   END AS dur_sec
+            FROM public.pipeline_runs
+            ORDER BY started_at DESC NULLS LAST
+            LIMIT 300
+        ),
+        latest_per_job AS (
+            SELECT DISTINCT ON (job_name)
+                   job_name, status AS latest_status, started_at AS latest_started_at, error AS latest_error
+            FROM recent
+            ORDER BY job_name, started_at DESC NULLS LAST
+        )
+        SELECT r.job_name,
+               max(r.layer) AS layer,
+               count(*) AS total_runs,
+               count(*) FILTER (WHERE lower(r.status) = 'success') AS success_runs,
+               count(*) FILTER (WHERE lower(r.status) = 'failed') AS failed_runs,
+               count(*) FILTER (WHERE lower(r.status) = 'running') AS running_runs,
+               round(avg(r.dur_sec)::numeric, 2) AS avg_duration_sec,
+               round((percentile_cont(0.95) WITHIN GROUP (ORDER BY r.dur_sec))::numeric, 2) AS p95_duration_sec,
+               round(max(r.dur_sec)::numeric, 2) AS max_duration_sec,
+               l.latest_status,
+               l.latest_started_at,
+               l.latest_error
+        FROM recent r
+        LEFT JOIN latest_per_job l ON l.job_name = r.job_name
+        GROUP BY r.job_name, l.latest_status, l.latest_started_at, l.latest_error
+        ORDER BY total_runs DESC, r.job_name
+        """,
+    )
+    by_job: list[dict[str, Any]] = []
+    tot_fin = 0
+    tot_ok = 0
+    for r in job_perf_rows:
+        succ = int(r.get("success_runs") or 0)
+        fail = int(r.get("failed_runs") or 0)
+        fin = succ + fail
+        tot_fin += fin
+        tot_ok += succ
+        by_job.append(
+            {
+                "job_name": r.get("job_name"),
+                "layer": r.get("layer"),
+                "total_runs": int(r.get("total_runs") or 0),
+                "success_runs": succ,
+                "failed_runs": fail,
+                "running_runs": int(r.get("running_runs") or 0),
+                "success_rate": round(100.0 * succ / fin, 1) if fin > 0 else 100.0,
+                "avg_duration_sec": None if r.get("avg_duration_sec") is None else float(r["avg_duration_sec"]),
+                "p95_duration_sec": None if r.get("p95_duration_sec") is None else float(r["p95_duration_sec"]),
+                "max_duration_sec": None if r.get("max_duration_sec") is None else float(r["max_duration_sec"]),
+                "latest_status": r.get("latest_status"),
+                "latest_started_at": r.get("latest_started_at"),
+                "latest_error": r.get("latest_error"),
+            }
+        )
+
+    recent_errors = _safe_gold_fetch(
+        conn,
+        """
+        SELECT run_id, job_name, layer, status, started_at, finished_at, error
+        FROM public.pipeline_runs
+        WHERE lower(status) = 'failed' OR (error IS NOT NULL AND error <> '')
+        ORDER BY started_at DESC NULLS LAST
+        LIMIT 15
+        """,
+    )
+
+    # 6. Latest Data Quality / GX results from public.data_quality_runs
+    dq_rows = _safe_gold_fetch(
+        conn,
+        """
+        WITH latest_run AS (
+            SELECT run_id, max(checked_at) AS max_ts
+            FROM public.data_quality_runs
+            GROUP BY run_id
+            ORDER BY max_ts DESC
+            LIMIT 1
+        )
+        SELECT q.run_id, q.layer, q.dataset, q.check_name, q.status,
+               q.severity, q.observed, q.threshold, q.checked_at
+        FROM public.data_quality_runs q
+        JOIN latest_run lr ON lr.run_id = q.run_id
+        ORDER BY
+          CASE lower(q.status) WHEN 'fail' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END,
+          q.layer, q.dataset, q.check_name
+        """,
+    )
+    dq_summary = {
+        "run_id": dq_rows[0]["run_id"] if dq_rows else None,
+        "checked_at": dq_rows[0]["checked_at"] if dq_rows else None,
+        "total": len(dq_rows),
+        "pass": sum(1 for r in dq_rows if str(r.get("status") or "").lower() == "pass"),
+        "warn": sum(1 for r in dq_rows if str(r.get("status") or "").lower() == "warn"),
+        "fail": sum(1 for r in dq_rows if str(r.get("status") or "").lower() == "fail"),
+    }
+
+    return {
+        "generated_at": now_utc.isoformat(),
+        "monitor": {
+            "reachable": monitor_reachable,
+            "telegram_configured": telegram_configured,
+            "last_probe_ts": last_probe_ts,
+            "up_count": up_count,
+            "total_count": len(services),
+            "services": services,
+            "host": host_metrics,
+        },
+        "alerts": {
+            "firing_count": firing_count,
+            "pending_count": pending_count,
+            "rules_total": len(all_rules),
+            "active": active_alerts,
+            "all_rules": all_rules,
+        },
+        "replication": {
+            "spock": spock_rows,
+            "haproxy": haproxy_rows,
+        },
+        "resources": {
+            "top_cpu": top_cpu[:12],
+            "top_memory": top_memory[:12],
+            "total_memory_mb": total_memory_mb,
+        },
+        "pipeline_performance": {
+            "overall_success_rate": round(100.0 * tot_ok / tot_fin, 1) if tot_fin > 0 else 100.0,
+            "by_job": by_job,
+            "recent_errors": recent_errors,
+        },
+        "data_quality": {
+            "summary": dq_summary,
+            "checks": dq_rows[:40],
+        },
+    }
+
+
+@app.get("/v1/ops/logs")
+def ops_logs(
+    service: str = "",
+    level: str = "",
+    run_id: str = "",
+    log_format: str = "",
+    q: str = "",
+    limit: int = Query(80, ge=1, le=300),
+):
+    """Query structured logs from VictoriaLogs filtered by service, level, run_id, or text."""
+    return _query_vl_logs(
+        service=service,
+        level=level,
+        run_id=run_id,
+        log_format=log_format,
+        q=q,
+        limit=limit,
+    )
 
 
 @app.get("/v1/stream/events")

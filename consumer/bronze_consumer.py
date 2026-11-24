@@ -19,10 +19,12 @@ A message is acked only after steps 4 and 5 succeed. On batch failure:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import glob
 import hashlib
 import importlib
 import json
+import logging
 import os
 import signal
 import sys
@@ -30,6 +32,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+for _cand in (*(str(p) for p in Path(__file__).resolve().parents), "/app"):
+    if _cand not in sys.path:
+        sys.path.insert(0, _cand)
 
 try:
     import boto3
@@ -57,9 +63,26 @@ except ImportError:  # pragma: no cover
     run_log = None  # type: ignore[assignment]
 
 try:
+    from shared.logging import run_context, setup_json_logging
     from shared import metrics as vm_metrics
 except ImportError:  # pragma: no cover
+    run_context = None  # type: ignore[assignment]
+    setup_json_logging = None  # type: ignore[assignment]
     vm_metrics = None  # type: ignore[assignment]
+
+_LOG_LEVEL = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+if setup_json_logging is not None:
+    setup_json_logging("bronze-consumer", level=_LOG_LEVEL)
+else:
+    logging.basicConfig(
+        level=_LOG_LEVEL,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+logger = logging.getLogger("bronze-consumer")
+
+
+def _run_ctx(run_id: str):
+    return run_context(run_id=run_id) if run_context is not None else contextlib.nullcontext(run_id)
 
 try:
     import merge_silver as silver_merger
@@ -398,7 +421,7 @@ def write_heartbeat(status: str, extra: dict[str, Any] | None = None) -> None:
         Path(tmp).write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp, HEARTBEAT_PATH)
     except OSError as exc:  # noqa: BLE001 - heartbeat is best effort
-        print(f"WARN heartbeat failed: {exc}", flush=True)
+        logger.warning("Heartbeat write failed: %s", exc, extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
 
 
 # ---------------------------------------------------------------------------
@@ -458,9 +481,9 @@ async def ensure_aux_streams(js) -> None:
                     duplicate_window=120,
                 )
                 await js.add_stream(cfg)
-                print(f"CREATED JetStream stream {name} ({subjects})", flush=True)
+                logger.info("Created JetStream stream %s (%s)", name, subjects, extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
             except Exception as exc:  # noqa: BLE001
-                print(f"WARN could not ensure stream {name}: {exc}", flush=True)
+                logger.warning("Could not ensure stream %s: %s", name, exc, extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
 
 
 async def publish_dlq(
@@ -489,9 +512,9 @@ async def publish_dlq(
     ).hexdigest()
     try:
         await js.publish(subject, body, headers={"Nats-Msg-Id": msg_id})
-        print(f"DLQ {subject} key={payload.get('s3_key')} err={error}", flush=True)
+        logger.warning("Routed to DLQ %s key=%s err=%s", subject, payload.get("s3_key"), error, extra={"domain": bucket, "layer": "silver", "job": "silver_consumer"})
     except Exception as exc:  # noqa: BLE001
-        print(f"WARN DLQ publish failed ({subject}): {exc}", flush=True)
+        logger.warning("DLQ publish failed (%s): %s", subject, exc, extra={"domain": bucket, "layer": "silver", "job": "silver_consumer"})
     _emit_counter("wmata_stream_dlq_total", {"bucket": bucket, "reason": reason})
 
 
@@ -502,9 +525,9 @@ async def publish_tombstone(js, bucket: str, key: str, event: dict) -> None:
     msg_id = hashlib.sha256(f"{subject}|{key}|{payload['etag']}".encode()).hexdigest()
     try:
         await js.publish(subject, body, headers={"Nats-Msg-Id": msg_id})
-        print(f"TOMBSTONE {subject} key={key}", flush=True)
+        logger.info("Published tombstone %s key=%s", subject, key, extra={"domain": bucket, "layer": "silver", "job": "silver_consumer"})
     except Exception as exc:  # noqa: BLE001
-        print(f"WARN tombstone publish failed ({subject}): {exc}", flush=True)
+        logger.warning("Tombstone publish failed (%s): %s", subject, exc, extra={"domain": bucket, "layer": "silver", "job": "silver_consumer"})
     _emit_counter("wmata_stream_tombstones_total", {"bucket": bucket})
 
 
@@ -512,7 +535,7 @@ async def safe_ack(msg) -> None:
     try:
         await msg.ack()
     except Exception as exc:  # noqa: BLE001 - connection may be closing
-        print(f"WARN ack failed: {exc}", flush=True)
+        logger.warning("Ack failed: %s", exc, extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
 
 
 async def safe_nak(msg, delay: float | None = None) -> None:
@@ -525,9 +548,9 @@ async def safe_nak(msg, delay: float | None = None) -> None:
         try:
             await msg.nak()
         except Exception as exc:  # noqa: BLE001
-            print(f"WARN nak failed: {exc}", flush=True)
+            logger.warning("Nak failed: %s", exc, extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
     except Exception as exc:  # noqa: BLE001 - connection may be closing
-        print(f"WARN nak failed: {exc}", flush=True)
+        logger.warning("Nak failed: %s", exc, extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
 
 
 async def object_exists(bucket: str, key: str) -> bool:
@@ -606,10 +629,7 @@ async def collect(
         except (NatsTimeout, asyncio.TimeoutError):
             break
         except Exception as exc:  # noqa: BLE001 - reconnect/retry on next loop
-            print(
-                f"WARN fetch {bucket} failed: {type(exc).__name__}: {exc}",
-                flush=True,
-            )
+            logger.warning("Fetch %s failed: %s: %s", bucket, type(exc).__name__, exc, extra={"domain": bucket, "layer": "silver", "job": "silver_consumer"})
             break
 
         for msg in msgs:
@@ -672,7 +692,7 @@ async def collect(
             try:
                 exists = await object_exists(bucket, key)
             except Exception as exc:  # noqa: BLE001 - transient S3 error
-                print(f"WARN head {bucket}/{key} failed: {exc}", flush=True)
+                logger.warning("HEAD %s/%s failed: %s", bucket, key, exc, extra={"domain": bucket, "layer": "silver", "job": "silver_consumer"})
                 await safe_nak(msg, delay=5)
                 continue
 
@@ -710,7 +730,7 @@ async def collect(
 
 
 async def run_cmd(cmd: list[str], label: str) -> None:
-    print(f"RUN {label}: {' '.join(cmd)}", flush=True)
+    logger.info("Running command (%s): %s", label, " ".join(cmd), extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
     proc = await asyncio.create_subprocess_exec(*cmd)
     rc = await proc.wait()
     if rc != 0:
@@ -860,10 +880,13 @@ class SparkRunner:
             except Exception:  # noqa: BLE001
                 pass
         elapsed = time.monotonic() - t0
-        print(
-            f"SparkSession ready master={self.master} app={self.app_name} "
-            f"shuffle_partitions={self.shuffle_partitions} init={elapsed:.1f}s",
-            flush=True,
+        logger.info(
+            "SparkSession ready master=%s app=%s shuffle_partitions=%s init=%.1fs",
+            self.master,
+            self.app_name,
+            self.shuffle_partitions,
+            elapsed,
+            extra={"domain": "infra", "layer": "silver", "job": "silver_consumer", "duration_ms": round(elapsed * 1000, 2)},
         )
         return spark
 
@@ -871,7 +894,7 @@ class SparkRunner:
         if self._spark is not None:
             if self.is_alive():
                 return self._spark
-            print("WARN persistent SparkSession died; recreating", flush=True)
+            logger.warning("Persistent SparkSession died; recreating", extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
             self.reset(hard=True)
         self._spark = self._create_session()
         return self._spark
@@ -907,10 +930,10 @@ class SparkRunner:
         except Exception as exc:
             self.reset_job_caches()
             if _is_fatal_spark_error(exc) or not self.is_alive():
-                print(
-                    f"WARN SparkSession unhealthy after error ({type(exc).__name__}); "
-                    "resetting session for next batch",
-                    flush=True,
+                logger.warning(
+                    "SparkSession unhealthy after error (%s); resetting session for next batch",
+                    type(exc).__name__,
+                    extra={"domain": "infra", "layer": "silver", "job": "silver_consumer", "error_type": type(exc).__name__},
                 )
                 self.reset(hard=True)
             raise
@@ -923,7 +946,7 @@ class SparkRunner:
             try:
                 spark.stop()
             except Exception as exc:  # noqa: BLE001
-                print(f"WARN SparkSession stop error: {exc}", flush=True)
+                logger.warning("SparkSession stop error: %s", exc, extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
         if hard and self._session_factory is None:
             try:
                 from pyspark import SparkContext
@@ -944,7 +967,7 @@ class SparkRunner:
         was_active = self._spark is not None
         self.reset(hard=False)
         if was_active:
-            print("SparkSession stopped cleanly", flush=True)
+            logger.info("SparkSession stopped cleanly", extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"})
 
 
 async def run_batch_persistent(
@@ -1030,11 +1053,14 @@ async def main() -> int:
     state_obj = load_consumer_state(STATE_PATH)
     delivery_tracker: dict[str, int] = {}
     spark_runner = SparkRunner() if SPARK_MODE == "persistent" else None
-    print(
-        f"consumer started spark_mode={SPARK_MODE} state_keys={len(state_obj['keys'])} "
-        f"watermarks={state_obj['watermarks']} max_deliver={MAX_DELIVER} "
-        f"allowed_lateness={ALLOWED_LATENESS_MIN}m",
-        flush=True,
+    logger.info(
+        "Consumer started spark_mode=%s state_keys=%d watermarks=%s max_deliver=%d allowed_lateness=%dm",
+        SPARK_MODE,
+        len(state_obj["keys"]),
+        state_obj["watermarks"],
+        MAX_DELIVER,
+        ALLOWED_LATENESS_MIN,
+        extra={"domain": "infra", "layer": "silver", "job": "silver_consumer"},
     )
     write_heartbeat("started", extra={"spark_mode": SPARK_MODE})
 
@@ -1043,7 +1069,7 @@ async def main() -> int:
         try:
             await asyncio.to_thread(spark_runner.get_session)
         except Exception as exc:  # noqa: BLE001 - retry lazily on first batch
-            print(f"WARN Spark warmup failed (will retry on first batch): {exc}", flush=True)
+            logger.warning("Spark warmup failed (will retry on first batch): %s", exc, extra={"domain": "infra", "layer": "silver", "job": "silver_consumer", "error_type": type(exc).__name__})
 
     try:
         while not stop.is_set():
@@ -1075,150 +1101,179 @@ async def main() -> int:
                 bucket: sum(1 for item in batch if item["bucket"] == bucket)
                 for bucket, _, _, _ in SUBS
             }
-            print(
-                f"collected wmata={counts['wmata']} traffic={counts['traffic']}",
-                flush=True,
-            )
             manifest_payload = write_manifest(batch)
             run_id = run_log.new_run_id() if run_log is not None else f"run-{int(time.time())}"
-            if run_log is not None:
-                run_log.safe_start_run(
-                    run_id,
-                    "silver_consumer",
-                    "silver",
-                    input_datasets=["bronze.wmata", "bronze.traffic"],
-                    output_datasets=["silver.wmata", "silver.traffic"],
-                    source_manifest={**manifest_payload, "batch_id": run_id},
+            batch_domain = "traffic" if counts["traffic"] > 0 and counts["wmata"] == 0 else "wmata"
+            with _run_ctx(run_id):
+                logger.info(
+                    "Collected batch wmata=%d traffic=%d",
+                    counts["wmata"],
+                    counts["traffic"],
+                    extra={
+                        "domain": batch_domain,
+                        "layer": "silver",
+                        "job": "silver_consumer",
+                        "row_count": len(batch),
+                    },
                 )
-
-            try:
-                if spark_runner is not None:
-                    await run_batch_persistent(spark_runner, manifest_payload, run_id)
-                else:
-                    await run_cmd(
-                        [sys.executable, MERGE_SCRIPT, "--truncate-only"],
-                        "truncate staging",
-                    )
-                    await run_cmd(
-                        [
-                            "/opt/spark/bin/spark-submit",
-                            "--master",
-                            SPARK_MASTER,
-                            "--conf",
-                            f"spark.sql.shuffle.partitions={SPARK_SHUFFLE_PARTITIONS}",
-                            "--conf",
-                            f"spark.driver.memory={SPARK_DRIVER_MEMORY}",
-                            SPARK_JOB,
-                            "--manifest",
-                            MANIFEST,
-                        ],
-                        "spark bronze->silver",
-                    )
-                    await run_cmd(
-                        [sys.executable, MERGE_SCRIPT, "--run-id", run_id],
-                        "merge staging",
-                    )
-            except Exception as exc:  # noqa: BLE001 - retry or DLQ poison pills
-                print(f"BATCH FAILED: {exc}", flush=True)
                 if run_log is not None:
-                    run_log.safe_finish_run(run_id, "failed", error=str(exc))
+                    run_log.safe_start_run(
+                        run_id,
+                        "silver_consumer",
+                        "silver",
+                        input_datasets=["bronze.wmata", "bronze.traffic"],
+                        output_datasets=["silver.wmata", "silver.traffic"],
+                        source_manifest={**manifest_payload, "batch_id": run_id},
+                    )
+
+                try:
+                    if spark_runner is not None:
+                        await run_batch_persistent(spark_runner, manifest_payload, run_id)
+                    else:
+                        await run_cmd(
+                            [sys.executable, MERGE_SCRIPT, "--truncate-only"],
+                            "truncate staging",
+                        )
+                        await run_cmd(
+                            [
+                                "/opt/spark/bin/spark-submit",
+                                "--master",
+                                SPARK_MASTER,
+                                "--conf",
+                                f"spark.sql.shuffle.partitions={SPARK_SHUFFLE_PARTITIONS}",
+                                "--conf",
+                                f"spark.driver.memory={SPARK_DRIVER_MEMORY}",
+                                SPARK_JOB,
+                                "--manifest",
+                                MANIFEST,
+                            ],
+                            "spark bronze->silver",
+                        )
+                        await run_cmd(
+                            [sys.executable, MERGE_SCRIPT, "--run-id", run_id],
+                            "merge staging",
+                        )
+                except Exception as exc:  # noqa: BLE001 - retry or DLQ poison pills
+                    dur_ms = round((time.monotonic() - batch_start) * 1000, 2)
+                    logger.exception(
+                        "Batch failed: %s",
+                        exc,
+                        extra={
+                            "domain": batch_domain,
+                            "layer": "silver",
+                            "job": "silver_consumer",
+                            "duration_ms": dur_ms,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    if run_log is not None:
+                        run_log.safe_finish_run(run_id, "failed", error=str(exc))
+                    _emit_counter(
+                        "wmata_pipeline_job_runs_total",
+                        {"service": "consumer", "job": "silver_consumer", "domain": "wmata", "layer": "silver", "status": "failed"},
+                    )
+                    dlq_n, retry_n = await handle_batch_failure(js, batch, str(exc))
+                    write_heartbeat(
+                        "error",
+                        extra={"spark_mode": SPARK_MODE, "dlq": dlq_n, "retried": retry_n},
+                    )
+                    await sleep_or_stop(stop, ERROR_BACKOFF)
+                    continue
+
+                duration = time.monotonic() - batch_start
+                now_dt = datetime.now(timezone.utc)
+                now_ts = now_dt.timestamp()
+
+                if run_log is not None:
+                    run_log.safe_finish_run(run_id, "success")
+
+                # Advance dedup keys + per-bucket live watermarks
+                for item in batch:
+                    state_obj["keys"][item["dedup"]] = now_ts
+                    delivery_tracker.pop(item["dedup"], None)
+                    bkt = item["bucket"]
+                    ev_ts = item.get("event_time")
+                    if ev_ts is not None and is_live_stream_event(bkt, item["s3_key"], item.get("event") or {}):
+                        cur_wm = parse_iso_timestamp(state_obj["watermarks"].get(bkt))
+                        if cur_wm is None or ev_ts > cur_wm:
+                            state_obj["watermarks"][bkt] = ev_ts.isoformat()
+                        lag_s = max(0.0, (now_dt - ev_ts).total_seconds())
+                        _emit_gauge("wmata_stream_processing_lag_seconds", round(lag_s, 2), {"bucket": bkt})
+
+                try:
+                    save_consumer_state(state_obj, STATE_PATH)
+                except Exception as exc:  # noqa: BLE001 - dedup state is best effort
+                    logger.warning("Could not save consumer state: %s", exc, extra={"domain": batch_domain, "layer": "silver", "job": "silver_consumer"})
+
+                for item in batch:
+                    await safe_ack(item["msg"])
+
+                # Publish persistent JetStream event for downstream inference & SSE
+                source_tag = "tomtom" if counts["traffic"] > 0 and counts["wmata"] == 0 else "wmata"
+                notify = json.dumps(
+                    {
+                        "run_id": run_id,
+                        "source": source_tag,
+                        "spark_mode": SPARK_MODE,
+                        "wmata_files": counts["wmata"],
+                        "traffic_files": counts["traffic"],
+                        "duration_sec": round(duration, 2),
+                        "watermarks": state_obj["watermarks"],
+                        "merged_at": now_dt.isoformat(),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                try:
+                    await js.publish(
+                        SILVER_MERGED_SUBJECT,
+                        notify,
+                        headers={"Nats-Msg-Id": run_id},
+                    )
+                    await nc.flush(timeout=10)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("JetStream publish failed (%s): %s", SILVER_MERGED_SUBJECT, exc, extra={"domain": batch_domain, "layer": "silver", "job": "silver_consumer"})
+                    try:
+                        await nc.publish(SILVER_MERGED_SUBJECT, notify)
+                        await nc.flush(timeout=5)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                # Emit stream & pipeline metrics to VictoriaMetrics
+                _emit_gauge("wmata_stream_batch_duration_seconds", round(duration, 3), {"service": "consumer"})
                 _emit_counter(
                     "wmata_pipeline_job_runs_total",
-                    {"service": "consumer", "job": "silver_consumer", "domain": "wmata", "layer": "silver", "status": "failed"},
+                    {"service": "consumer", "job": "silver_consumer", "domain": "wmata", "layer": "silver", "status": "success"},
                 )
-                dlq_n, retry_n = await handle_batch_failure(js, batch, str(exc))
+                for bkt, cnt in counts.items():
+                    if cnt > 0:
+                        _emit_counter("wmata_stream_events_total", {"bucket": bkt, "status": "processed"}, amount=float(cnt))
+                        _emit_gauge("wmata_stream_last_event_timestamp", now_ts, {"stream": f"silver-{bkt}", "service": "consumer"})
+
                 write_heartbeat(
-                    "error",
-                    extra={"spark_mode": SPARK_MODE, "dlq": dlq_n, "retried": retry_n},
+                    "ok",
+                    extra={
+                        "spark_mode": SPARK_MODE,
+                        "wmata": counts["wmata"],
+                        "traffic": counts["traffic"],
+                        "duration_sec": round(duration, 2),
+                        "watermarks": state_obj["watermarks"],
+                        "pending_lag": pending_lag,
+                    },
                 )
-                await sleep_or_stop(stop, ERROR_BACKOFF)
-                continue
-
-            duration = time.monotonic() - batch_start
-            now_dt = datetime.now(timezone.utc)
-            now_ts = now_dt.timestamp()
-
-            if run_log is not None:
-                run_log.safe_finish_run(run_id, "success")
-
-            # Advance dedup keys + per-bucket live watermarks
-            for item in batch:
-                state_obj["keys"][item["dedup"]] = now_ts
-                delivery_tracker.pop(item["dedup"], None)
-                bkt = item["bucket"]
-                ev_ts = item.get("event_time")
-                if ev_ts is not None and is_live_stream_event(bkt, item["s3_key"], item.get("event") or {}):
-                    cur_wm = parse_iso_timestamp(state_obj["watermarks"].get(bkt))
-                    if cur_wm is None or ev_ts > cur_wm:
-                        state_obj["watermarks"][bkt] = ev_ts.isoformat()
-                    lag_s = max(0.0, (now_dt - ev_ts).total_seconds())
-                    _emit_gauge("wmata_stream_processing_lag_seconds", round(lag_s, 2), {"bucket": bkt})
-
-            try:
-                save_consumer_state(state_obj, STATE_PATH)
-            except Exception as exc:  # noqa: BLE001 - dedup state is best effort
-                print(f"WARN could not save consumer state: {exc}", flush=True)
-
-            for item in batch:
-                await safe_ack(item["msg"])
-
-            # Publish persistent JetStream event for downstream inference & SSE
-            source_tag = "tomtom" if counts["traffic"] > 0 and counts["wmata"] == 0 else "wmata"
-            notify = json.dumps(
-                {
-                    "run_id": run_id,
-                    "source": source_tag,
-                    "spark_mode": SPARK_MODE,
-                    "wmata_files": counts["wmata"],
-                    "traffic_files": counts["traffic"],
-                    "duration_sec": round(duration, 2),
-                    "watermarks": state_obj["watermarks"],
-                    "merged_at": now_dt.isoformat(),
-                },
-                separators=(",", ":"),
-            ).encode("utf-8")
-            try:
-                await js.publish(
-                    SILVER_MERGED_SUBJECT,
-                    notify,
-                    headers={"Nats-Msg-Id": run_id},
+                logger.info(
+                    "Acked batch wmata=%d traffic=%d dur=%.1fs mode=%s",
+                    counts["wmata"],
+                    counts["traffic"],
+                    duration,
+                    SPARK_MODE,
+                    extra={
+                        "domain": batch_domain,
+                        "layer": "silver",
+                        "job": "silver_consumer",
+                        "duration_ms": round(duration * 1000, 2),
+                        "row_count": len(batch),
+                    },
                 )
-                await nc.flush(timeout=10)
-            except Exception as exc:  # noqa: BLE001
-                print(f"WARN JetStream publish failed ({SILVER_MERGED_SUBJECT}): {exc}", flush=True)
-                try:
-                    await nc.publish(SILVER_MERGED_SUBJECT, notify)
-                    await nc.flush(timeout=5)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            # Emit stream & pipeline metrics to VictoriaMetrics
-            _emit_gauge("wmata_stream_batch_duration_seconds", round(duration, 3), {"service": "consumer"})
-            _emit_counter(
-                "wmata_pipeline_job_runs_total",
-                {"service": "consumer", "job": "silver_consumer", "domain": "wmata", "layer": "silver", "status": "success"},
-            )
-            for bkt, cnt in counts.items():
-                if cnt > 0:
-                    _emit_counter("wmata_stream_events_total", {"bucket": bkt, "status": "processed"}, amount=float(cnt))
-                    _emit_gauge("wmata_stream_last_event_timestamp", now_ts, {"stream": f"silver-{bkt}", "service": "consumer"})
-
-            write_heartbeat(
-                "ok",
-                extra={
-                    "spark_mode": SPARK_MODE,
-                    "wmata": counts["wmata"],
-                    "traffic": counts["traffic"],
-                    "duration_sec": round(duration, 2),
-                    "watermarks": state_obj["watermarks"],
-                    "pending_lag": pending_lag,
-                },
-            )
-            print(
-                f"ACKED wmata={counts['wmata']} traffic={counts['traffic']} "
-                f"dur={duration:.1f}s mode={SPARK_MODE}",
-                flush=True,
-            )
     finally:
         if spark_runner is not None:
             try:

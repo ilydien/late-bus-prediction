@@ -50,6 +50,17 @@ VM_URL = os.environ.get("VM_URL", "http://victoriametrics:8428")
 VL_URL = os.environ.get("VL_URL", "http://victorialogs:9428")
 VECTOR_URL = os.environ.get("VECTOR_URL", "http://vector:8686")
 VMALERT_URL = os.environ.get("VMALERT_URL", "http://vmalert:8880")
+SERVING_API_URL = os.environ.get("SERVING_API_URL", "http://serving-api:8000")
+SPARK_MASTER_URL = os.environ.get("SPARK_MASTER_URL", "http://spark-master:8080")
+SPARK_WORKER_URL = os.environ.get("SPARK_WORKER_URL", "http://spark-worker:8081")
+CADVISOR_URL = os.environ.get("CADVISOR_URL", "http://cadvisor:8080")
+NATS_EXPORTER_URL = os.environ.get("NATS_EXPORTER_URL", "http://nats-exporter:7777")
+DAGSTER_USER_CODE_HOST = os.environ.get("DAGSTER_USER_CODE_HOST", "dagster-user-code")
+DAGSTER_USER_CODE_PORT = int(os.environ.get("DAGSTER_USER_CODE_PORT", "4000"))
+CONSUMER_HEARTBEAT_PATH = os.environ.get("CONSUMER_HEARTBEAT_PATH", "/work/consumer/consumer_heartbeat")
+WMATA_POLLER_HEARTBEAT_PATH = os.environ.get("WMATA_POLLER_HEARTBEAT_PATH", "/work/dlt/wmata_poller_heartbeat")
+TOMTOM_POLLER_HEARTBEAT_PATH = os.environ.get("TOMTOM_POLLER_HEARTBEAT_PATH", "/work/dlt/tomtom_poller_heartbeat")
+HEARTBEAT_MAX_AGE_SEC = int(os.environ.get("HEARTBEAT_MAX_AGE_SEC", "1800"))
 
 _STATE_LOCK = threading.Lock()
 _latest_checks: dict[str, dict[str, object]] = {}
@@ -75,6 +86,27 @@ def _tcp_ok(host: str, port: int, timeout: int = 3) -> bool:
         return False
 
 
+def _heartbeat_ok(path: str, max_age_s: int = HEARTBEAT_MAX_AGE_SEC) -> bool:
+    try:
+        mtime = os.path.getmtime(path)
+        return (time.time() - mtime) < max_age_s
+    except OSError:
+        return False
+
+
+def _cadvisor_up(compose_service: str, max_age_s: int = 120) -> bool:
+    rows = _query_vm(
+        f'time() - max(container_last_seen{{container_label_com_docker_compose_service="{compose_service}"}})'
+    )
+    if not rows:
+        return False
+    return float(rows[0].get("value", 9999.0)) < max_age_s
+
+
+def _telegram_configured() -> bool:
+    return bool(os.environ.get("TELEGRAM_BOT_API_KEY", "").strip() and os.environ.get("TELEGRAM_CHAT_ID", "").strip())
+
+
 def _build_checks() -> list[tuple[str, Callable[[], bool]]]:
     return [
         ("postgres-infra", lambda: _tcp_ok(POSTGRES_INFRA_HOST, POSTGRES_INFRA_PORT)),
@@ -84,14 +116,25 @@ def _build_checks() -> list[tuple[str, Callable[[], bool]]]:
         ("seaweedfs", lambda: _http_ok(f"{SEAWEEDFS_URL}/cluster/status")),
         ("seaweedfs-bridge", lambda: _http_ok(f"{SEAWEEDFS_BRIDGE_URL}/health")),
         ("nats", lambda: _http_ok(f"{NATS_MON_URL}/healthz")),
+        ("nats-exporter", lambda: _http_ok(f"{NATS_EXPORTER_URL}/metrics")),
         ("debezium-wmata", lambda: _http_ok(f"{DEBEZIUM_WMATA_URL}/q/health/ready")),
         ("debezium-traffic", lambda: _http_ok(f"{DEBEZIUM_TRAFFIC_URL}/q/health/ready")),
         ("dagster-webserver", lambda: _http_ok(f"{DAGSTER_URL}/dagit_info")),
+        ("dagster-user-code", lambda: _tcp_ok(DAGSTER_USER_CODE_HOST, DAGSTER_USER_CODE_PORT)),
         ("mlflow", lambda: _http_ok(f"{MLFLOW_URL}/health")),
         ("trino", lambda: _http_ok(f"{TRINO_URL}/v1/info")),
+        ("spark-master", lambda: _http_ok(f"{SPARK_MASTER_URL}/")),
+        ("spark-worker", lambda: _http_ok(f"{SPARK_WORKER_URL}/")),
+        ("serving-api", lambda: _http_ok(f"{SERVING_API_URL}/health")),
+        ("consumer", lambda: _heartbeat_ok(CONSUMER_HEARTBEAT_PATH)),
+        ("wmata-poller", lambda: _heartbeat_ok(WMATA_POLLER_HEARTBEAT_PATH)),
+        ("tomtom-poller", lambda: _heartbeat_ok(TOMTOM_POLLER_HEARTBEAT_PATH)),
+        ("stream-inference", lambda: _cadvisor_up("stream-inference")),
         ("victoriametrics", lambda: _http_ok(f"{VM_URL}/-/healthy")),
         ("victorialogs", lambda: _http_ok(f"{VL_URL}/health")),
         ("vector", lambda: _http_ok(f"{VECTOR_URL}/health")),
+        ("vmalert", lambda: _http_ok(f"{VMALERT_URL}/-/healthy")),
+        ("cadvisor", lambda: _http_ok(f"{CADVISOR_URL}/healthz")),
     ]
 
 
@@ -310,6 +353,7 @@ def build_monitoring_summary() -> dict[str, object]:
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "last_probe_ts": last_run,
+        "telegram_configured": _telegram_configured(),
         "services": services,
         "host": host,
         "alerts": alerts,
@@ -320,6 +364,7 @@ def build_monitoring_summary() -> dict[str, object]:
             "nats_consumer_pending": _query_vm("jetstream_consumer_num_pending"),
             "pg_up": _query_vm("pg_up"),
             "spock_replicating": _query_vm("spock_subscription_is_replicating"),
+            "haproxy_active_servers": _query_vm('haproxy_backend_active_servers{proxy=~"silver_.*|gold_.*"}'),
         },
     }
 
@@ -392,6 +437,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     "service": "health-monitor",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "last_probe_ts": last_run,
+                    "telegram_configured": _telegram_configured(),
                     "checks": checks,
                 }
             ).encode("utf-8")
@@ -420,6 +466,50 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self._send_bytes(404, "text/plain; charset=utf-8", b"not found")
 
     def do_POST(self) -> None:
+        if self.path == "/api/monitoring/test-alert":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                body = json.loads(raw) if raw.strip() else {}
+            except (ValueError, json.JSONDecodeError):
+                self._send_bytes(400, "application/json", b'{"error":"invalid json"}')
+                return
+
+            status = str(body.get("status", "FIRING")).upper()
+            if status not in ("FIRING", "RESOLVED"):
+                status = "FIRING"
+            level = str(body.get("level", "INFO")).upper()
+            service = str(body.get("service", "health-monitor"))
+            custom_msg = str(body.get("message", "Smoke test alert from WMATA health-monitor"))
+
+            with run_context("test-alert"):
+                configured = _telegram_configured()
+                msg = f"*Service:* `{service}`\n*Summary:* {custom_msg}"
+                sent = send_alert(
+                    message=msg,
+                    level=level,
+                    throttle_key=None if body.get("force", True) else f"test:{service}",
+                    alert_name="SmokeTestAlert",
+                    status=status,
+                    runbook="docs/runbooks/alerts.md",
+                )
+                logger.info(
+                    "Test alert dispatched status=%s configured=%s sent=%s",
+                    status,
+                    configured,
+                    sent,
+                    extra={"domain": "infra", "layer": "ops", "job": "test_alert"},
+                )
+            resp_status = 200 if (sent or not configured) else 502
+            payload = {
+                "status": "sent" if sent else ("not_configured" if not configured else "failed"),
+                "telegram_configured": configured,
+                "sent": sent,
+                "alert_status": status,
+            }
+            self._send_bytes(resp_status, "application/json", json.dumps(payload).encode("utf-8"))
+            return
+
         if self.path not in ("/api/v2/alerts", "/api/v1/alerts", "/alert-webhook"):
             self._send_bytes(404, "text/plain; charset=utf-8", b"not found")
             return

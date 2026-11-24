@@ -321,6 +321,8 @@ services:
     environment:
       NATS_URL: nats://nats:4222
       BRIDGE_PORT: "8080"
+    volumes:
+      - ./shared:/app/shared:ro
     ports:
       - ${HOST_IP:-127.0.0.1}:8081:8080
     depends_on:
@@ -1394,9 +1396,15 @@ services:
       POSTGRES_SILVER_PASSWORD: ${POSTGRES_SILVER_PASSWORD:-postgres}
       POSTGRES_DB_TRAFFIC: ${POSTGRES_DB_TRAFFIC:-traffic}
       NATS_URL: nats://nats:4222
+      NATS_MON_URL: http://nats:8222
       MONITOR_URL: http://monitor:8090
+      VM_URL: http://victoriametrics:8428
+      VL_URL: http://victorialogs:9428
+      VMALERT_URL: http://vmalert:8880
     volumes:
       - ./serving/api:/app:ro
+      - ./shared:/opt/platform/shared:ro
+      - ./governance:/opt/platform/governance:ro
     ports:
       - ${HOST_IP:-127.0.0.1}:18000:8000
     depends_on:
@@ -1426,6 +1434,8 @@ services:
     restart: unless-stopped
     ports:
       - ${HOST_IP:-127.0.0.1}:8090:8090
+    env_file:
+      - .env
     environment:
       MONITOR_PORT: "8090"
       CHECK_INTERVAL: "30"
@@ -1439,11 +1449,18 @@ services:
       SEAWEEDFS_URL: http://seaweedfs:9333
       SEAWEEDFS_BRIDGE_URL: http://seaweedfs-bridge:8080
       NATS_MON_URL: http://nats:8222
+      NATS_EXPORTER_URL: http://nats-exporter:7777
       DEBEZIUM_WMATA_URL: http://debezium-wmata:8080
       DEBEZIUM_TRAFFIC_URL: http://debezium-traffic:8080
       DAGSTER_URL: http://dagster-webserver:3000
+      DAGSTER_USER_CODE_HOST: dagster-user-code
+      DAGSTER_USER_CODE_PORT: "4000"
       MLFLOW_URL: http://mlflow:5000
       TRINO_URL: http://trino:8080
+      SPARK_MASTER_URL: http://spark-master:8080
+      SPARK_WORKER_URL: http://spark-worker:8081
+      SERVING_API_URL: http://serving-api:8000
+      CADVISOR_URL: http://cadvisor:8080
       VM_URL: http://victoriametrics:8428
       VL_URL: http://victorialogs:9428
       VECTOR_URL: http://vector:8686
@@ -1452,6 +1469,8 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       - ./shared:/app/shared:ro
+      - consumer-state:/work/consumer:ro
+      - dlt-state:/work/dlt:ro
     depends_on:
       victoriametrics:
         condition: service_healthy

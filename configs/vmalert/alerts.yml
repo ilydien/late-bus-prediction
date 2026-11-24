@@ -76,3 +76,53 @@ groups:
           summary: "VictoriaMetrics storage free space < 1 GB"
           description: "Free bytes remaining: {{ $value }}."
           runbook: "docs/runbooks/alerts.md#alert-c-servicedown-resourcehigh"
+
+      # Alert D: Spock Multi-Master Replication & HAProxy Backend HA
+      - alert: SpockReplicationDown
+        expr: spock_subscription_is_replicating == 0
+        for: 1m
+        labels:
+          severity: critical
+          owner: platform-ops
+          category: replication
+        annotations:
+          summary: "Spock replication {{ $labels.subscription_name }} ({{ $labels.layer }}/{{ $labels.datname }}) is DOWN"
+          description: "Subscription {{ $labels.subscription_name }} on {{ $labels.layer }}/{{ $labels.datname }} is not replicating."
+          runbook: "docs/runbooks/alerts.md#alert-d-spockreplicationdown-haproxybackenddown"
+
+      - alert: HAProxyBackendDown
+        expr: haproxy_backend_active_servers{proxy=~"silver_.*|gold_.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          owner: platform-ops
+          category: database-ha
+        annotations:
+          summary: "HAProxy backend {{ $labels.proxy }} has 0 active servers"
+          description: "No healthy PostgreSQL nodes available for {{ $labels.proxy }}."
+          runbook: "docs/runbooks/alerts.md#alert-d-spockreplicationdown-haproxybackenddown"
+
+      # Alert E: Dead-Letter Queue (DLQ) & Serving API
+      - alert: DlqMessagesPresent
+        expr: increase(jetstream_stream_total_messages{stream_name="wmata-dlq"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          owner: streaming
+          category: dlq
+        annotations:
+          summary: "New messages routed to JetStream DLQ (wmata-dlq)"
+          description: "Poison-pill or late events entered wmata-dlq in the last 10 minutes (+{{ $value }})."
+          runbook: "docs/runbooks/alerts.md#alert-e-dlqmessagespresent"
+
+      - alert: ServingApiDown
+        expr: wmata_service_up{service="serving-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          owner: platform-ops
+          category: serving
+        annotations:
+          summary: "MetroPulse DC serving-api is DOWN"
+          description: "Serving API health probe failed for 1 minute."
+          runbook: "docs/runbooks/alerts.md#alert-c-servicedown-resourcehigh"

@@ -63,17 +63,28 @@ except ImportError:
     run_log = None  # type: ignore[assignment]
 
 try:
+    from shared.logging import run_context, setup_json_logging
     from shared import metrics as vm_metrics
 except ImportError:
+    run_context = None  # type: ignore[assignment]
+    setup_json_logging = None  # type: ignore[assignment]
     vm_metrics = None  # type: ignore[assignment]
 
 SILVER_MERGED_SUBJECT = os.environ.get("SILVER_MERGED_SUBJECT", "realtime.silver.merged")
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+_LOG_LEVEL = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+if setup_json_logging is not None:
+    setup_json_logging("stream-inference", level=_LOG_LEVEL)
+else:
+    logging.basicConfig(
+        level=_LOG_LEVEL,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 logger = logging.getLogger("stream-inference")
+
+
+def _run_ctx(run_id: str):
+    return run_context(run_id=run_id) if run_context is not None else contextlib.nullcontext(run_id)
 
 SILVER_HOST = os.environ.get("POSTGRES_SILVER_HOST", "haproxy")
 SILVER_PORT = int(os.environ.get("POSTGRES_SILVER_PORT", "5433"))
@@ -567,212 +578,257 @@ async def publish_nats_inference(payload: dict[str, Any]) -> None:
 
 def run_stream_inference_cycle(limit: int = 1000) -> dict[str, Any]:
     run_id = run_log.new_run_id() if run_log is not None else str(uuid.uuid4())
-    if run_log is not None:
-        run_log.safe_start_run(
-            run_id,
-            "stream_inference",
-            "gold",
-            input_datasets=["silver.wmata.bus_trip_snapshot", "silver.traffic.tomtom_flow_segment"],
-            output_datasets=["gold.wmata.trip_delay_features", "gold.wmata.model_predictions", NATS_SUBJECT],
-        )
-
-    try:
-        sync_counts = sync_silver_to_gold_live(limit=limit)
-        with connect_gold() as conn:
-            model, model_version, features, categories = ensure_champion_model(conn)
-            cols = list(dict.fromkeys(["trip_key", "snapshot_ts", "service_date", "target_deviation_15m"] + features))
-            df = pd.read_sql(
-                f"SELECT {', '.join(cols)} FROM public.trip_delay_features ORDER BY snapshot_ts DESC LIMIT %s",
-                conn,
-                params=(limit,),
+    with _run_ctx(run_id):
+        if run_log is not None:
+            run_log.safe_start_run(
+                run_id,
+                "stream_inference",
+                "gold",
+                input_datasets=["silver.wmata.bus_trip_snapshot", "silver.traffic.tomtom_flow_segment"],
+                output_datasets=["gold.wmata.trip_delay_features", "gold.wmata.model_predictions", NATS_SUBJECT],
             )
-            if df.empty:
-                summary = {"status": "idle", "run_id": run_id, "scored": 0, **sync_counts}
-                if run_log is not None:
-                    run_log.safe_finish_run(run_id, "success", row_counts=summary)
-                return summary
 
-            all_cats = list(dict.fromkeys(categories + [str(x) for x in df["route_id"].dropna().unique()]))
-            X = df[features].copy()
-            for f in features:
-                if f != "route_id":
-                    X[f] = pd.to_numeric(X[f], errors="coerce").fillna(0.0)
-            X["route_id"] = pd.Categorical(X["route_id"].astype(str), categories=all_cats)
-
-            preds = model.predict(X)
-            now = datetime.now(timezone.utc)
-            pred_rows = []
-            for pred_val, (_, row) in zip(preds, df.iterrows()):
-                p = float(pred_val)
-                actual = None if pd.isna(row.get("target_deviation_15m")) else float(row["target_deviation_15m"])
-                abs_err = None if actual is None else abs(p - actual)
-                pred_rows.append(
-                    (
-                        f"{row['trip_key']}|{row['snapshot_ts']}",
-                        model_version,
-                        now,
-                        row["trip_key"],
-                        row["snapshot_ts"],
-                        p,
-                        actual,
-                        abs_err,
-                        int(p > 5.0),
-                        None if actual is None else int(actual > 5.0),
-                        "success",
-                        None,
-                        run_id,
+        try:
+            return _run_stream_inference_cycle_inner(run_id, limit)
+        except Exception as exc:
+            if run_log is not None:
+                run_log.safe_finish_run(run_id, "failed", error=str(exc))
+            if vm_metrics is not None:
+                try:
+                    vm_metrics.inc_counter(
+                        "wmata_pipeline_job_runs_total",
+                        labels={
+                            "service": "stream-inference",
+                            "job": "stream_inference",
+                            "domain": "wmata",
+                            "layer": "gold",
+                            "status": "failed",
+                        },
                     )
+                except Exception:  # noqa: BLE001
+                    pass
+            logger.exception(
+                "Stream inference cycle failed: %s",
+                exc,
+                extra={
+                    "domain": "wmata",
+                    "layer": "gold",
+                    "job": "stream_inference",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
+
+
+def _run_stream_inference_cycle_inner(run_id: str, limit: int) -> dict[str, Any]:
+    t_cycle = time.monotonic()
+    sync_counts = sync_silver_to_gold_live(limit=limit)
+    with connect_gold() as conn:
+        model, model_version, features, categories = ensure_champion_model(conn)
+        cols = list(dict.fromkeys(["trip_key", "snapshot_ts", "service_date", "target_deviation_15m"] + features))
+        df = pd.read_sql(
+            f"SELECT {', '.join(cols)} FROM public.trip_delay_features ORDER BY snapshot_ts DESC LIMIT %s",
+            conn,
+            params=(limit,),
+        )
+        if df.empty:
+            summary = {"status": "idle", "run_id": run_id, "scored": 0, **sync_counts}
+            if run_log is not None:
+                run_log.safe_finish_run(run_id, "success", row_counts=summary)
+            logger.info(
+                "Stream inference idle (no features)",
+                extra={"domain": "wmata", "layer": "gold", "job": "stream_inference", "row_count": 0},
+            )
+            return summary
+
+        all_cats = list(dict.fromkeys(categories + [str(x) for x in df["route_id"].dropna().unique()]))
+        X = df[features].copy()
+        for f in features:
+            if f != "route_id":
+                X[f] = pd.to_numeric(X[f], errors="coerce").fillna(0.0)
+        X["route_id"] = pd.Categorical(X["route_id"].astype(str), categories=all_cats)
+
+        preds = model.predict(X)
+        now = datetime.now(timezone.utc)
+        pred_rows = []
+        for pred_val, (_, row) in zip(preds, df.iterrows()):
+            p = float(pred_val)
+            actual = None if pd.isna(row.get("target_deviation_15m")) else float(row["target_deviation_15m"])
+            abs_err = None if actual is None else abs(p - actual)
+            pred_rows.append(
+                (
+                    f"{row['trip_key']}|{row['snapshot_ts']}",
+                    model_version,
+                    now,
+                    row["trip_key"],
+                    row["snapshot_ts"],
+                    p,
+                    actual,
+                    abs_err,
+                    int(p > 5.0),
+                    None if actual is None else int(actual > 5.0),
+                    "success",
+                    None,
+                    run_id,
                 )
+            )
 
-            with conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO public.model_predictions
-                      (input_record_id, model_version, predicted_at, trip_key, snapshot_ts,
-                       predicted_delay_min, actual_delay_min, abs_error, predicted_late,
-                       actual_late, status, error, inference_run_id)
-                    VALUES %s
-                    ON CONFLICT (input_record_id, model_version) DO UPDATE SET
-                      predicted_at = EXCLUDED.predicted_at,
-                      predicted_delay_min = EXCLUDED.predicted_delay_min,
-                      actual_delay_min = EXCLUDED.actual_delay_min,
-                      abs_error = EXCLUDED.abs_error,
-                      predicted_late = EXCLUDED.predicted_late,
-                      actual_late = EXCLUDED.actual_late,
-                      status = EXCLUDED.status,
-                      error = EXCLUDED.error,
-                      inference_run_id = EXCLUDED.inference_run_id
-                    """,
-                    pred_rows,
-                    page_size=2000,
-                )
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO public.model_predictions
+                  (input_record_id, model_version, predicted_at, trip_key, snapshot_ts,
+                   predicted_delay_min, actual_delay_min, abs_error, predicted_late,
+                   actual_late, status, error, inference_run_id)
+                VALUES %s
+                ON CONFLICT (input_record_id, model_version) DO UPDATE SET
+                  predicted_at = EXCLUDED.predicted_at,
+                  predicted_delay_min = EXCLUDED.predicted_delay_min,
+                  actual_delay_min = EXCLUDED.actual_delay_min,
+                  abs_error = EXCLUDED.abs_error,
+                  predicted_late = EXCLUDED.predicted_late,
+                  actual_late = EXCLUDED.actual_late,
+                  status = EXCLUDED.status,
+                  error = EXCLUDED.error,
+                  inference_run_id = EXCLUDED.inference_run_id
+                """,
+                pred_rows,
+                page_size=2000,
+            )
 
-                # Reconcile real +15m ground truth before refreshing daily performance
-            conn.commit()
+            # Reconcile real +15m ground truth before refreshing daily performance
+        conn.commit()
 
-        reconciled_count = reconcile_ground_truth_15m(lookback_hours=6)
+    reconciled_count = reconcile_ground_truth_15m(lookback_hours=6)
 
-        with connect_gold() as pconn:
-            with pconn.cursor() as cur:
-                # Update daily model performance metrics:
-                # Prefer true +15m observed actuals (`split = 'live_observed'`) once >= 20 exist
-                # for a service_date; fall back to bootstrap targets during cold-start first 14m.
-                cur.execute(
-                    """
-                    WITH per_day AS (
-                        SELECT f.service_date,
-                               p.model_version,
-                               count(*) FILTER (WHERE f.split = 'live_observed') AS n_obs
-                        FROM public.model_predictions p
-                        JOIN public.trip_delay_features f
-                          ON f.trip_key = p.trip_key AND f.snapshot_ts = p.snapshot_ts
-                        WHERE p.status = 'success' AND p.actual_delay_min IS NOT NULL AND f.service_date IS NOT NULL
-                        GROUP BY f.service_date, p.model_version
-                    )
-                    INSERT INTO public.model_performance_daily
-                      (service_date, model_version, n_predictions, mae, rmse, accuracy_late_5, avg_error)
+    with connect_gold() as pconn:
+        with pconn.cursor() as cur:
+            # Update daily model performance metrics:
+            # Prefer true +15m observed actuals (`split = 'live_observed'`) once >= 20 exist
+            # for a service_date; fall back to bootstrap targets during cold-start first 14m.
+            cur.execute(
+                """
+                WITH per_day AS (
                     SELECT f.service_date,
                            p.model_version,
-                           count(*) AS n_predictions,
-                           avg(p.abs_error) AS mae,
-                           sqrt(avg(power(p.predicted_delay_min - p.actual_delay_min, 2))) AS rmse,
-                           avg(CASE WHEN p.predicted_late = p.actual_late THEN 1.0 ELSE 0.0 END) AS accuracy_late_5,
-                           avg(p.predicted_delay_min - p.actual_delay_min) AS avg_error
+                           count(*) FILTER (WHERE f.split = 'live_observed') AS n_obs
                     FROM public.model_predictions p
                     JOIN public.trip_delay_features f
                       ON f.trip_key = p.trip_key AND f.snapshot_ts = p.snapshot_ts
-                    JOIN per_day d
-                      ON d.service_date = f.service_date AND d.model_version = p.model_version
-                    WHERE p.status = 'success'
-                      AND p.actual_delay_min IS NOT NULL
-                      AND f.service_date IS NOT NULL
-                      AND (d.n_obs < 20 OR f.split = 'live_observed')
+                    WHERE p.status = 'success' AND p.actual_delay_min IS NOT NULL AND f.service_date IS NOT NULL
                     GROUP BY f.service_date, p.model_version
-                    ON CONFLICT (service_date, model_version) DO UPDATE SET
-                      n_predictions = EXCLUDED.n_predictions,
-                      mae = EXCLUDED.mae,
-                      rmse = EXCLUDED.rmse,
-                      accuracy_late_5 = EXCLUDED.accuracy_late_5,
-                      avg_error = EXCLUDED.avg_error
-                    """
                 )
-            pconn.commit()
+                INSERT INTO public.model_performance_daily
+                  (service_date, model_version, n_predictions, mae, rmse, accuracy_late_5, avg_error)
+                SELECT f.service_date,
+                       p.model_version,
+                       count(*) AS n_predictions,
+                       avg(p.abs_error) AS mae,
+                       sqrt(avg(power(p.predicted_delay_min - p.actual_delay_min, 2))) AS rmse,
+                       avg(CASE WHEN p.predicted_late = p.actual_late THEN 1.0 ELSE 0.0 END) AS accuracy_late_5,
+                       avg(p.predicted_delay_min - p.actual_delay_min) AS avg_error
+                FROM public.model_predictions p
+                JOIN public.trip_delay_features f
+                  ON f.trip_key = p.trip_key AND f.snapshot_ts = p.snapshot_ts
+                JOIN per_day d
+                  ON d.service_date = f.service_date AND d.model_version = p.model_version
+                WHERE p.status = 'success'
+                  AND p.actual_delay_min IS NOT NULL
+                  AND f.service_date IS NOT NULL
+                  AND (d.n_obs < 20 OR f.split = 'live_observed')
+                GROUP BY f.service_date, p.model_version
+                ON CONFLICT (service_date, model_version) DO UPDATE SET
+                  n_predictions = EXCLUDED.n_predictions,
+                  mae = EXCLUDED.mae,
+                  rmse = EXCLUDED.rmse,
+                  accuracy_late_5 = EXCLUDED.accuracy_late_5,
+                  avg_error = EXCLUDED.avg_error
+                """
+            )
+        pconn.commit()
 
-        late_count = sum(1 for r in pred_rows if r[8] == 1)
-        event_payload = {
-            "inference_run_id": run_id,
-            "model_version": model_version,
-            "predicted_at": now.isoformat(),
-            "scored_count": len(pred_rows),
-            "predicted_late_count": late_count,
-            "reconciled_ground_truth": reconciled_count,
-            "avg_predicted_delay_min": round(float(np.mean(preds)), 3),
-        }
-        asyncio.run(publish_nats_inference(event_payload))
+    late_count = sum(1 for r in pred_rows if r[8] == 1)
+    event_payload = {
+        "inference_run_id": run_id,
+        "model_version": model_version,
+        "predicted_at": now.isoformat(),
+        "scored_count": len(pred_rows),
+        "predicted_late_count": late_count,
+        "reconciled_ground_truth": reconciled_count,
+        "avg_predicted_delay_min": round(float(np.mean(preds)), 3),
+    }
+    asyncio.run(publish_nats_inference(event_payload))
 
-        if vm_metrics is not None:
-            try:
-                now_s = time.time()
-                vm_metrics.push_metric(
-                    "wmata_stream_last_event_timestamp",
-                    now_s,
-                    labels={"stream": "wmata-inference", "service": "stream-inference"},
-                )
+    duration_s = round(time.monotonic() - t_cycle, 3)
+    if vm_metrics is not None:
+        try:
+            now_s = time.time()
+            vm_metrics.push_metric(
+                "wmata_stream_last_event_timestamp",
+                now_s,
+                labels={"stream": "wmata-inference", "service": "stream-inference"},
+            )
+            vm_metrics.inc_counter(
+                "wmata_stream_inference_scored_total",
+                labels={"model_version": model_version},
+                amount=float(len(pred_rows)),
+            )
+            if reconciled_count > 0:
                 vm_metrics.inc_counter(
-                    "wmata_stream_inference_scored_total",
+                    "wmata_stream_ground_truth_reconciled_total",
                     labels={"model_version": model_version},
-                    amount=float(len(pred_rows)),
+                    amount=float(reconciled_count),
                 )
-                if reconciled_count > 0:
-                    vm_metrics.inc_counter(
-                        "wmata_stream_ground_truth_reconciled_total",
-                        labels={"model_version": model_version},
-                        amount=float(reconciled_count),
-                    )
-                vm_metrics.inc_counter(
-                    "wmata_pipeline_job_runs_total",
-                    labels={
-                        "service": "stream-inference",
-                        "job": "stream_inference",
-                        "domain": "wmata",
-                        "layer": "gold",
-                        "status": "success",
-                    },
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            vm_metrics.inc_counter(
+                "wmata_pipeline_job_runs_total",
+                labels={
+                    "service": "stream-inference",
+                    "job": "stream_inference",
+                    "domain": "wmata",
+                    "layer": "gold",
+                    "status": "success",
+                },
+            )
+            vm_metrics.push_metric(
+                "wmata_pipeline_job_duration_seconds",
+                duration_s,
+                labels={
+                    "service": "stream-inference",
+                    "job": "stream_inference",
+                    "domain": "wmata",
+                    "layer": "gold",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
-        summary = {
-            "status": "ok",
-            "run_id": run_id,
-            "model_version": model_version,
-            "scored": len(pred_rows),
-            "predicted_late": late_count,
-            "reconciled_15m": reconciled_count,
-            **sync_counts,
-        }
-        if run_log is not None:
-            run_log.safe_finish_run(run_id, "success", row_counts=summary)
-        return summary
-    except Exception as exc:
-        if run_log is not None:
-            run_log.safe_finish_run(run_id, "failed", error=str(exc))
-        if vm_metrics is not None:
-            try:
-                vm_metrics.inc_counter(
-                    "wmata_pipeline_job_runs_total",
-                    labels={
-                        "service": "stream-inference",
-                        "job": "stream_inference",
-                        "domain": "wmata",
-                        "layer": "gold",
-                        "status": "failed",
-                    },
-                )
-            except Exception:  # noqa: BLE001
-                pass
-        raise
+    summary = {
+        "status": "ok",
+        "run_id": run_id,
+        "model_version": model_version,
+        "scored": len(pred_rows),
+        "predicted_late": late_count,
+        "reconciled_15m": reconciled_count,
+        **sync_counts,
+    }
+    if run_log is not None:
+        run_log.safe_finish_run(run_id, "success", row_counts=summary)
+    logger.info(
+        "Scored %d predictions (%d late, reconciled=%d, model=%s)",
+        len(pred_rows),
+        late_count,
+        reconciled_count,
+        model_version,
+        extra={
+            "domain": "wmata",
+            "layer": "gold",
+            "job": "stream_inference",
+            "duration_ms": round(duration_s * 1000, 2),
+            "row_count": len(pred_rows),
+        },
+    )
+    return summary
 
 
 def match_future_observations(

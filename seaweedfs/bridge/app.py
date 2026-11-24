@@ -19,9 +19,22 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+for _cand in (*(str(p) for p in Path(__file__).resolve().parents), "/app"):
+    if _cand not in sys.path:
+        sys.path.insert(0, _cand)
+
+try:
+    from shared.logging import run_context, setup_json_logging
+except ImportError:  # pragma: no cover
+    run_context = None  # type: ignore[assignment]
+    setup_json_logging = None  # type: ignore[assignment]
 
 try:
     import nats
@@ -38,11 +51,19 @@ ROUTES = {
     "/buckets/traffic/": "traffic.realtime.bronze_data",
 }
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+_LOG_LEVEL = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+if setup_json_logging is not None:
+    setup_json_logging("seaweedfs-bridge", level=_LOG_LEVEL)
+else:
+    logging.basicConfig(
+        level=_LOG_LEVEL,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 log = logging.getLogger("seaweedfs-bridge")
+
+
+def _run_ctx(prefix: str):
+    return run_context(prefix) if run_context is not None else nullcontext("unassigned")
 
 
 class Publisher:
@@ -181,19 +202,36 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "seaweedfs-bridge/1.0"
 
     def log_message(self, fmt, *args) -> None:  # route access logs via logging
-        log.info("%s - %s", self.address_string(), fmt % args)
+        msg = fmt % args
+        if "GET /health" in msg:
+            log.debug("%s - %s", self.address_string(), msg)
+        else:
+            log.info(
+                "%s - %s",
+                self.address_string(),
+                msg,
+                extra={"domain": "infra", "layer": "bronze", "job": "seaweedfs_bridge"},
+            )
 
-    def _reply(self, status: int, body: str) -> None:
+    def _reply(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
         data = body.encode()
         self.send_response(status)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._reply(200, "ok")
+            payload = json.dumps(
+                {
+                    "status": "ok",
+                    "service": "seaweedfs-bridge",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "checks": {"nats": "ok" if (publisher._nc is not None and not publisher._nc.is_closed) else "lazy"},
+                }
+            )
+            self._reply(200, payload, content_type="application/json")
         else:
             self._reply(404, "not found")
 
@@ -202,43 +240,65 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, "not found")
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._reply(400, "bad content-length")
-            return
+        with _run_ctx("bridge"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._reply(400, "bad content-length")
+                return
 
-        raw = self.rfile.read(length)
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError:
-            self._reply(400, "invalid json")
-            return
+            raw = self.rfile.read(length)
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning(
+                    "Rejected malformed JSON webhook payload",
+                    extra={"domain": "infra", "layer": "bronze", "job": "seaweedfs_bridge"},
+                )
+                self._reply(400, "invalid json")
+                return
 
-        key = event.get("key") or ""
-        subject = route(key)
-        if subject is None:
-            # Not a bronze bucket we subscribe to: accept so SeaweedFS does not
-            # keep retrying an event we intentionally drop.
-            self._reply(200, "ignored")
-            return
+            key = event.get("key") or ""
+            subject = route(key)
+            if subject is None:
+                # Not a bronze bucket we subscribe to: accept so SeaweedFS does not
+                # keep retrying an event we intentionally drop.
+                self._reply(200, "ignored")
+                return
 
-        # Retries replay identical bytes; hashing the payload lets JetStream
-        # dedupe them inside the stream's duplicate window.
-        raw_sha256 = hashlib.sha256(raw).hexdigest()
-        enriched = enrich_envelope(event, raw_sha256)
-        msg_id = str(enriched.get("event_id") or raw_sha256)
-        payload = json.dumps(enriched, separators=(",", ":")).encode("utf-8")
+            domain = "wmata" if subject.startswith("wmata.") else "traffic"
+            # Retries replay identical bytes; hashing the payload lets JetStream
+            # dedupe them inside the stream's duplicate window.
+            raw_sha256 = hashlib.sha256(raw).hexdigest()
+            enriched = enrich_envelope(event, raw_sha256)
+            msg_id = str(enriched.get("event_id") or raw_sha256)
+            payload = json.dumps(enriched, separators=(",", ":")).encode("utf-8")
 
-        try:
-            publisher.publish(subject, payload, msg_id)
-        except Exception:
-            log.exception("publish to %s failed for %s", subject, key)
-            self._reply(503, "nats unavailable")
-            return
+            try:
+                publisher.publish(subject, payload, msg_id)
+            except Exception as exc:
+                log.exception(
+                    "Publish to %s failed for %s",
+                    subject,
+                    key,
+                    extra={
+                        "domain": domain,
+                        "layer": "bronze",
+                        "job": "seaweedfs_bridge",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                self._reply(503, "nats unavailable")
+                return
 
-        log.info("published %s -> %s", event.get("event_type", "?"), subject)
-        self._reply(200, "ok")
+            log.info(
+                "Published %s -> %s (%s)",
+                event.get("event_type", "?"),
+                subject,
+                enriched.get("s3_key") or key,
+                extra={"domain": domain, "layer": "bronze", "job": "seaweedfs_bridge", "row_count": 1},
+            )
+            self._reply(200, "ok")
 
 
 def main() -> None:
