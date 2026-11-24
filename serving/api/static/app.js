@@ -274,8 +274,11 @@
     rcCauseFilter: "all",
     mlPredFilter: "all",
     pipeLayerFilter: "all",
+    selectedRunError: null,
 
     streamStatus: null,
+    opsOverview: null,
+    opsLogs: null,
     routeRows: [],
     hourlyRows: [],
     modelRows: [],
@@ -473,6 +476,10 @@
     document.getElementById("sidebar").classList.remove("open");
 
     renderActivePage();
+
+    if (key === "pipeline" && !state.opsLogs) {
+      loadOpsLogs();
+    }
 
     if (key === "live-map") {
       setTimeout(() => {
@@ -1660,8 +1667,117 @@
     return "ok";
   }
 
+  function renderOpsLogsTable() {
+    const tbody = document.getElementById("ops-logs-tbody");
+    const qEl = document.getElementById("ops-log-query");
+    const cntEl = document.getElementById("ops-log-count");
+    const detailBox = document.getElementById("ops-log-detail-box");
+    if (!tbody) return;
+
+    const payload = state.opsLogs || {};
+    const logs = payload.logs || [];
+    if (qEl) qEl.textContent = `Query: ${payload.query || "*"}`;
+    if (cntEl) {
+      cntEl.className = `badge ${payload.reachable === false ? "crimson" : "neutral"} mono`;
+      cntEl.textContent = payload.reachable === false ? "VictoriaLogs offline" : `${logs.length} logs`;
+    }
+    if (detailBox) detailBox.style.display = "none";
+
+    tbody.innerHTML = "";
+    if (logs.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="6" class="empty-cell">No matching logs found</td></tr>`;
+      return;
+    }
+
+    logs.forEach(entry => {
+      const lvl = String(entry.level || "INFO").toUpperCase();
+      const lvlCls = (lvl === "ERROR" || lvl === "CRITICAL") ? "crimson" : lvl === "WARNING" ? "amber" : lvl === "DEBUG" ? "neutral" : "emerald";
+      const rowCls = (lvl === "ERROR" || lvl === "CRITICAL") ? "ops-log-row is-error clickable" : lvl === "WARNING" ? "ops-log-row is-warn clickable" : "ops-log-row clickable";
+      const tsShort = String(entry.timestamp || "").replace("T", " ").slice(11, 19) || "—";
+      const rid = String(entry.run_id || "unassigned");
+      const ridShort = rid === "unassigned" ? "unassigned" : `${rid.slice(0, 12)}…`;
+      const fmt = String(entry.log_format || "text");
+      const errSuffix = entry.error_type ? ` [${entry.error_type}]` : "";
+
+      const tr = document.createElement("tr");
+      tr.className = rowCls;
+      tr.innerHTML = `
+        <td class="mono" style="color:var(--text-secondary)">${escapeHtml(tsShort)}</td>
+        <td><span class="badge ${lvlCls}">${escapeHtml(lvl)}</span></td>
+        <td class="mono"><strong>${escapeHtml(entry.service || "—")}</strong></td>
+        <td class="mono" title="${escapeHtml(rid)}">${escapeHtml(ridShort)}</td>
+        <td><span class="badge ${fmt === "json" ? "indigo" : "neutral"}">${escapeHtml(fmt.toUpperCase())}</span></td>
+        <td class="mono ops-log-msg">${escapeHtml(String(entry.message || "") + errSuffix)}</td>
+      `;
+      tr.addEventListener("click", () => {
+        if (!detailBox) return;
+        const lines = [
+          `Time: ${entry.timestamp || "—"} | Service: ${entry.service || "—"} | Level: ${lvl} | Run ID: ${rid}`,
+          entry.job ? `Domain/Layer/Job: ${entry.domain || "—"} / ${entry.layer || "—"} / ${entry.job}` : "",
+          entry.duration_ms !== null && entry.duration_ms !== undefined ? `Duration: ${entry.duration_ms} ms` : "",
+          `Message: ${entry.message || ""}`,
+          entry.exception ? `\nException:\n${entry.exception}` : "",
+        ].filter(Boolean);
+        detailBox.textContent = lines.join("\n");
+        detailBox.style.display = "block";
+      });
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function loadOpsLogs() {
+    const svc = document.getElementById("log-service-filter")?.value || "";
+    const lvl = document.getElementById("log-level-filter")?.value || "";
+    const fmt = document.getElementById("log-format-filter")?.value || "";
+    const rid = document.getElementById("log-runid-filter")?.value.trim() || "";
+    const q = document.getElementById("log-search-filter")?.value.trim() || "";
+    const params = new URLSearchParams({ limit: "80" });
+    if (svc) params.set("service", svc);
+    if (lvl) params.set("level", lvl);
+    if (fmt) params.set("log_format", fmt);
+    if (rid) params.set("run_id", rid);
+    if (q) params.set("q", q);
+    const resp = await fetchJsonOrNull(`/v1/ops/logs?${params.toString()}`);
+    if (resp) {
+      state.opsLogs = resp;
+      renderOpsLogsTable();
+    }
+  }
+
+  function populateLogServicesDropdown(servicesObj) {
+    const sel = document.getElementById("log-service-filter");
+    if (!sel) return;
+    const cur = sel.value;
+    const known = new Set([
+      "serving-api",
+      "bronze-consumer",
+      "stream-inference",
+      "seaweedfs-bridge",
+      "wmata-poller",
+      "tomtom-poller",
+      "health-monitor",
+      ...Object.keys(servicesObj || {}),
+    ]);
+    sel.innerHTML = `<option value="">All Services</option>`;
+    Array.from(known).sort().forEach(s => {
+      const opt = document.createElement("option");
+      opt.value = s;
+      opt.textContent = s;
+      sel.appendChild(opt);
+    });
+    if (cur && known.has(cur)) sel.value = cur;
+  }
+
   function renderPipelinePage() {
     const st = state.streamStatus || {};
+    const ops = state.opsOverview || {};
+    const mon = ops.monitor || {};
+    const alertsObj = ops.alerts || {};
+    const replObj = ops.replication || {};
+    const resObj = ops.resources || {};
+    const perfObj = ops.pipeline_performance || {};
+    const dqObj = ops.data_quality || {};
+
     const counts = st.counts || {};
     const fresh = st.freshness || {};
     const tel = st.telemetry || {};
@@ -1669,6 +1785,59 @@
     const gridColor = cssVar("--chart-grid");
     const tickColor = cssVar("--chart-tick");
 
+    // 1. Ops Signal Strip (Opsi A: CPU used/total cores, RAM used/total GB, Disk used/total GB)
+    const servicesMap = mon.services || {};
+    const svcNames = Object.keys(servicesMap).sort();
+    const upCount = mon.up_count || 0;
+    const totalCount = mon.total_count || svcNames.length;
+    const svcSumEl = document.getElementById("ops-svc-summary");
+    if (svcSumEl) {
+      svcSumEl.className = `badge ${!mon.reachable ? "neutral" : upCount === totalCount ? "emerald" : "crimson"}`;
+      svcSumEl.textContent = mon.reachable ? `${upCount} / ${totalCount} UP` : "Monitor offline";
+    }
+
+    const firingCnt = alertsObj.firing_count || 0;
+    const pendingCnt = alertsObj.pending_count || 0;
+    const alertSumEl = document.getElementById("ops-alert-summary");
+    if (alertSumEl) {
+      alertSumEl.className = `badge ${firingCnt > 0 ? "crimson" : pendingCnt > 0 ? "amber" : "emerald"}`;
+      alertSumEl.textContent = firingCnt > 0 || pendingCnt > 0 ? `${firingCnt} Firing · ${pendingCnt} Pending` : `0 Firing (${alertsObj.rules_total || 0} rules)`;
+    }
+
+    const spockRows = replObj.spock || [];
+    const spockOk = spockRows.filter(r => Number(r.is_replicating) === 1).length;
+    const spockSumEl = document.getElementById("ops-spock-summary");
+    if (spockSumEl) {
+      spockSumEl.className = `badge ${spockRows.length === 0 ? "neutral" : spockOk === spockRows.length ? "emerald" : "crimson"}`;
+      spockSumEl.textContent = spockRows.length ? `${spockOk} / ${spockRows.length} Replicating` : "No metrics";
+    }
+
+    const host = mon.host || {};
+    const hostSumEl = document.getElementById("ops-host-summary");
+    if (hostSumEl) {
+      if (host.memory_total_gb !== undefined || host.cpu_cores !== undefined) {
+        const cpuTxt = host.cpu_cores !== undefined ? `CPU ${Number(host.cpu_used_cores || 0).toFixed(2)}/${Math.round(Number(host.cpu_cores))}c` : `CPU ${host.cpu_percent ?? "—"}%`;
+        const ramTxt = host.memory_total_gb !== undefined ? `RAM ${Number(host.memory_used_gb || 0).toFixed(1)}/${Number(host.memory_total_gb).toFixed(1)} GB` : `RAM ${host.memory_percent ?? "—"}%`;
+        const diskTxt = host.disk_total_gb !== undefined ? `Disk ${Number(host.disk_used_gb || 0).toFixed(1)}/${Number(host.disk_total_gb).toFixed(1)} GB` : `Disk ${host.disk_percent ?? "—"}%`;
+        hostSumEl.textContent = `${cpuTxt} · ${ramTxt} · ${diskTxt}`;
+      } else {
+        hostSumEl.textContent = "—";
+      }
+    }
+
+    const stripEl = document.getElementById("ops-signal-strip");
+    if (stripEl) {
+      const hasIssues = firingCnt > 0 || (mon.reachable && upCount < totalCount) || (spockRows.length > 0 && spockOk < spockRows.length);
+      stripEl.className = `signal-strip ${hasIssues ? (firingCnt > 0 || upCount < totalCount ? "crit" : "warn") : "good"}`;
+    }
+
+    const tgEl = document.getElementById("ops-telegram-badge");
+    if (tgEl) {
+      tgEl.className = `badge ${mon.telegram_configured ? "emerald" : "amber"}`;
+      tgEl.textContent = mon.telegram_configured ? "Telegram: Configured" : "Telegram: Not Configured";
+    }
+
+    // 2. Medallion Flow + Freshness KPIs
     document.getElementById("pipe-silver-buses").textContent = (counts.silver_bus_snapshots || 0).toLocaleString();
     document.getElementById("pipe-silver-sub").textContent = `${counts.active_vehicles || 0} veh · ${state.corridors.length}c / ${state.incidents.length}i`;
     document.getElementById("pipe-gold-features").textContent = (counts.gold_features || 0).toLocaleString();
@@ -1697,12 +1866,195 @@
 
     const finished = runs.filter(r => ["success", "failed"].includes(String(r.status || "").toLowerCase()));
     const ok = finished.filter(r => String(r.status || "").toLowerCase() === "success");
-    const sr = finished.length ? Math.round((ok.length / finished.length) * 100) : 100;
+    const sr = finished.length ? Math.round((ok.length / finished.length) * 100) : (perfObj.overall_success_rate ?? 100);
     document.getElementById("pipe-success-rate").textContent = `${tel.sse_subscribers || 1} SSE · Jobs ${sr}%`;
     document.getElementById("pipe-sr-bar").style.width = `${sr}%`;
 
-    const filteredRuns = runs.filter(r => state.pipeLayerFilter === "all" || String(r.layer || "").toLowerCase() === state.pipeLayerFilter);
+    // 3. Service Health Matrix + Active vmalert List
+    populateLogServicesDropdown(servicesMap);
+    const probeAgeEl = document.getElementById("ops-probe-age");
+    if (probeAgeEl) {
+      const ageS = mon.last_probe_ts ? Math.max(0, Math.round(Date.now() / 1000 - Number(mon.last_probe_ts))) : null;
+      probeAgeEl.textContent = ageS !== null ? `Probe ${fmtAge(ageS)}` : "Probe —";
+    }
+
+    const svcGrid = document.getElementById("ops-svc-grid");
+    if (svcGrid) {
+      svcGrid.innerHTML = "";
+      if (svcNames.length === 0) {
+        svcGrid.innerHTML = `<div class="empty-cell" style="grid-column:1/-1">Monitor service unavailable</div>`;
+      } else {
+        svcNames.forEach(name => {
+          const info = servicesMap[name] || {};
+          const isUp = Boolean(info.up);
+          const latMs = info.duration_s !== null && info.duration_s !== undefined ? `${Math.round(Number(info.duration_s) * 1000)}ms` : "—";
+          const pill = document.createElement("button");
+          pill.type = "button";
+          pill.className = `ops-svc-pill${isUp ? "" : " down"}`;
+          pill.title = `Filter logs for ${name}`;
+          pill.innerHTML = `
+            <span class="ops-svc-name"><span class="dot-sm" style="background:${isUp ? "var(--emerald)" : "var(--crimson)"}"></span>${escapeHtml(name)}</span>
+            <span class="mono ops-svc-lat">${escapeHtml(latMs)}</span>
+          `;
+          pill.addEventListener("click", () => {
+            const logSvcName = name === "consumer" ? "bronze-consumer" : name;
+            const sel = document.getElementById("log-service-filter");
+            if (sel) {
+              if (!Array.from(sel.options).some(o => o.value === logSvcName)) {
+                const opt = document.createElement("option");
+                opt.value = logSvcName;
+                opt.textContent = logSvcName;
+                sel.appendChild(opt);
+              }
+              sel.value = logSvcName;
+              loadOpsLogs();
+              sel.scrollIntoView({ behavior: "smooth", block: "center" });
+            }
+          });
+          svcGrid.appendChild(pill);
+        });
+      }
+    }
+
+    const alertListEl = document.getElementById("ops-alert-list");
+    if (alertListEl) {
+      const activeList = alertsObj.active || [];
+      if (activeList.length === 0) {
+        alertListEl.style.display = "none";
+      } else {
+        alertListEl.style.display = "flex";
+        alertListEl.innerHTML = activeList.slice(0, 6).map(al => {
+          const stName = String(al.state || "firing").toLowerCase();
+          const summary = (al.annotations && al.annotations.summary) || al.name || "Alert";
+          return `
+            <div class="ops-alert-item ${stName === "pending" ? "pending" : ""}">
+              <span><strong>${escapeHtml(al.name || "Alert")}</strong> — ${escapeHtml(summary)}</span>
+              <span class="badge ${stName === "pending" ? "amber" : "crimson"}">${escapeHtml(stName.toUpperCase())}</span>
+            </div>
+          `;
+        }).join("");
+      }
+    }
+
+    // 4. Replication & Top Container Resources
+    const totMemEl = document.getElementById("ops-total-mem");
+    if (totMemEl) {
+      const totGb = (Number(resObj.total_memory_mb || 0) / 1024).toFixed(2);
+      totMemEl.textContent = `${totGb} GB Containers`;
+    }
+
+    const replEl = document.getElementById("ops-repl-badges");
+    if (replEl) {
+      const badges = [];
+      spockRows.forEach(s => {
+        const okRepl = Number(s.is_replicating) === 1;
+        badges.push(`<span class="badge ${okRepl ? "emerald" : "crimson"}" title="${escapeHtml(s.subscription_name)}">Spock ${escapeHtml(s.layer)}/${escapeHtml(s.datname)} ${okRepl ? "✓" : "✕"}</span>`);
+      });
+      (replObj.haproxy || []).forEach(h => {
+        const upH = Number(h.active_servers) > 0;
+        const shortName = String(h.proxy || "").replace("_backend", "");
+        badges.push(`<span class="badge ${upH ? "sky" : "crimson"}">HAProxy ${escapeHtml(shortName)}: ${h.active_servers}</span>`);
+      });
+      replEl.innerHTML = badges.length ? badges.join("") : `<span class="badge neutral">No replication metrics</span>`;
+    }
+
+    const resBarsEl = document.getElementById("ops-res-bars");
+    if (resBarsEl) {
+      const topMem = resObj.top_memory || [];
+      const cpuMap = new Map((resObj.top_cpu || []).map(x => [x.name, x.cpu_pct]));
+      if (topMem.length === 0) {
+        resBarsEl.innerHTML = `<div class="empty-cell">No cAdvisor metrics</div>`;
+      } else {
+        const maxMem = Math.max(100, ...topMem.map(x => Number(x.mem_mb || 0)));
+        resBarsEl.innerHTML = topMem.slice(0, 6).map(item => {
+          const mb = Number(item.mem_mb || 0);
+          const cpu = cpuMap.get(item.name);
+          const pct = Math.min(100, Math.round((mb / maxMem) * 100));
+          const col = pct >= 80 ? "var(--indigo)" : "var(--brand)";
+          return `
+            <div class="vbar-item">
+              <div class="vbar-head">
+                <span class="vbar-name">${escapeHtml(item.name)}</span>
+                <span class="vbar-nums">${mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(0)} MB`}${cpu !== undefined ? ` · ${Number(cpu).toFixed(1)}% CPU` : ""}</span>
+              </div>
+              <div class="vbar-track"><span style="width:${pct}%;background:${col}"></span></div>
+            </div>
+          `;
+        }).join("");
+      }
+    }
+
+    // 5. Pipeline Job Performance (Chart + Table)
+    const byJob = perfObj.by_job || [];
+    const perfRateEl = document.getElementById("ops-perf-rate");
+    if (perfRateEl) {
+      perfRateEl.textContent = `Success ${perfObj.overall_success_rate ?? 100}%`;
+    }
+
+    safeChart("pipePerf", "pipePerfChart", {
+      type: "bar",
+      data: {
+        labels: byJob.slice(0, 6).map(j => j.job_name),
+        datasets: [
+          {
+            label: "Avg (s)",
+            data: byJob.slice(0, 6).map(j => Number(j.avg_duration_sec || 0)),
+            backgroundColor: cssVar("--brand") || "#0066b3",
+            borderRadius: 4,
+            maxBarThickness: 18,
+          },
+          {
+            label: "P95 (s)",
+            data: byJob.slice(0, 6).map(j => Number(j.p95_duration_sec || 0)),
+            backgroundColor: cssVar("--indigo") || "#4f46e5",
+            borderRadius: 4,
+            maxBarThickness: 18,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: true, labels: { color: tickColor, boxWidth: 10 } } },
+        scales: {
+          x: { ticks: { color: tickColor }, grid: { display: false } },
+          y: { beginAtZero: true, ticks: { color: tickColor }, grid: { color: gridColor } },
+        },
+      },
+    });
+
+    const perfTbody = document.getElementById("ops-perf-tbody");
+    if (perfTbody) {
+      perfTbody.innerHTML = "";
+      if (byJob.length === 0) {
+        perfTbody.innerHTML = `<tr><td colspan="6" class="empty-cell">No pipeline performance history yet</td></tr>`;
+      } else {
+        byJob.forEach(j => {
+          const lSt = String(j.latest_status || "").toLowerCase();
+          const lCls = lSt === "success" ? "emerald" : lSt === "running" ? "brand" : "crimson";
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td><strong>${escapeHtml(j.job_name)}</strong></td>
+            <td class="mono">${j.total_runs}</td>
+            <td class="mono">${Number(j.success_rate).toFixed(1)}%</td>
+            <td class="mono">${j.avg_duration_sec !== null ? `${Number(j.avg_duration_sec).toFixed(1)}s` : "—"}</td>
+            <td class="mono">${j.p95_duration_sec !== null ? `${Number(j.p95_duration_sec).toFixed(1)}s` : "—"}</td>
+            <td><span class="badge ${lCls}">${escapeHtml(lSt.toUpperCase() || "—")}</span></td>
+          `;
+          perfTbody.appendChild(tr);
+        });
+      }
+    }
+
+    // 6. Pipeline Runs (with Failed filter, clickable run_id, and error detail)
+    const filteredRuns = runs.filter(r => {
+      if (state.pipeLayerFilter === "all") return true;
+      if (state.pipeLayerFilter === "failed") return String(r.status || "").toLowerCase() === "failed" || Boolean(r.error);
+      return String(r.layer || "").toLowerCase() === state.pipeLayerFilter;
+    });
     const rTbody = document.getElementById("pipe-runs-tbody");
+    const errDetailBox = document.getElementById("ops-run-error-detail");
+    if (errDetailBox && !state.selectedRunError) errDetailBox.style.display = "none";
     rTbody.innerHTML = "";
     if (filteredRuns.length === 0) {
       rTbody.innerHTML = `<tr><td colspan="6" class="empty-cell">No runs</td></tr>`;
@@ -1712,22 +2064,86 @@
         const stCls = stStr === "success" ? "emerald" : stStr === "running" ? "brand" : "crimson";
         const lyStr = String(r.layer || "—").toLowerCase();
         const lyCls = lyStr === "gold" ? "indigo" : lyStr === "silver" ? "sky" : "amber";
-        const fullStart = String(r.started_at || "").replace("T", " ").slice(0, 19);
-        const shortStart = fullStart.length >= 19 ? fullStart.slice(11, 19) : fullStart;
         const dur = r.duration_sec !== null && r.duration_sec !== undefined ? `${Number(r.duration_sec).toFixed(1)}s` : "run";
+        const rid = String(r.run_id || "—");
+        const ridShort = rid.length > 10 ? `${rid.slice(0, 8)}…` : rid;
+        const hasErr = Boolean(r.error);
+        const summaryHtml = hasErr
+          ? `<span class="ops-err-pill" title="${escapeHtml(r.error)}">${escapeHtml(r.error)}</span>`
+          : `<span class="mono" style="font-size:11px;color:var(--text-secondary)">${escapeHtml(formatRunSummary(r.row_counts))}</span>`;
+
         const tr = document.createElement("tr");
+        if (hasErr) tr.className = "clickable";
         tr.innerHTML = `
+          <td><button type="button" class="ops-run-link" title="Filter logs for run_id ${escapeHtml(rid)}">${escapeHtml(ridShort)}</button></td>
           <td><strong>${escapeHtml(r.job_name || "—")}</strong></td>
           <td><span class="badge ${lyCls}">${escapeHtml(lyStr.toUpperCase())}</span></td>
           <td><span class="badge ${stCls}">${escapeHtml(stStr.toUpperCase())}</span></td>
-          <td class="mono" style="color:var(--text-secondary)">${escapeHtml(shortStart)}</td>
           <td class="mono">${escapeHtml(dur)}</td>
-          <td class="mono summary-cell" style="font-size:11px;color:var(--text-secondary)">${escapeHtml(formatRunSummary(r.row_counts))}</td>
+          <td class="summary-cell">${summaryHtml}</td>
         `;
+        const linkBtn = tr.querySelector(".ops-run-link");
+        if (linkBtn) {
+          linkBtn.addEventListener("click", ev => {
+            ev.stopPropagation();
+            const inp = document.getElementById("log-runid-filter");
+            if (inp) {
+              inp.value = rid;
+              loadOpsLogs();
+              inp.scrollIntoView({ behavior: "smooth", block: "center" });
+            }
+          });
+        }
+        if (hasErr && errDetailBox) {
+          tr.addEventListener("click", () => {
+            state.selectedRunError = `[${r.job_name}] run_id=${rid}\n${r.error}`;
+            errDetailBox.textContent = state.selectedRunError;
+            errDetailBox.style.display = "block";
+          });
+        }
         rTbody.appendChild(tr);
       });
     }
 
+    // 7. Data Quality Gate
+    const dqBadgesEl = document.getElementById("ops-dq-badges");
+    const dqSum = dqObj.summary || {};
+    if (dqBadgesEl) {
+      if (!dqSum.total) {
+        dqBadgesEl.innerHTML = `<span class="badge neutral">No checks yet</span>`;
+      } else {
+        dqBadgesEl.innerHTML = `
+          <span class="badge emerald">Pass ${dqSum.pass}</span>
+          <span class="badge amber">Warn ${dqSum.warn}</span>
+          <span class="badge ${dqSum.fail > 0 ? "crimson" : "neutral"}">Fail ${dqSum.fail}</span>
+        `;
+      }
+    }
+    const dqTbody = document.getElementById("ops-dq-tbody");
+    if (dqTbody) {
+      const checks = dqObj.checks || [];
+      dqTbody.innerHTML = "";
+      if (checks.length === 0) {
+        dqTbody.innerHTML = `<tr><td colspan="4" class="empty-cell">No data quality runs recorded yet</td></tr>`;
+      } else {
+        checks.forEach(c => {
+          const stC = String(c.status || "pass").toLowerCase();
+          const cCls = stC === "fail" ? "crimson" : stC === "warn" ? "amber" : "emerald";
+          const obs = c.observed !== null && c.observed !== undefined ? Number(c.observed).toFixed(2) : "—";
+          const thr = c.threshold !== null && c.threshold !== undefined ? Number(c.threshold).toFixed(2) : "—";
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td class="mono">${escapeHtml(c.dataset)}</td>
+            <td>${escapeHtml(c.check_name)}</td>
+            <td><span class="badge ${cCls}">${escapeHtml(stC.toUpperCase())}</span></td>
+            <td class="mono">${obs} / ${thr}</td>
+          `;
+          dqTbody.appendChild(tr);
+        });
+      }
+    }
+
+    // 8. TomTom Incidents
     const incBreak = (state.rootCause && state.rootCause.incident_breakdown) || [];
     document.getElementById("pipe-inc-total").textContent = `${state.incidents.length}`;
     const maxInc = Math.max(10, ...incBreak.map(i => i.count || 0)) * 1.18;
@@ -1768,6 +2184,10 @@
       `;
       incTbody.appendChild(tr);
     });
+
+    if (state.opsLogs) {
+      renderOpsLogsTable();
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -1853,7 +2273,8 @@
       corridorsResp,
       incidentsResp,
       busesResp,
-      rootCauseResp
+      rootCauseResp,
+      opsResp
     ] = await Promise.all([
       fetchJsonOrNull(`/v1/routes/delay?start_date=${startDate}&end_date=${endDate}${routeParam}`),
       fetchJsonOrNull(`/v1/routes/hourly?start_date=${startDate}&end_date=${endDate}${routeParam}`),
@@ -1862,7 +2283,8 @@
       fetchJsonOrNull("/v1/traffic/corridors"),
       fetchJsonOrNull("/v1/traffic/incidents?limit=200"),
       fetchJsonOrNull(`/v1/buses/live?limit=600${routeParam}`),
-      fetchJsonOrNull(`/v1/analytics/root-cause?start_date=${startDate}&end_date=${endDate}${routeParam}`)
+      fetchJsonOrNull(`/v1/analytics/root-cause?start_date=${startDate}&end_date=${endDate}${routeParam}`),
+      fetchJsonOrNull("/v1/ops/overview")
     ]);
 
     state.routeRows = (delayResp && delayResp.data) || [];
@@ -1873,8 +2295,12 @@
     state.incidents = (incidentsResp && incidentsResp.data) || [];
     state.buses = (busesResp && busesResp.data) || [];
     state.rootCause = rootCauseResp;
+    if (opsResp) state.opsOverview = opsResp;
 
     renderActivePage(zoomToBuses);
+    if (state.page === "pipeline") {
+      loadOpsLogs();
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -2056,6 +2482,24 @@
         document.querySelectorAll("[data-layer-filter]").forEach(b => b.classList.toggle("active", b === btn));
         renderPipelinePage();
       });
+    });
+
+    ["log-service-filter", "log-level-filter", "log-format-filter"].forEach(id => {
+      document.getElementById(id)?.addEventListener("change", loadOpsLogs);
+    });
+    ["log-runid-filter", "log-search-filter"].forEach(id => {
+      document.getElementById(id)?.addEventListener("keydown", e => {
+        if (e.key === "Enter") loadOpsLogs();
+      });
+    });
+    document.getElementById("log-refresh-btn")?.addEventListener("click", loadOpsLogs);
+    document.getElementById("log-clear-btn")?.addEventListener("click", () => {
+      document.getElementById("log-service-filter").value = "";
+      document.getElementById("log-level-filter").value = "";
+      document.getElementById("log-format-filter").value = "";
+      document.getElementById("log-runid-filter").value = "";
+      document.getElementById("log-search-filter").value = "";
+      loadOpsLogs();
     });
   }
 
