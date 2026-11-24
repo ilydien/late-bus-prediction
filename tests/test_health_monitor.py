@@ -40,6 +40,9 @@ def test_run_checks_and_render_prometheus_metrics():
     assert 'wmata_service_up{service="serving-api"} 1' in metrics_text
     assert 'wmata_service_up{service="consumer"} 1' in metrics_text
     assert "wmata_host_cpu_percent" in metrics_text
+    assert "cpu_cores" in health_monitor._latest_host_metrics
+    assert "memory_used_gb" in health_monitor._latest_host_metrics
+    assert "disk_total_gb" in health_monitor._latest_host_metrics
 
 
 def test_handle_alertmanager_firing_and_resolved_lifecycle():
@@ -137,3 +140,34 @@ def test_heartbeat_and_cadvisor_probes(tmp_path, monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_API_KEY", "bot-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
     assert health_monitor._telegram_configured() is True
+
+
+def test_http_test_alert_endpoint(monkeypatch):
+    import threading
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), health_monitor.MonitorHandler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        monkeypatch.setenv("TELEGRAM_BOT_API_KEY", "bot-token")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/monitoring/test-alert",
+            data=json.dumps({"status": "FIRING", "level": "INFO", "message": "test"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with patch("monitor.health_monitor.send_alert", return_value=True) as mock_send:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                assert resp.status == 200
+                body = json.loads(resp.read().decode("utf-8"))
+        assert body["status"] == "sent"
+        assert body["telegram_configured"] is True
+        assert body["sent"] is True
+        assert mock_send.call_args.kwargs["alert_name"] == "SmokeTestAlert"
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -11,7 +11,7 @@
     rel="stylesheet"
   />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <link rel="stylesheet" href="/static/styles.css?v=6" />
+  <link rel="stylesheet" href="/static/styles.css?v=7" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
@@ -693,6 +693,17 @@
              PAGE 5: PIPELINE HEALTH (/pipeline)
              ================================================================= -->
         <section class="page-view" id="page-pipeline">
+          <!-- Ops Signal Strip (services, alerts, replication, host capacity in GB/cores) -->
+          <div class="signal-strip" id="ops-signal-strip">
+            <div class="signal-items">
+              <div class="signal-chip"><span class="k">Services</span><span class="badge emerald" id="ops-svc-summary">—</span></div>
+              <div class="signal-chip"><span class="k">Alerts</span><span class="badge neutral" id="ops-alert-summary">—</span></div>
+              <div class="signal-chip"><span class="k">Spock Repl</span><span class="badge neutral" id="ops-spock-summary">—</span></div>
+              <div class="signal-chip"><span class="k">Host</span><span class="mono" id="ops-host-summary">—</span></div>
+            </div>
+            <span class="badge neutral" id="ops-telegram-badge">Telegram: —</span>
+          </div>
+
           <!-- 4-Stage Medallion Architecture with Visual Connecting Arrows -->
           <div class="medallion-flow-grid">
             <article class="stage-card bronze">
@@ -761,30 +772,102 @@
             </article>
           </div>
 
+          <!-- Service Health Matrix + Spock Replication & Container Resources -->
           <div class="grid-main-side">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Service Health Probes &amp; Alerts (<span class="mono">monitor + vmalert</span>)</div>
+                <span class="badge neutral mono" id="ops-probe-age">Probe —</span>
+              </div>
+              <div class="ops-svc-grid" id="ops-svc-grid"></div>
+              <div class="ops-alert-list" id="ops-alert-list" style="display:none"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Replication &amp; Container Resources</div>
+                <span class="badge sky mono" id="ops-total-mem">—</span>
+              </div>
+              <div class="ops-chip-wrap" id="ops-repl-badges"></div>
+              <div class="visual-bar-list" id="ops-res-bars"></div>
+            </div>
+          </div>
+
+          <!-- Pipeline Job Performance & Pipeline Runs (with Error Detail + Clickable Run ID) -->
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Pipeline Performance (<span class="mono">Avg vs P95s</span>)</div>
+                <span class="badge indigo mono" id="ops-perf-rate">—</span>
+              </div>
+              <div class="chart-box short">
+                <canvas id="pipePerfChart"></canvas>
+              </div>
+              <div class="table-scroll table-compact" style="max-height:210px">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Job</th>
+                      <th>Runs</th>
+                      <th>OK%</th>
+                      <th>Avg</th>
+                      <th>P95</th>
+                      <th>Latest</th>
+                    </tr>
+                  </thead>
+                  <tbody id="ops-perf-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+
             <div class="card">
               <div class="card-head">
                 <div class="card-title">Pipeline Runs (<span class="mono">pipeline_runs</span>)</div>
                 <div class="segmented">
                   <button class="seg-btn active" data-layer-filter="all" type="button">All</button>
+                  <button class="seg-btn" data-layer-filter="failed" type="button">Failed</button>
                   <button class="seg-btn" data-layer-filter="bronze" type="button">Bronze</button>
                   <button class="seg-btn" data-layer-filter="silver" type="button">Silver</button>
                   <button class="seg-btn" data-layer-filter="gold" type="button">Gold</button>
                 </div>
               </div>
-              <div class="table-scroll table-compact">
+              <div class="table-scroll table-compact" style="max-height:330px">
                 <table>
                   <thead>
                     <tr>
+                      <th>Run ID</th>
                       <th>Job</th>
                       <th>Layer</th>
                       <th>Status</th>
-                      <th>UTC</th>
                       <th>Dur</th>
-                      <th>Summary</th>
+                      <th>Error / Summary</th>
                     </tr>
                   </thead>
                   <tbody id="pipe-runs-tbody"></tbody>
+                </table>
+              </div>
+              <div class="ops-detail-box mono" id="ops-run-error-detail" style="display:none"></div>
+            </div>
+          </div>
+
+          <!-- Data Quality Gate + TomTom Incidents -->
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Data Quality Gate (<span class="mono">data_quality_runs</span>)</div>
+                <div class="ops-chip-wrap" id="ops-dq-badges"></div>
+              </div>
+              <div class="table-scroll table-compact" style="max-height:260px">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Dataset</th>
+                      <th>Check</th>
+                      <th>Status</th>
+                      <th>Observed / Threshold</th>
+                    </tr>
+                  </thead>
+                  <tbody id="ops-dq-tbody"></tbody>
                 </table>
               </div>
             </div>
@@ -812,11 +895,60 @@
               </div>
             </div>
           </div>
+
+          <!-- Live Log Explorer (VictoriaLogs) -->
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title">Live Log Explorer (<span class="mono">VictoriaLogs</span>)</div>
+              <div class="ops-log-controls">
+                <select id="log-service-filter" title="Filter by service">
+                  <option value="">All Services</option>
+                </select>
+                <select id="log-level-filter" title="Filter by log level">
+                  <option value="">All Levels</option>
+                  <option value="ERROR">ERROR</option>
+                  <option value="WARNING">WARNING</option>
+                  <option value="CRITICAL">CRITICAL</option>
+                  <option value="INFO">INFO</option>
+                  <option value="DEBUG">DEBUG</option>
+                </select>
+                <select id="log-format-filter" title="Filter by log format">
+                  <option value="">All Formats</option>
+                  <option value="json">JSON</option>
+                  <option value="text">Text</option>
+                </select>
+                <input id="log-runid-filter" type="text" placeholder="run_id…" style="width:150px" />
+                <input id="log-search-filter" type="text" placeholder="Search message…" style="width:170px" />
+                <button class="btn btn-primary" id="log-refresh-btn" type="button">Query</button>
+                <button class="btn" id="log-clear-btn" type="button">Clear</button>
+              </div>
+            </div>
+            <div class="kpi-foot" style="border-top:none;padding-top:0">
+              <span class="mono" id="ops-log-query">Query: *</span>
+              <span class="badge neutral mono" id="ops-log-count">0 logs</span>
+            </div>
+            <div class="table-scroll table-compact" style="max-height:360px">
+              <table>
+                <thead>
+                  <tr>
+                    <th>UTC</th>
+                    <th>Level</th>
+                    <th>Service</th>
+                    <th>Run ID</th>
+                    <th>Fmt</th>
+                    <th>Message / Error</th>
+                  </tr>
+                </thead>
+                <tbody id="ops-logs-tbody"></tbody>
+              </table>
+            </div>
+            <div class="ops-detail-box mono" id="ops-log-detail-box" style="display:none"></div>
+          </div>
         </section>
       </main>
     </div>
   </div>
 
-  <script src="/static/app.js?v=9"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

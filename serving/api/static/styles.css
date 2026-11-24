@@ -1262,3 +1262,153 @@ tbody tr:hover td { background: var(--brand-soft); }
 @media (max-width: 600px) {
   .grid-4, .medallion-flow-grid { grid-template-columns: 1fr; }
 }
+
+/* ============================================================================
+   Page 5: Ops Health, Performance & Live Log Explorer
+   ============================================================================ */
+.ops-svc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 7px;
+}
+
+.ops-svc-pill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.ops-svc-pill:hover {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.ops-svc-pill.down {
+  background: var(--crimson-soft);
+  border-color: var(--crimson-border);
+}
+
+.ops-svc-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ops-svc-lat {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.ops-alert-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.ops-alert-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--crimson-soft);
+  border: 1px solid var(--crimson-border);
+  font-size: 11.5px;
+}
+
+.ops-alert-item.pending {
+  background: var(--amber-soft);
+  border-color: var(--amber-border);
+}
+
+.ops-chip-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ops-run-link {
+  color: var(--brand);
+  font-weight: 700;
+  cursor: pointer;
+  text-decoration: underline;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+}
+
+.ops-run-link:hover {
+  color: var(--brand-hover);
+}
+
+.ops-err-pill {
+  display: inline-block;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--crimson-soft);
+  border: 1px solid var(--crimson-border);
+  color: var(--crimson);
+  font-size: 11px;
+  vertical-align: middle;
+}
+
+.ops-detail-box {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--crimson);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 11.5px;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.ops-log-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.ops-log-row.is-error td {
+  background: var(--crimson-soft);
+}
+
+.ops-log-row.is-warn td {
+  background: var(--amber-soft);
+}
+
+.ops-log-msg {
+  white-space: normal;
+  word-break: break-word;
+  min-width: 280px;
+  max-width: 680px;
+  line-height: 1.38;
+}

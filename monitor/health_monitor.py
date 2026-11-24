@@ -151,9 +151,12 @@ def run_checks() -> dict[str, dict[str, object]]:
         if not ok:
             logger.warning("Service check failed: %s", name, extra={"domain": "infra", "layer": "ops", "job": "health_probe"})
 
-    cpu = psutil.cpu_percent(interval=None)
-    mem = psutil.virtual_memory().percent
+    cpu_pct = float(psutil.cpu_percent(interval=0.2))
+    cpu_cores = int(psutil.cpu_count(logical=True) or 1)
+    cpu_used_cores = round((cpu_pct / 100.0) * cpu_cores, 2)
+    vm = psutil.virtual_memory()
     disk = shutil.disk_usage("/")
+    gb = 1024 ** 3
     disk_pct = round((disk.used / disk.total) * 100.0, 2)
 
     with _STATE_LOCK:
@@ -162,9 +165,15 @@ def run_checks() -> dict[str, dict[str, object]]:
         _latest_host_metrics.clear()
         _latest_host_metrics.update(
             {
-                "cpu_percent": float(cpu),
-                "memory_percent": float(mem),
+                "cpu_percent": cpu_pct,
+                "cpu_cores": float(cpu_cores),
+                "cpu_used_cores": cpu_used_cores,
+                "memory_percent": float(vm.percent),
+                "memory_used_gb": round(vm.used / gb, 2),
+                "memory_total_gb": round(vm.total / gb, 2),
                 "disk_percent": float(disk_pct),
+                "disk_used_gb": round(disk.used / gb, 1),
+                "disk_total_gb": round(disk.total / gb, 1),
             }
         )
         _last_run_ts = time.time()
