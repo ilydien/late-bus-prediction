@@ -275,6 +275,12 @@
     mlPredFilter: "all",
     pipeLayerFilter: "all",
     selectedRunError: null,
+    logQuickMode: "all",
+    logLiveEnabled: false,
+    logLivePausedByInspect: false,
+    logLiveTimer: null,
+    selectedLogEntry: null,
+    transitDataKey: null,
 
     streamStatus: null,
     opsOverview: null,
@@ -476,9 +482,15 @@
     document.getElementById("sidebar").classList.remove("open");
 
     renderActivePage();
+    syncLogLiveTimer();
 
-    if (key === "pipeline" && !state.opsLogs) {
-      loadOpsLogs();
+    if (key === "pipeline") {
+      if (!state.opsLogs) loadOpsLogs();
+    } else {
+      const fKey = currentTransitFilterKey();
+      if (state.transitDataKey !== fKey) {
+        loadDashboard(false);
+      }
     }
 
     if (key === "live-map") {
@@ -1667,21 +1679,125 @@
     return "ok";
   }
 
-  function renderOpsLogsTable() {
+  function buildStandardLogJson(entry) {
+    const out = {
+      timestamp: entry.timestamp || null,
+      level: String(entry.level || "INFO").toUpperCase(),
+      service: entry.service || "unknown",
+      run_id: entry.run_id || "unassigned",
+      message: entry.message || "",
+      log_format: entry.log_format || "text",
+    };
+    ["domain", "layer", "job", "duration_ms", "row_count", "error_type", "exception"].forEach(k => {
+      if (entry[k] !== null && entry[k] !== undefined && entry[k] !== "") {
+        out[k] = entry[k];
+      }
+    });
+    return out;
+  }
+
+  function openLogJsonInspector(entry, pauseLive = false) {
+    const panel = document.getElementById("ops-log-json-panel");
+    const srcEl = document.getElementById("ops-log-json-source");
+    const metaEl = document.getElementById("ops-log-json-meta");
+    const preEl = document.getElementById("ops-log-json-pre");
+    if (!panel || !preEl) return;
+    if (!entry) {
+      panel.style.display = "none";
+      state.selectedLogEntry = null;
+      return;
+    }
+
+    state.selectedLogEntry = buildStandardLogJson(entry);
+    const isJson = String(entry.log_format || "text").toLowerCase() === "json";
+    if (srcEl) {
+      srcEl.className = `badge ${isJson ? "indigo" : "neutral"}`;
+      srcEl.textContent = isJson ? "Native App JSON" : "Vector-Normalized Text";
+    }
+    if (metaEl) {
+      metaEl.textContent = `${entry.service || "—"} · run_id=${entry.run_id || "unassigned"}`;
+    }
+    preEl.textContent = JSON.stringify(state.selectedLogEntry, null, 2);
+    panel.style.display = "flex";
+
+    if (pauseLive && state.logLiveEnabled) {
+      state.logLivePausedByInspect = true;
+      syncLogLiveTimer();
+    }
+  }
+
+  function updateLogLivePill() {
+    const btn = document.getElementById("log-live-toggle-btn");
+    const dot = document.getElementById("log-live-dot");
+    const lbl = document.getElementById("log-live-label");
+    if (!btn || !dot || !lbl) return;
+    if (!state.logLiveEnabled) {
+      btn.className = "ops-live-pill";
+      dot.className = "pulse-dot paused";
+      lbl.textContent = "Live: OFF";
+    } else if (state.logLivePausedByInspect || document.hidden || state.page !== "pipeline") {
+      btn.className = "ops-live-pill paused";
+      dot.className = "pulse-dot paused";
+      lbl.textContent = state.logLivePausedByInspect ? "Live: Paused (Inspect)" : "Live: Paused";
+    } else {
+      btn.className = "ops-live-pill active";
+      dot.className = "pulse-dot";
+      lbl.textContent = "Live: 3s ON";
+    }
+  }
+
+  function syncLogLiveTimer() {
+    if (state.logLiveTimer) {
+      clearInterval(state.logLiveTimer);
+      state.logLiveTimer = null;
+    }
+    const shouldPoll = (
+      state.logLiveEnabled
+      && !state.logLivePausedByInspect
+      && state.page === "pipeline"
+      && !document.hidden
+    );
+    if (shouldPoll) {
+      state.logLiveTimer = setInterval(() => {
+        if (state.page === "pipeline" && !document.hidden && state.logLiveEnabled && !state.logLivePausedByInspect) {
+          loadOpsLogs(false);
+        }
+      }, 3000);
+    }
+    updateLogLivePill();
+  }
+
+  async function jumpToServiceLogs(serviceName) {
+    const sel = document.getElementById("log-service-filter");
+    if (sel) {
+      if (!Array.from(sel.options).some(o => o.value === serviceName)) {
+        const opt = document.createElement("option");
+        opt.value = serviceName;
+        opt.textContent = serviceName;
+        sel.appendChild(opt);
+      }
+      sel.value = serviceName;
+      sel.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+    await loadOpsLogs(true);
+  }
+
+  function renderOpsLogsTable(autoInspectLatest = false) {
     const tbody = document.getElementById("ops-logs-tbody");
     const qEl = document.getElementById("ops-log-query");
     const cntEl = document.getElementById("ops-log-count");
-    const detailBox = document.getElementById("ops-log-detail-box");
     if (!tbody) return;
 
     const payload = state.opsLogs || {};
-    const logs = payload.logs || [];
+    let logs = payload.logs || [];
+    if (state.logQuickMode === "warn_err" && !(document.getElementById("log-level-filter")?.value)) {
+      logs = logs.filter(e => ["ERROR", "CRITICAL", "WARNING"].includes(String(e.level || "").toUpperCase()));
+    }
     if (qEl) qEl.textContent = `Query: ${payload.query || "*"}`;
     if (cntEl) {
       cntEl.className = `badge ${payload.reachable === false ? "crimson" : "neutral"} mono`;
       cntEl.textContent = payload.reachable === false ? "VictoriaLogs offline" : `${logs.length} logs`;
     }
-    if (detailBox) detailBox.style.display = "none";
 
     tbody.innerHTML = "";
     if (logs.length === 0) {
@@ -1709,38 +1825,33 @@
         <td><span class="badge ${fmt === "json" ? "indigo" : "neutral"}">${escapeHtml(fmt.toUpperCase())}</span></td>
         <td class="mono ops-log-msg">${escapeHtml(String(entry.message || "") + errSuffix)}</td>
       `;
-      tr.addEventListener("click", () => {
-        if (!detailBox) return;
-        const lines = [
-          `Time: ${entry.timestamp || "—"} | Service: ${entry.service || "—"} | Level: ${lvl} | Run ID: ${rid}`,
-          entry.job ? `Domain/Layer/Job: ${entry.domain || "—"} / ${entry.layer || "—"} / ${entry.job}` : "",
-          entry.duration_ms !== null && entry.duration_ms !== undefined ? `Duration: ${entry.duration_ms} ms` : "",
-          `Message: ${entry.message || ""}`,
-          entry.exception ? `\nException:\n${entry.exception}` : "",
-        ].filter(Boolean);
-        detailBox.textContent = lines.join("\n");
-        detailBox.style.display = "block";
-      });
+      tr.addEventListener("click", () => openLogJsonInspector(entry, true));
       tbody.appendChild(tr);
     });
+
+    if (autoInspectLatest && logs.length > 0) {
+      const preferred = logs.find(e => ["ERROR", "CRITICAL", "WARNING"].includes(String(e.level || "").toUpperCase())) || logs[0];
+      openLogJsonInspector(preferred, false);
+    }
   }
 
-  async function loadOpsLogs() {
+  async function loadOpsLogs(autoInspectLatest = false) {
     const svc = document.getElementById("log-service-filter")?.value || "";
-    const lvl = document.getElementById("log-level-filter")?.value || "";
+    const exactLvl = document.getElementById("log-level-filter")?.value || "";
     const fmt = document.getElementById("log-format-filter")?.value || "";
     const rid = document.getElementById("log-runid-filter")?.value.trim() || "";
     const q = document.getElementById("log-search-filter")?.value.trim() || "";
-    const params = new URLSearchParams({ limit: "80" });
+    const limit = state.logQuickMode === "warn_err" && !exactLvl ? "200" : "80";
+    const params = new URLSearchParams({ limit });
     if (svc) params.set("service", svc);
-    if (lvl) params.set("level", lvl);
+    if (exactLvl) params.set("level", exactLvl);
     if (fmt) params.set("log_format", fmt);
     if (rid) params.set("run_id", rid);
     if (q) params.set("q", q);
     const resp = await fetchJsonOrNull(`/v1/ops/logs?${params.toString()}`);
     if (resp) {
       state.opsLogs = resp;
-      renderOpsLogsTable();
+      renderOpsLogsTable(autoInspectLatest);
     }
   }
 
@@ -1756,6 +1867,21 @@
       "wmata-poller",
       "tomtom-poller",
       "health-monitor",
+      "haproxy",
+      "nats",
+      "seaweedfs",
+      "spock-silver-1",
+      "spock-gold-1",
+      "postgres-infra",
+      "debezium-wmata",
+      "debezium-traffic",
+      "dagster-webserver",
+      "dagster-daemon",
+      "dagster-user-code",
+      "mlflow",
+      "trino",
+      "spark-master",
+      "spark-worker",
       ...Object.keys(servicesObj || {}),
     ]);
     sel.innerHTML = `<option value="">All Services</option>`;
@@ -1772,8 +1898,11 @@
     const st = state.streamStatus || {};
     const ops = state.opsOverview || {};
     const mon = ops.monitor || {};
+    const tiered = ops.services_tiered || {};
+    const tSum = tiered.summary || {};
     const alertsObj = ops.alerts || {};
     const replObj = ops.replication || {};
+    const streamTel = ops.stream_telemetry || {};
     const resObj = ops.resources || {};
     const perfObj = ops.pipeline_performance || {};
     const dqObj = ops.data_quality || {};
@@ -1785,15 +1914,33 @@
     const gridColor = cssVar("--chart-grid");
     const tickColor = cssVar("--chart-tick");
 
-    // 1. Ops Signal Strip (Opsi A: CPU used/total cores, RAM used/total GB, Disk used/total GB)
+    // 1. Ops Signal Strip (Tier 1, Tier 2, Alerts, Spock, Host GB/cores, Telegram)
     const servicesMap = mon.services || {};
-    const svcNames = Object.keys(servicesMap).sort();
-    const upCount = mon.up_count || 0;
-    const totalCount = mon.total_count || svcNames.length;
-    const svcSumEl = document.getElementById("ops-svc-summary");
-    if (svcSumEl) {
-      svcSumEl.className = `badge ${!mon.reachable ? "neutral" : upCount === totalCount ? "emerald" : "crimson"}`;
-      svcSumEl.textContent = mon.reachable ? `${upCount} / ${totalCount} UP` : "Monitor offline";
+    const tier1List = tiered.tier1 || [];
+    const tier2List = tiered.tier2 || [];
+    const t1Up = tSum.tier1_up ?? tier1List.filter(i => i.status === "up").length;
+    const t1Deg = tSum.tier1_degraded ?? tier1List.filter(i => i.status === "degraded").length;
+    const t1Down = tSum.tier1_down ?? tier1List.filter(i => i.status === "down").length;
+    const t1Tot = tSum.tier1_total ?? tier1List.length;
+
+    const t1SumEl = document.getElementById("ops-tier1-summary");
+    if (t1SumEl) {
+      if (!mon.reachable && t1Tot === 0) {
+        t1SumEl.className = "badge neutral";
+        t1SumEl.textContent = "Monitor offline";
+      } else {
+        t1SumEl.className = `badge ${t1Down > 0 ? "crimson" : t1Deg > 0 ? "amber" : "emerald"}`;
+        t1SumEl.textContent = t1Down > 0 ? `${t1Up}/${t1Tot} UP (${t1Down} down)` : t1Deg > 0 ? `${t1Up}/${t1Tot} UP (${t1Deg} deg)` : `${t1Up} / ${t1Tot} UP`;
+      }
+    }
+
+    const t2Up = tSum.tier2_up ?? tier2List.filter(i => i.status === "up").length;
+    const t2Tot = tSum.tier2_total ?? tier2List.length;
+    const t2Issues = tSum.tier2_issues || [];
+    const t2SumEl = document.getElementById("ops-tier2-summary");
+    if (t2SumEl) {
+      t2SumEl.className = `badge ${t2Tot === 0 ? "neutral" : t2Up === t2Tot ? "emerald" : "amber"}`;
+      t2SumEl.textContent = t2Issues.length ? `${t2Up}/${t2Tot} (${t2Issues[0]})` : `${t2Up} / ${t2Tot} READY`;
     }
 
     const firingCnt = alertsObj.firing_count || 0;
@@ -1827,8 +1974,8 @@
 
     const stripEl = document.getElementById("ops-signal-strip");
     if (stripEl) {
-      const hasIssues = firingCnt > 0 || (mon.reachable && upCount < totalCount) || (spockRows.length > 0 && spockOk < spockRows.length);
-      stripEl.className = `signal-strip ${hasIssues ? (firingCnt > 0 || upCount < totalCount ? "crit" : "warn") : "good"}`;
+      const ovState = tiered.overall_state || (firingCnt > 0 ? "critical" : "good");
+      stripEl.className = `signal-strip ${ovState === "critical" ? "crit" : ovState === "degraded" ? "warn" : "good"}`;
     }
 
     const tgEl = document.getElementById("ops-telegram-badge");
@@ -1870,7 +2017,7 @@
     document.getElementById("pipe-success-rate").textContent = `${tel.sse_subscribers || 1} SSE · Jobs ${sr}%`;
     document.getElementById("pipe-sr-bar").style.width = `${sr}%`;
 
-    // 3. Service Health Matrix + Active vmalert List
+    // 3. Tiered Service Health Probes (Tier 1 Table + Tier 2 Cards + Tier 3 Strip + Alerts)
     populateLogServicesDropdown(servicesMap);
     const probeAgeEl = document.getElementById("ops-probe-age");
     if (probeAgeEl) {
@@ -1878,42 +2025,96 @@
       probeAgeEl.textContent = ageS !== null ? `Probe ${fmtAge(ageS)}` : "Probe —";
     }
 
-    const svcGrid = document.getElementById("ops-svc-grid");
-    if (svcGrid) {
-      svcGrid.innerHTML = "";
-      if (svcNames.length === 0) {
-        svcGrid.innerHTML = `<div class="empty-cell" style="grid-column:1/-1">Monitor service unavailable</div>`;
+    const relayBadgeEl = document.getElementById("ops-alert-relay-badge");
+    const relayNotif = alertsObj.notifications || {};
+    if (relayBadgeEl) {
+      const sentTot = Number(relayNotif.firing || 0) + Number(relayNotif.resolved || 0);
+      if (sentTot > 0) {
+        relayBadgeEl.style.display = "inline-flex";
+        relayBadgeEl.textContent = `Relay: ${relayNotif.firing || 0}F / ${relayNotif.resolved || 0}R`;
       } else {
-        svcNames.forEach(name => {
-          const info = servicesMap[name] || {};
-          const isUp = Boolean(info.up);
-          const latMs = info.duration_s !== null && info.duration_s !== undefined ? `${Math.round(Number(info.duration_s) * 1000)}ms` : "—";
-          const pill = document.createElement("button");
-          pill.type = "button";
-          pill.className = `ops-svc-pill${isUp ? "" : " down"}`;
-          pill.title = `Filter logs for ${name}`;
-          pill.innerHTML = `
-            <span class="ops-svc-name"><span class="dot-sm" style="background:${isUp ? "var(--emerald)" : "var(--crimson)"}"></span>${escapeHtml(name)}</span>
-            <span class="mono ops-svc-lat">${escapeHtml(latMs)}</span>
+        relayBadgeEl.style.display = "none";
+      }
+    }
+
+    const t1Pill = document.getElementById("ops-tier1-pill");
+    if (t1Pill) {
+      t1Pill.className = `badge ${t1Down > 0 ? "crimson" : t1Deg > 0 ? "amber" : "emerald"} mono`;
+      t1Pill.textContent = `${t1Up} / ${t1Tot} HEALTHY`;
+    }
+    const t1Tbody = document.getElementById("ops-tier1-tbody");
+    if (t1Tbody) {
+      t1Tbody.innerHTML = "";
+      if (tier1List.length === 0) {
+        t1Tbody.innerHTML = `<tr><td colspan="4" class="empty-cell">Monitor service unavailable</td></tr>`;
+      } else {
+        tier1List.forEach(item => {
+          const stCls = item.status === "down" ? "crimson" : item.status === "degraded" ? "amber" : "emerald";
+          const dotCol = item.status === "down" ? "var(--crimson)" : item.status === "degraded" ? "var(--amber)" : "var(--emerald)";
+          const latStr = item.latency_ms !== null && item.latency_ms !== undefined
+            ? `${item.latency_ms}ms${item.probe_kind === "hb" ? " (hb)" : ""}`
+            : "—";
+          const tr = document.createElement("tr");
+          tr.className = "clickable";
+          tr.title = `Klik untuk lihat log JSON ${item.log_service}`;
+          tr.innerHTML = `
+            <td><span class="ops-svc-name"><span class="dot-sm" style="background:${dotCol}"></span><strong>${escapeHtml(item.name)}</strong></span></td>
+            <td class="mono" style="font-size:11px;color:var(--text-secondary)">${escapeHtml(item.detail)}</td>
+            <td class="mono" style="font-size:11px;color:var(--text-muted)">${escapeHtml(latStr)}</td>
+            <td><span class="badge ${stCls}">${escapeHtml(item.status_label)}</span></td>
           `;
-          pill.addEventListener("click", () => {
-            const logSvcName = name === "consumer" ? "bronze-consumer" : name;
-            const sel = document.getElementById("log-service-filter");
-            if (sel) {
-              if (!Array.from(sel.options).some(o => o.value === logSvcName)) {
-                const opt = document.createElement("option");
-                opt.value = logSvcName;
-                opt.textContent = logSvcName;
-                sel.appendChild(opt);
-              }
-              sel.value = logSvcName;
-              loadOpsLogs();
-              sel.scrollIntoView({ behavior: "smooth", block: "center" });
-            }
-          });
-          svcGrid.appendChild(pill);
+          tr.addEventListener("click", () => jumpToServiceLogs(item.log_service));
+          t1Tbody.appendChild(tr);
         });
       }
+    }
+
+    const t2Pill = document.getElementById("ops-tier2-pill");
+    if (t2Pill) {
+      t2Pill.className = `badge ${t2Up === t2Tot ? "emerald" : "amber"} mono`;
+      t2Pill.textContent = `${t2Up} / ${t2Tot} READY`;
+    }
+    const t2Grid = document.getElementById("ops-tier2-grid");
+    if (t2Grid) {
+      t2Grid.innerHTML = "";
+      tier2List.forEach(item => {
+        const stCls = item.status === "down" ? "crimson" : (item.status === "degraded" || item.status === "offline") ? "amber" : "emerald";
+        const dotCol = item.status === "down" ? "var(--crimson)" : (item.status === "degraded" || item.status === "offline") ? "var(--amber)" : "var(--emerald)";
+        const cardCls = item.status === "down" ? " is-down" : (item.status === "degraded" || item.status === "offline") ? " is-degraded" : "";
+        const latStr = item.latency_ms !== null && item.latency_ms !== undefined ? `${item.latency_ms}ms` : "—";
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `ops-tier2-card${cardCls}`;
+        btn.title = `Klik untuk lihat log JSON ${item.log_service}`;
+        btn.innerHTML = `
+          <div class="ops-tier2-top">
+            <span class="ops-svc-name"><span class="dot-sm" style="background:${dotCol}"></span>${escapeHtml(item.name)}</span>
+            <span class="ops-chip-wrap">
+              <span class="badge ${stCls}">${escapeHtml(item.status_label)}</span>
+              <span class="mono ops-svc-lat">${escapeHtml(latStr)}</span>
+            </span>
+          </div>
+          <div class="ops-tier2-sub mono">${escapeHtml(item.detail)}</div>
+        `;
+        btn.addEventListener("click", () => jumpToServiceLogs(item.log_service));
+        t2Grid.appendChild(btn);
+      });
+    }
+
+    const t3Strip = document.getElementById("ops-tier3-strip");
+    if (t3Strip) {
+      const vmT = tiered.vm_targets || {};
+      const t3Html = (tiered.tier3 || []).map(item => {
+        const dotCol = item.up ? "var(--emerald)" : "var(--crimson)";
+        return `<button type="button" class="ops-svc-pill" data-t3-svc="${escapeHtml(item.log_service)}" style="padding:3px 8px;font-size:11px"><span class="ops-svc-name"><span class="dot-sm" style="background:${dotCol}"></span>${escapeHtml(item.name)}</span></button>`;
+      }).join("");
+      const vmUp = vmT.up ?? 0;
+      const vmTot = vmT.total ?? 0;
+      const vmCls = vmTot === 0 ? "neutral" : vmUp === vmTot ? "sky" : "amber";
+      t3Strip.innerHTML = `<span class="ops-tier-title" style="margin-right:4px">Tier 3 · Infra Ops</span>${t3Html}<span class="badge ${vmCls} mono">VM Scrape: ${vmUp}/${vmTot} UP</span>`;
+      t3Strip.querySelectorAll("[data-t3-svc]").forEach(btn => {
+        btn.addEventListener("click", () => jumpToServiceLogs(btn.dataset.t3Svc));
+      });
     }
 
     const alertListEl = document.getElementById("ops-alert-list");
@@ -1936,26 +2137,85 @@
       }
     }
 
-    // 4. Replication & Top Container Resources
+    // 4. Replication Per-Node, Stream Telemetry & Container Resources
     const totMemEl = document.getElementById("ops-total-mem");
     if (totMemEl) {
       const totGb = (Number(resObj.total_memory_mb || 0) / 1024).toFixed(2);
       totMemEl.textContent = `${totGb} GB Containers`;
     }
 
+    const nodeGridEl = document.getElementById("ops-node-grid");
+    if (nodeGridEl) {
+      const nodes = replObj.nodes || [];
+      if (nodes.length === 0) {
+        nodeGridEl.innerHTML = `<div class="empty-cell" style="grid-column:1/-1">No node status</div>`;
+      } else {
+        nodeGridEl.innerHTML = nodes.map(n => {
+          const isUp = n.up === true;
+          const isDown = n.up === false;
+          const dotCol = isUp ? "var(--emerald)" : isDown ? "var(--crimson)" : "var(--text-muted)";
+          const roleCls = n.role === "Primary RW" ? "brand" : "neutral";
+          return `
+            <div class="ops-node-pill${isDown ? " is-down" : ""}">
+              <span class="ops-svc-name"><span class="dot-sm" style="background:${dotCol}"></span><span class="mono">${escapeHtml(n.node)}</span></span>
+              <span class="badge ${roleCls}">${escapeHtml(n.role)}</span>
+            </div>
+          `;
+        }).join("");
+      }
+    }
+
     const replEl = document.getElementById("ops-repl-badges");
     if (replEl) {
       const badges = [];
+      if (replObj.silver_failover) badges.push(`<span class="badge amber">Silver Failover -> S2</span>`);
+      if (replObj.gold_failover) badges.push(`<span class="badge amber">Gold Failover -> G2</span>`);
       spockRows.forEach(s => {
         const okRepl = Number(s.is_replicating) === 1;
         badges.push(`<span class="badge ${okRepl ? "emerald" : "crimson"}" title="${escapeHtml(s.subscription_name)}">Spock ${escapeHtml(s.layer)}/${escapeHtml(s.datname)} ${okRepl ? "✓" : "✕"}</span>`);
       });
-      (replObj.haproxy || []).forEach(h => {
-        const upH = Number(h.active_servers) > 0;
-        const shortName = String(h.proxy || "").replace("_backend", "");
-        badges.push(`<span class="badge ${upH ? "sky" : "crimson"}">HAProxy ${escapeHtml(shortName)}: ${h.active_servers}</span>`);
+      const pgConns = replObj.pg_connections || {};
+      const deadTups = replObj.dead_tuples || {};
+      ["silver", "gold", "infra"].forEach(ly => {
+        if (pgConns[ly] !== undefined) {
+          const dTxt = deadTups[ly] !== undefined ? ` · ${deadTups[ly]} dead` : "";
+          badges.push(`<span class="badge neutral mono">PG ${ly}: ${pgConns[ly]} conn${dTxt}</span>`);
+        }
       });
       replEl.innerHTML = badges.length ? badges.join("") : `<span class="badge neutral">No replication metrics</span>`;
+    }
+
+    const streamChipsEl = document.getElementById("ops-stream-chips");
+    if (streamChipsEl) {
+      const evMap = streamTel.events_by_status || {};
+      const chips = [
+        `<span class="badge sky mono">Inference Scored: ${Number(streamTel.inference_scored_total || 0).toLocaleString()}</span>`,
+        `<span class="badge neutral mono">Stream Lag: ${streamTel.processing_lag_sec !== null && streamTel.processing_lag_sec !== undefined ? `${Number(streamTel.processing_lag_sec).toFixed(1)}s` : "0s"}</span>`,
+      ];
+      ["processed", "deduped", "late", "missing", "tombstone"].forEach(stK => {
+        if (evMap[stK] !== undefined && evMap[stK] > 0) {
+          const cls = (stK === "late" || stK === "missing") ? "amber" : "emerald";
+          chips.push(`<span class="badge ${cls} mono">${stK}: ${evMap[stK]}</span>`);
+        }
+      });
+      streamChipsEl.innerHTML = chips.join("");
+    }
+
+    const quotaEl = document.getElementById("ops-tomtom-quota");
+    if (quotaEl) {
+      const usedQ = Number(streamTel.tomtom_quota_used || 0);
+      const maxQ = Math.max(1, Number(streamTel.tomtom_quota_limit || 2450));
+      const qPct = Math.min(100, Math.round((usedQ / maxQ) * 100));
+      const qCol = qPct >= 90 ? "var(--crimson)" : qPct >= 70 ? "var(--amber)" : "var(--sky)";
+      quotaEl.innerHTML = `
+        <div class="vbar-item">
+          <div class="vbar-head">
+            <span class="vbar-name">TomTom Daily API Quota</span>
+            <span class="vbar-nums">${usedQ.toLocaleString()} / ${maxQ.toLocaleString()} req (${qPct}%)</span>
+          </div>
+          <div class="vbar-track"><span style="width:${Math.max(usedQ > 0 ? 4 : 0, qPct)}%;background:${qCol}"></span></div>
+        </div>
+      `;
     }
 
     const resBarsEl = document.getElementById("ops-res-bars");
@@ -2089,7 +2349,7 @@
             const inp = document.getElementById("log-runid-filter");
             if (inp) {
               inp.value = rid;
-              loadOpsLogs();
+              loadOpsLogs(true);
               inp.scrollIntoView({ behavior: "smooth", block: "center" });
             }
           });
@@ -2248,7 +2508,14 @@
     document.getElementById("preset-archive-btn").classList.toggle("active", state.datePreset === "archive");
   }
 
+  function currentTransitFilterKey() {
+    const startDate = document.getElementById("start-date")?.value || "";
+    const endDate = document.getElementById("end-date")?.value || "";
+    return `${startDate}|${endDate}|${state.routeId || ""}`;
+  }
+
   async function loadDashboard(zoomToBuses = false) {
+    if (document.hidden && !zoomToBuses) return;
     const streamResp = await fetchJsonOrNull("/v1/stream/status");
     state.streamStatus = streamResp;
     const fresh = (streamResp && streamResp.freshness) || {};
@@ -2264,6 +2531,25 @@
     const startDate = document.getElementById("start-date").value || shiftDateIso(maxDate, -7);
     const endDate = document.getElementById("end-date").value || maxDate;
     const routeParam = state.routeId ? `&route_id=${encodeURIComponent(state.routeId)}` : "";
+
+    // Page-Scoped Fetching: when viewing /pipeline, avoid firing heavy GPS/route queries on every SSE push
+    if (state.page === "pipeline") {
+      const needIncSummary = !state.rootCause;
+      const [opsResp, incResp, rcResp] = await Promise.all([
+        fetchJsonOrNull("/v1/ops/overview"),
+        needIncSummary ? fetchJsonOrNull("/v1/traffic/incidents?limit=200") : Promise.resolve(null),
+        needIncSummary ? fetchJsonOrNull(`/v1/analytics/root-cause?start_date=${startDate}&end_date=${endDate}${routeParam}`) : Promise.resolve(null),
+      ]);
+      if (opsResp) state.opsOverview = opsResp;
+      if (incResp) state.incidents = incResp.data || [];
+      if (rcResp) state.rootCause = rcResp;
+
+      renderActivePage(false);
+      if (!state.opsLogs || (state.logLiveEnabled && !state.logLivePausedByInspect)) {
+        loadOpsLogs(false);
+      }
+      return;
+    }
 
     const [
       delayResp,
@@ -2296,11 +2582,9 @@
     state.buses = (busesResp && busesResp.data) || [];
     state.rootCause = rootCauseResp;
     if (opsResp) state.opsOverview = opsResp;
+    state.transitDataKey = currentTransitFilterKey();
 
     renderActivePage(zoomToBuses);
-    if (state.page === "pipeline") {
-      loadOpsLogs();
-    }
   }
 
   // --------------------------------------------------------------------------
@@ -2485,21 +2769,79 @@
     });
 
     ["log-service-filter", "log-level-filter", "log-format-filter"].forEach(id => {
-      document.getElementById(id)?.addEventListener("change", loadOpsLogs);
+      document.getElementById(id)?.addEventListener("change", () => {
+        state.logLivePausedByInspect = false;
+        syncLogLiveTimer();
+        loadOpsLogs(false);
+      });
+    });
+    document.querySelectorAll("[data-log-quick]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        state.logQuickMode = btn.dataset.logQuick || "all";
+        document.querySelectorAll("[data-log-quick]").forEach(b => b.classList.toggle("active", b === btn));
+        state.logLivePausedByInspect = false;
+        syncLogLiveTimer();
+        loadOpsLogs(false);
+      });
     });
     ["log-runid-filter", "log-search-filter"].forEach(id => {
       document.getElementById(id)?.addEventListener("keydown", e => {
-        if (e.key === "Enter") loadOpsLogs();
+        if (e.key === "Enter") {
+          state.logLivePausedByInspect = false;
+          syncLogLiveTimer();
+          loadOpsLogs(false);
+        }
       });
     });
-    document.getElementById("log-refresh-btn")?.addEventListener("click", loadOpsLogs);
+    document.getElementById("log-live-toggle-btn")?.addEventListener("click", () => {
+      if (state.logLiveEnabled && state.logLivePausedByInspect) {
+        state.logLivePausedByInspect = false;
+      } else {
+        state.logLiveEnabled = !state.logLiveEnabled;
+        state.logLivePausedByInspect = false;
+      }
+      syncLogLiveTimer();
+      if (state.logLiveEnabled) loadOpsLogs(false);
+    });
+    document.getElementById("log-refresh-btn")?.addEventListener("click", () => {
+      state.logLivePausedByInspect = false;
+      syncLogLiveTimer();
+      loadOpsLogs(false);
+    });
     document.getElementById("log-clear-btn")?.addEventListener("click", () => {
       document.getElementById("log-service-filter").value = "";
       document.getElementById("log-level-filter").value = "";
       document.getElementById("log-format-filter").value = "";
       document.getElementById("log-runid-filter").value = "";
       document.getElementById("log-search-filter").value = "";
-      loadOpsLogs();
+      state.logQuickMode = "all";
+      state.logLivePausedByInspect = false;
+      document.querySelectorAll("[data-log-quick]").forEach(b => b.classList.toggle("active", b.dataset.logQuick === "all"));
+      openLogJsonInspector(null);
+      syncLogLiveTimer();
+      loadOpsLogs(false);
+    });
+    document.getElementById("ops-log-close-btn")?.addEventListener("click", () => {
+      openLogJsonInspector(null);
+      state.logLivePausedByInspect = false;
+      syncLogLiveTimer();
+    });
+    document.getElementById("ops-log-copy-btn")?.addEventListener("click", async () => {
+      if (!state.selectedLogEntry) return;
+      const btn = document.getElementById("ops-log-copy-btn");
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(state.selectedLogEntry, null, 2));
+        if (btn) {
+          btn.textContent = "Copied!";
+          setTimeout(() => { btn.textContent = "Copy JSON"; }, 1200);
+        }
+      } catch (_e) {}
+    });
+    document.addEventListener("visibilitychange", () => {
+      syncLogLiveTimer();
+      if (!document.hidden && state.sseEnabled) {
+        loadDashboard(false);
+      }
     });
   }
 

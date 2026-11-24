@@ -225,7 +225,8 @@ async def json_request_logging(request: Request, call_next):
             )
             raise
         dur_ms = round((time.monotonic() - t0) * 1000, 2)
-        if path != "/health":
+        skip_info_paths = ("/health", "/v1/ops/logs", "/v1/ops/overview")
+        if path not in skip_info_paths or response.status_code >= 400:
             lvl = logging.ERROR if response.status_code >= 500 else logging.WARNING if response.status_code >= 400 else logging.INFO
             logger.log(
                 lvl,
@@ -1604,7 +1605,7 @@ def ops_overview(conn=Depends(get_conn)):
     firing_count = sum(1 for a in active_alerts if a.get("state") == "firing")
     pending_count = sum(1 for a in active_alerts if a.get("state") == "pending")
 
-    # 3. Replication & HAProxy metrics (from monitor summary or VictoriaMetrics)
+    # 3. Replication, per-node HAProxy status & Postgres health metrics
     vm_metrics = (mon_summary or {}).get("metrics") or {}
     spock_raw = vm_metrics.get("spock_replicating") or _query_vm_instant("spock_subscription_is_replicating")
     spock_rows = [
@@ -1626,6 +1627,94 @@ def ops_overview(conn=Depends(get_conn)):
         }
         for r in haproxy_raw
     ]
+    haproxy_srv_raw = vm_metrics.get("haproxy_server_status") or _query_vm_instant(
+        'haproxy_server_status{proxy=~"silver_rw_backend|gold_rw_backend",state="UP"}'
+    )
+    node_status_map: dict[str, dict[str, Any]] = {}
+    for r in haproxy_srv_raw:
+        lbl = r.get("labels") or {}
+        srv = str(lbl.get("server") or "")
+        prx = str(lbl.get("proxy") or "")
+        if not srv:
+            continue
+        up_flag = int(round(_safe_float(r.get("value"), 0.0))) == 1
+        layer_nm = "silver" if "silver" in prx else "gold"
+        role_nm = "Primary RW" if srv.endswith("-1") else "Backup"
+        node_status_map[srv] = {
+            "node": srv,
+            "layer": layer_nm,
+            "role": role_nm,
+            "up": up_flag,
+        }
+    repl_nodes = [
+        node_status_map.get(n, {"node": n, "layer": "silver" if "silver" in n else "gold", "role": "Primary RW" if n.endswith("-1") else "Backup", "up": None})
+        for n in ("spock-silver-1", "spock-silver-2", "spock-gold-1", "spock-gold-2")
+    ]
+    silver_failover = bool(
+        node_status_map.get("spock-silver-1", {}).get("up") is False
+        and node_status_map.get("spock-silver-2", {}).get("up") is True
+    )
+    gold_failover = bool(
+        node_status_map.get("spock-gold-1", {}).get("up") is False
+        and node_status_map.get("spock-gold-2", {}).get("up") is True
+    )
+
+    pg_conn_raw = vm_metrics.get("pg_connections_by_layer") or _query_vm_instant("sum by (layer) (pg_stat_activity_count)")
+    pg_connections = {
+        str((r.get("labels") or {}).get("layer") or "unknown"): int(round(_safe_float(r.get("value"), 0.0)))
+        for r in pg_conn_raw
+    }
+    pg_dead_raw = vm_metrics.get("pg_dead_tuples_by_layer") or _query_vm_instant("sum by (layer) (pg_table_live_tuples_n_dead_tup)")
+    dead_tuples = {
+        str((r.get("labels") or {}).get("layer") or "unknown"): int(round(_safe_float(r.get("value"), 0.0)))
+        for r in pg_dead_raw
+    }
+
+    # 3b. Stream, TomTom quota, Inference & Alert Relay telemetry
+    js_tel = _fetch_jetstream_telemetry()
+    stream_ev_raw = vm_metrics.get("stream_events_total") or _query_vm_instant("wmata_stream_events_total")
+    events_by_status: dict[str, int] = {}
+    for r in stream_ev_raw:
+        st_lbl = str((r.get("labels") or {}).get("status") or "processed")
+        events_by_status[st_lbl] = events_by_status.get(st_lbl, 0) + int(round(_safe_float(r.get("value"), 0.0)))
+
+    lag_raw = vm_metrics.get("stream_processing_lag") or _query_vm_instant("wmata_stream_processing_lag_seconds")
+    processing_lag_sec = max((_safe_float(r.get("value"), 0.0) for r in lag_raw), default=None)
+
+    tomtom_req_raw = vm_metrics.get("tomtom_poll_requests") or _query_vm_instant("wmata_tomtom_poll_requests_total")
+    tomtom_quota_used = sum(int(round(_safe_float(r.get("value"), 0.0))) for r in tomtom_req_raw)
+    tomtom_quota_limit = int(os.environ.get("TOMTOM_MAX_DAILY_REQUESTS", "2450"))
+
+    inf_scored_raw = vm_metrics.get("inference_scored_total") or _query_vm_instant("wmata_stream_inference_scored_total")
+    inference_scored_total = sum(int(round(_safe_float(r.get("value"), 0.0))) for r in inf_scored_raw)
+
+    alert_notif_raw = vm_metrics.get("alert_notifications_total") or _query_vm_instant("wmata_alert_notifications_total")
+    alert_notifications = {"firing": 0, "resolved": 0}
+    for r in alert_notif_raw:
+        st_lbl = str((r.get("labels") or {}).get("status") or "").lower()
+        if st_lbl in alert_notifications:
+            alert_notifications[st_lbl] += int(round(_safe_float(r.get("value"), 0.0)))
+
+    vm_targets_raw = vm_metrics.get("vm_scrape_targets") or _query_vm_instant("up")
+    vm_targets = [
+        {
+            "job": str((r.get("labels") or {}).get("job") or "unknown"),
+            "up": int(round(_safe_float(r.get("value"), 0.0))) == 1,
+        }
+        for r in vm_targets_raw
+    ]
+    vm_targets_up = sum(1 for t in vm_targets if t["up"])
+
+    # 3c. Freshness ages for Tier 1 DEGRADED thresholds
+    fresh_rows = _safe_gold_fetch(conn, "SELECT * FROM public.serving_freshness")
+    fresh_gold = fresh_rows[0] if fresh_rows else {}
+    snap_dt = _parse_iso_dt(fresh_gold.get("max_snapshot_ts"))
+    pred_dt = _parse_iso_dt(fresh_gold.get("max_predicted_at"))
+    snap_age_sec = int(max(0.0, (now_utc - snap_dt).total_seconds())) if snap_dt else None
+    pred_age_sec = int(max(0.0, (now_utc - pred_dt).total_seconds())) if pred_dt else None
+    tomtom_age_rows = _try_silver_traffic_query("SELECT max(snapshot_ts) AS tomtom_max_ts FROM public.tomtom_flow_segment")
+    tomtom_dt = _parse_iso_dt(tomtom_age_rows[0].get("tomtom_max_ts")) if tomtom_age_rows else None
+    tomtom_age_sec = int(max(0.0, (now_utc - tomtom_dt).total_seconds())) if tomtom_dt else None
 
     # 4. Container CPU / Memory top consumers
     cpu_raw = vm_metrics.get("container_cpu_pct") or _query_vm_instant(
@@ -1766,6 +1855,265 @@ def ops_overview(conn=Depends(get_conn)):
         "fail": sum(1 for r in dq_rows if str(r.get("status") or "").lower() == "fail"),
     }
 
+    # 7. Build Tiered Service Health & 3-Level Status (Tier 1 / Tier 2 / Tier 3)
+    def _lat_ms(svc_key: str) -> int | None:
+        d = (services.get(svc_key) or {}).get("duration_s")
+        return None if d is None else int(round(_safe_float(d, 0.0) * 1000))
+
+    def _is_up(svc_key: str) -> bool:
+        return bool((services.get(svc_key) or {}).get("up"))
+
+    def _fmt_age_short(sec: int | None) -> str:
+        if sec is None:
+            return "no data"
+        if sec < 60:
+            return f"{sec}s ago"
+        if sec < 3600:
+            return f"{sec // 60}m {sec % 60}s"
+        return f"{sec // 3600}h {(sec % 3600) // 60}m"
+
+    def _tier1_status(ok: bool, degraded: bool = False) -> tuple[str, str]:
+        if not ok:
+            return ("down", "DOWN")
+        if degraded:
+            return ("degraded", "DEGRADED")
+        return ("up", "UP")
+
+    spock_ok_cnt = sum(1 for r in spock_rows if int(r.get("is_replicating") or 0) == 1)
+    spock_total_cnt = len(spock_rows)
+    haproxy_map = {h["proxy"]: h["active_servers"] for h in haproxy_rows}
+    total_pending = int(js_tel.get("total_pending") or 0)
+    dlq_msgs = int(js_tel.get("dlq_messages") or 0)
+    silver_rw_cnt = haproxy_map.get("silver_rw_backend", 0)
+    gold_rw_cnt = haproxy_map.get("gold_rw_backend", 0)
+    silver_ro_cnt = haproxy_map.get("silver_ro_backend", 0)
+    gold_ro_cnt = haproxy_map.get("gold_ro_backend", 0)
+
+    # Tier 1: 11 Core Real-Time entries
+    w_up = _is_up("wmata-poller")
+    w_deg = w_up and snap_age_sec is not None and snap_age_sec > 180
+    w_st, w_lbl = _tier1_status(w_up, w_deg)
+
+    t_up = _is_up("tomtom-poller")
+    t_deg = t_up and (
+        (tomtom_age_sec is not None and tomtom_age_sec > 600)
+        or (tomtom_quota_limit > 0 and tomtom_quota_used >= int(tomtom_quota_limit * 0.9))
+    )
+    t_st, t_lbl = _tier1_status(t_up, t_deg)
+
+    sw_up = _is_up("seaweedfs")
+    sw_st, sw_lbl = _tier1_status(sw_up)
+
+    br_up = _is_up("seaweedfs-bridge")
+    br_st, br_lbl = _tier1_status(br_up)
+
+    na_up = _is_up("nats")
+    na_deg = na_up and (total_pending > 0 or dlq_msgs > 0)
+    na_st, na_lbl = _tier1_status(na_up, na_deg)
+
+    co_up = _is_up("consumer")
+    co_deg = co_up and (total_pending > 50 or (processing_lag_sec is not None and processing_lag_sec > 300))
+    co_st, co_lbl = _tier1_status(co_up, co_deg)
+
+    sp_m_up = _is_up("spark-master")
+    sp_w_up = _is_up("spark-worker")
+    sp_up = sp_m_up and sp_w_up
+    sp_deg = (sp_m_up or sp_w_up) and not sp_up
+    sp_st, sp_lbl = _tier1_status(sp_m_up or sp_w_up, sp_deg)
+    sp_lat = _lat_ms("spark-master") if _lat_ms("spark-master") is not None else _lat_ms("spark-worker")
+
+    hp_up = _is_up("haproxy-silver-rw") and _is_up("haproxy-gold-rw")
+    hp_deg = hp_up and (silver_failover or gold_failover)
+    hp_st, hp_lbl = _tier1_status(hp_up, hp_deg)
+    hp_lat = _lat_ms("haproxy-stats") if _lat_ms("haproxy-stats") is not None else _lat_ms("haproxy-silver-rw")
+
+    if spock_total_cnt > 0:
+        spk_up = spock_ok_cnt == spock_total_cnt
+        spk_deg = (0 < spock_ok_cnt < spock_total_cnt) or silver_failover or gold_failover
+        spk_st, spk_lbl = _tier1_status(spock_ok_cnt > 0, spk_deg or not spk_up)
+    else:
+        spk_st, spk_lbl = ("degraded", "NO DATA")
+
+    inf_up = _is_up("stream-inference")
+    inf_deg = inf_up and pred_age_sec is not None and pred_age_sec > 180
+    inf_st, inf_lbl = _tier1_status(inf_up, inf_deg)
+
+    api_up = _is_up("serving-api")
+    api_st, api_lbl = _tier1_status(api_up)
+
+    tier1_items = [
+        {
+            "key": "wmata-poller",
+            "name": "wmata-poller",
+            "log_service": "wmata-poller",
+            "detail": f"Poll API 60s · Snapshot {_fmt_age_short(snap_age_sec)}",
+            "latency_ms": _lat_ms("wmata-poller"),
+            "probe_kind": "hb",
+            "status": w_st,
+            "status_label": w_lbl,
+        },
+        {
+            "key": "tomtom-poller",
+            "name": "tomtom-poller",
+            "log_service": "tomtom-poller",
+            "detail": f"Flow & insiden · Kuota {tomtom_quota_used}/{tomtom_quota_limit}",
+            "latency_ms": _lat_ms("tomtom-poller"),
+            "probe_kind": "hb",
+            "status": t_st,
+            "status_label": t_lbl,
+        },
+        {
+            "key": "seaweedfs",
+            "name": "seaweedfs",
+            "log_service": "seaweedfs",
+            "detail": "Bronze S3 (:8333) & MLflow artifacts",
+            "latency_ms": _lat_ms("seaweedfs"),
+            "probe_kind": "http",
+            "status": sw_st,
+            "status_label": sw_lbl,
+        },
+        {
+            "key": "seaweedfs-bridge",
+            "name": "seaweedfs-bridge",
+            "log_service": "seaweedfs-bridge",
+            "detail": "Webhook S3 -> NATS JetStream",
+            "latency_ms": _lat_ms("seaweedfs-bridge"),
+            "probe_kind": "http",
+            "status": br_st,
+            "status_label": br_lbl,
+        },
+        {
+            "key": "nats",
+            "name": "nats",
+            "log_service": "nats",
+            "detail": f"JetStream · Pending {total_pending} · DLQ {dlq_msgs}",
+            "latency_ms": _lat_ms("nats"),
+            "probe_kind": "http",
+            "status": na_st,
+            "status_label": na_lbl,
+        },
+        {
+            "key": "consumer",
+            "name": "consumer",
+            "log_service": "bronze-consumer",
+            "detail": f"Micro-batch Spark -> Silver · Lag {_fmt_age_short(int(processing_lag_sec)) if processing_lag_sec is not None else '0s'}",
+            "latency_ms": _lat_ms("consumer"),
+            "probe_kind": "hb",
+            "status": co_st,
+            "status_label": co_lbl,
+        },
+        {
+            "key": "spark",
+            "name": "spark-master/worker",
+            "log_service": "spark-master",
+            "detail": f"Master {'OK' if sp_m_up else 'DOWN'} · Worker {'OK' if sp_w_up else 'DOWN'}",
+            "latency_ms": sp_lat,
+            "probe_kind": "http",
+            "status": sp_st,
+            "status_label": sp_lbl,
+        },
+        {
+            "key": "haproxy",
+            "name": "haproxy",
+            "log_service": "haproxy",
+            "detail": f"RW S:{silver_rw_cnt} G:{gold_rw_cnt} · RO S:{silver_ro_cnt} G:{gold_ro_cnt}" + (" (Failover)" if (silver_failover or gold_failover) else ""),
+            "latency_ms": hp_lat,
+            "probe_kind": "tcp",
+            "status": hp_st,
+            "status_label": hp_lbl,
+        },
+        {
+            "key": "spock",
+            "name": "spock (S1/S2/G1/G2)",
+            "log_service": "spock-silver-1",
+            "detail": f"Repl {spock_ok_cnt}/{spock_total_cnt} aktif · Silver & Gold",
+            "latency_ms": None,
+            "probe_kind": "sql",
+            "status": spk_st,
+            "status_label": spk_lbl,
+        },
+        {
+            "key": "stream-inference",
+            "name": "stream-inference",
+            "log_service": "stream-inference",
+            "detail": f"LightGBM @champion · Scored {inference_scored_total} · {_fmt_age_short(pred_age_sec)}",
+            "latency_ms": _lat_ms("stream-inference"),
+            "probe_kind": "cadvisor",
+            "status": inf_st,
+            "status_label": inf_lbl,
+        },
+        {
+            "key": "serving-api",
+            "name": "serving-api",
+            "log_service": "serving-api",
+            "detail": f"MetroPulse DC + SSE ({len(_SSE_SUBSCRIBERS)} clients)",
+            "latency_ms": _lat_ms("serving-api"),
+            "probe_kind": "http",
+            "status": api_st,
+            "status_label": api_lbl,
+        },
+    ]
+
+    # Tier 2: 8 CDC, Batch & MLOps cards
+    def _tier2_card(key: str, name: str, log_svc: str, detail: str, ok_label: str = "OK", adhoc: bool = False) -> dict[str, Any]:
+        up_ok = _is_up(key)
+        lat = _lat_ms(key)
+        if not up_ok:
+            st, lbl = ("offline", "OFFLINE") if adhoc else ("down", "DOWN")
+        elif lat is not None and lat >= 500:
+            st, lbl = ("degraded", "SLOW")
+        else:
+            st, lbl = ("up", ok_label)
+        return {
+            "key": key,
+            "name": name,
+            "log_service": log_svc,
+            "detail": detail,
+            "latency_ms": lat,
+            "status": st,
+            "status_label": lbl,
+        }
+
+    infra_conn = pg_connections.get("infra")
+    infra_conn_txt = f" · {infra_conn} conn" if infra_conn is not None else ""
+    tier2_items = [
+        _tier2_card("debezium-wmata", "debezium-wmata", "debezium-wmata", "CDC WAL Silver -> NATS (wmata)", ok_label="READY"),
+        _tier2_card("debezium-traffic", "debezium-traffic", "debezium-traffic", "CDC WAL Silver -> NATS (traffic)", ok_label="READY"),
+        _tier2_card("postgres-infra", "postgres-infra", "postgres-infra", f"dagster_db & mlflow_db{infra_conn_txt}"),
+        _tier2_card("dagster-webserver", "dagster-webserver", "dagster-webserver", "Orchestrator UI (:3000)"),
+        _tier2_card("dagster-daemon", "dagster-daemon", "dagster-daemon", "Scheduler & Sensor Loop"),
+        _tier2_card("dagster-user-code", "dagster-user-code", "dagster-user-code", "ETL & ML gRPC worker (:4000)"),
+        _tier2_card("mlflow", "mlflow", "mlflow", "Model registry @champion (:5000)"),
+        _tier2_card("trino", "trino", "trino", "Ad-hoc federated SQL (:8080)", adhoc=True),
+    ]
+
+    # Tier 3: Meta-Observability
+    tier3_items = [
+        {
+            "key": k,
+            "name": k,
+            "log_service": "health-monitor" if k == "monitor" else k,
+            "up": _is_up(k),
+            "latency_ms": _lat_ms(k),
+        }
+        for k in ("victoriametrics", "victorialogs", "vector", "monitor", "vmalert")
+    ]
+
+    tier1_up_cnt = sum(1 for i in tier1_items if i["status"] == "up")
+    tier1_deg_cnt = sum(1 for i in tier1_items if i["status"] == "degraded")
+    tier1_down_cnt = sum(1 for i in tier1_items if i["status"] == "down")
+    tier2_up_cnt = sum(1 for i in tier2_items if i["status"] == "up")
+    tier2_issues = [f"{i['name']} {i['status_label'].lower()}" for i in tier2_items if i["status"] != "up"]
+
+    if not monitor_reachable:
+        overall_state = "degraded"
+    elif tier1_down_cnt > 0 or (spock_total_cnt > 0 and spock_ok_cnt == 0) or firing_count > 0:
+        overall_state = "critical"
+    elif tier1_deg_cnt > 0 or tier2_issues or pending_count > 0:
+        overall_state = "degraded"
+    else:
+        overall_state = "healthy"
+
     return {
         "generated_at": now_utc.isoformat(),
         "monitor": {
@@ -1777,16 +2125,46 @@ def ops_overview(conn=Depends(get_conn)):
             "services": services,
             "host": host_metrics,
         },
+        "services_tiered": {
+            "overall_state": overall_state,
+            "tier1": tier1_items,
+            "tier2": tier2_items,
+            "tier3": tier3_items,
+            "vm_targets": {"up": vm_targets_up, "total": len(vm_targets), "items": vm_targets},
+            "summary": {
+                "tier1_up": tier1_up_cnt,
+                "tier1_degraded": tier1_deg_cnt,
+                "tier1_down": tier1_down_cnt,
+                "tier1_total": len(tier1_items),
+                "tier2_up": tier2_up_cnt,
+                "tier2_total": len(tier2_items),
+                "tier2_issues": tier2_issues,
+            },
+        },
         "alerts": {
             "firing_count": firing_count,
             "pending_count": pending_count,
             "rules_total": len(all_rules),
             "active": active_alerts,
             "all_rules": all_rules,
+            "notifications": alert_notifications,
         },
         "replication": {
             "spock": spock_rows,
             "haproxy": haproxy_rows,
+            "nodes": repl_nodes,
+            "silver_failover": silver_failover,
+            "gold_failover": gold_failover,
+            "pg_connections": pg_connections,
+            "dead_tuples": dead_tuples,
+        },
+        "stream_telemetry": {
+            "jetstream": js_tel,
+            "events_by_status": events_by_status,
+            "processing_lag_sec": processing_lag_sec,
+            "tomtom_quota_used": tomtom_quota_used,
+            "tomtom_quota_limit": tomtom_quota_limit,
+            "inference_scored_total": inference_scored_total,
         },
         "resources": {
             "top_cpu": top_cpu[:12],
