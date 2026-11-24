@@ -163,23 +163,35 @@ def merge_table(conn, cur, table: str) -> tuple[int, int]:
     return staged, merged
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--truncate-only", action="store_true")
-    ap.add_argument("--run-id")
-    args = ap.parse_args()
+def truncate_all() -> dict[str, int]:
+    """Truncate all silver staging tables across configured databases."""
+    truncated: dict[str, int] = {}
+    for database, dbname in DATABASES.items():
+        conn = connect(dbname)
+        try:
+            with conn.cursor() as cur:
+                n = truncate_staging(cur, database)
+                conn.commit()
+                truncated[database] = n
+                print(f"{database}: truncated {n} staging tables", flush=True)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+    return truncated
 
+
+def merge_all(run_id: str | None = None) -> dict[str, dict]:
+    """Idempotently upsert all staging tables into target silver tables."""
     counts: dict[str, dict] = {}
     for database, dbname in DATABASES.items():
         conn = connect(dbname)
         try:
             with conn.cursor() as cur:
-                if args.truncate_only:
-                    n = truncate_staging(cur, database)
-                    conn.commit()
-                    print(f"{database}: truncated {n} staging tables", flush=True)
-                    continue
-
                 for table in TABLES[database]:
                     staged, merged = merge_table(conn, cur, table)
                     counts[f"{database}.{table}"] = {
@@ -201,8 +213,22 @@ def main() -> None:
         finally:
             conn.close()
 
-    if args.run_id and counts:
-        run_log.safe_record_row_counts(args.run_id, counts)
+    if run_id and counts:
+        run_log.safe_record_row_counts(run_id, counts)
+    return counts
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--truncate-only", action="store_true")
+    ap.add_argument("--run-id")
+    args = ap.parse_args()
+
+    if args.truncate_only:
+        truncate_all()
+        return
+
+    merge_all(run_id=args.run_id)
 
 
 if __name__ == "__main__":

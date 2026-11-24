@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
+import contextlib
 import json
 import logging
 import math
@@ -24,18 +26,29 @@ import signal
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import lightgbm as lgb
-import mlflow
-import mlflow.lightgbm
-import numpy as np
-import pandas as pd
-import psycopg2
-from mlflow import MlflowClient
-from psycopg2.extras import RealDictCursor, execute_values
+try:
+    import lightgbm as lgb
+    import mlflow
+    import mlflow.lightgbm
+    import numpy as np
+    import pandas as pd
+    import psycopg2
+    from mlflow import MlflowClient
+    from psycopg2.extras import RealDictCursor, execute_values
+except ImportError:  # pragma: no cover - allows pure reconciliation tests without heavy ML deps
+    lgb = None  # type: ignore[assignment]
+    mlflow = None  # type: ignore[assignment]
+    np = None  # type: ignore[assignment]
+    pd = None  # type: ignore[assignment]
+    psycopg2 = None  # type: ignore[assignment]
+    MlflowClient = None  # type: ignore[assignment]
+    RealDictCursor = None  # type: ignore[assignment]
+    execute_values = None  # type: ignore[assignment]
 
 sys.path.insert(0, "/app")
 
@@ -48,6 +61,13 @@ try:
     from governance import run_log
 except ImportError:
     run_log = None  # type: ignore[assignment]
+
+try:
+    from shared import metrics as vm_metrics
+except ImportError:
+    vm_metrics = None  # type: ignore[assignment]
+
+SILVER_MERGED_SUBJECT = os.environ.get("SILVER_MERGED_SUBJECT", "realtime.silver.merged")
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -628,9 +648,28 @@ def run_stream_inference_cycle(limit: int = 1000) -> dict[str, Any]:
                     page_size=2000,
                 )
 
-                # Update daily model performance metrics
+                # Reconcile real +15m ground truth before refreshing daily performance
+            conn.commit()
+
+        reconciled_count = reconcile_ground_truth_15m(lookback_hours=6)
+
+        with connect_gold() as pconn:
+            with pconn.cursor() as cur:
+                # Update daily model performance metrics:
+                # Prefer true +15m observed actuals (`split = 'live_observed'`) once >= 20 exist
+                # for a service_date; fall back to bootstrap targets during cold-start first 14m.
                 cur.execute(
                     """
+                    WITH per_day AS (
+                        SELECT f.service_date,
+                               p.model_version,
+                               count(*) FILTER (WHERE f.split = 'live_observed') AS n_obs
+                        FROM public.model_predictions p
+                        JOIN public.trip_delay_features f
+                          ON f.trip_key = p.trip_key AND f.snapshot_ts = p.snapshot_ts
+                        WHERE p.status = 'success' AND p.actual_delay_min IS NOT NULL AND f.service_date IS NOT NULL
+                        GROUP BY f.service_date, p.model_version
+                    )
                     INSERT INTO public.model_performance_daily
                       (service_date, model_version, n_predictions, mae, rmse, accuracy_late_5, avg_error)
                     SELECT f.service_date,
@@ -643,7 +682,12 @@ def run_stream_inference_cycle(limit: int = 1000) -> dict[str, Any]:
                     FROM public.model_predictions p
                     JOIN public.trip_delay_features f
                       ON f.trip_key = p.trip_key AND f.snapshot_ts = p.snapshot_ts
-                    WHERE p.status = 'success' AND p.actual_delay_min IS NOT NULL AND f.service_date IS NOT NULL
+                    JOIN per_day d
+                      ON d.service_date = f.service_date AND d.model_version = p.model_version
+                    WHERE p.status = 'success'
+                      AND p.actual_delay_min IS NOT NULL
+                      AND f.service_date IS NOT NULL
+                      AND (d.n_obs < 20 OR f.split = 'live_observed')
                     GROUP BY f.service_date, p.model_version
                     ON CONFLICT (service_date, model_version) DO UPDATE SET
                       n_predictions = EXCLUDED.n_predictions,
@@ -653,7 +697,7 @@ def run_stream_inference_cycle(limit: int = 1000) -> dict[str, Any]:
                       avg_error = EXCLUDED.avg_error
                     """
                 )
-            conn.commit()
+            pconn.commit()
 
         late_count = sum(1 for r in pred_rows if r[8] == 1)
         event_payload = {
@@ -662,9 +706,42 @@ def run_stream_inference_cycle(limit: int = 1000) -> dict[str, Any]:
             "predicted_at": now.isoformat(),
             "scored_count": len(pred_rows),
             "predicted_late_count": late_count,
+            "reconciled_ground_truth": reconciled_count,
             "avg_predicted_delay_min": round(float(np.mean(preds)), 3),
         }
         asyncio.run(publish_nats_inference(event_payload))
+
+        if vm_metrics is not None:
+            try:
+                now_s = time.time()
+                vm_metrics.push_metric(
+                    "wmata_stream_last_event_timestamp",
+                    now_s,
+                    labels={"stream": "wmata-inference", "service": "stream-inference"},
+                )
+                vm_metrics.inc_counter(
+                    "wmata_stream_inference_scored_total",
+                    labels={"model_version": model_version},
+                    amount=float(len(pred_rows)),
+                )
+                if reconciled_count > 0:
+                    vm_metrics.inc_counter(
+                        "wmata_stream_ground_truth_reconciled_total",
+                        labels={"model_version": model_version},
+                        amount=float(reconciled_count),
+                    )
+                vm_metrics.inc_counter(
+                    "wmata_pipeline_job_runs_total",
+                    labels={
+                        "service": "stream-inference",
+                        "job": "stream_inference",
+                        "domain": "wmata",
+                        "layer": "gold",
+                        "status": "success",
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         summary = {
             "status": "ok",
@@ -672,6 +749,7 @@ def run_stream_inference_cycle(limit: int = 1000) -> dict[str, Any]:
             "model_version": model_version,
             "scored": len(pred_rows),
             "predicted_late": late_count,
+            "reconciled_15m": reconciled_count,
             **sync_counts,
         }
         if run_log is not None:
@@ -680,48 +758,300 @@ def run_stream_inference_cycle(limit: int = 1000) -> dict[str, Any]:
     except Exception as exc:
         if run_log is not None:
             run_log.safe_finish_run(run_id, "failed", error=str(exc))
+        if vm_metrics is not None:
+            try:
+                vm_metrics.inc_counter(
+                    "wmata_pipeline_job_runs_total",
+                    labels={
+                        "service": "stream-inference",
+                        "job": "stream_inference",
+                        "domain": "wmata",
+                        "layer": "gold",
+                        "status": "failed",
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                pass
         raise
+
+
+def match_future_observations(
+    predictions: list[dict[str, Any]],
+    silver_snaps: list[dict[str, Any]],
+    min_ahead_sec: int = 840,
+    max_ahead_sec: int = 960,
+) -> list[dict[str, Any]]:
+    """Match past predictions to true Silver observations 14-16 minutes ahead for the same trip_key."""
+    by_trip: dict[str, tuple[list[float], list[float]]] = {}
+    grouped_raw: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for snap in silver_snaps:
+        tk = snap.get("trip_key")
+        ts = snap.get("snapshot_ts")
+        dev = snap.get("deviation_min")
+        if not tk or ts is None or dev is None:
+            continue
+        ts_dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        grouped_raw[str(tk)].append((ts_dt.timestamp(), max(-60.0, min(60.0, float(dev)))))
+
+    for tk, pairs in grouped_raw.items():
+        pairs.sort(key=lambda item: item[0])
+        by_trip[tk] = ([p[0] for p in pairs], [p[1] for p in pairs])
+
+    reconciled: list[dict[str, Any]] = []
+    for pred in predictions:
+        tk = str(pred.get("trip_key") or "")
+        if tk not in by_trip:
+            continue
+        ts = pred.get("snapshot_ts")
+        if ts is None:
+            continue
+        ts_dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        base_s = ts_dt.timestamp()
+        ts_list, dev_list = by_trip[tk]
+        lo = bisect.bisect_left(ts_list, base_s + min_ahead_sec)
+        hi = bisect.bisect_right(ts_list, base_s + max_ahead_sec)
+        if lo >= hi:
+            continue
+        vals = dev_list[lo:hi]
+        actual = round(sum(vals) / len(vals), 3)
+        p_val = float(pred.get("predicted_delay_min") or 0.0)
+        reconciled.append(
+            {
+                "input_record_id": pred["input_record_id"],
+                "model_version": pred["model_version"],
+                "trip_key": tk,
+                "snapshot_ts": pred["snapshot_ts"],
+                "actual_delay_min": actual,
+                "abs_error": round(abs(p_val - actual), 4),
+                "actual_late": int(actual > 5.0),
+            }
+        )
+    return reconciled
+
+
+def reconcile_ground_truth_15m(lookback_hours: int = 8) -> int:
+    """Back-fill true observed +15m actuals from Silver into Gold predictions & features."""
+    if psycopg2 is None:
+        return 0
+    try:
+        with connect_silver("wmata") as s_conn:
+            with s_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    WITH eligible AS (
+                        SELECT trip_key, max(snapshot_ts) AS max_ts
+                        FROM public.bus_trip_snapshot
+                        WHERE trip_key IS NOT NULL
+                          AND snapshot_ts >= now() - (%s || ' hours')::interval
+                          AND deviation_min IS NOT NULL
+                        GROUP BY trip_key
+                        HAVING max(snapshot_ts) - min(snapshot_ts) >= interval '14 minutes'
+                    )
+                    SELECT s.trip_key, s.snapshot_ts, s.deviation_min, e.max_ts
+                    FROM public.bus_trip_snapshot s
+                    JOIN eligible e ON e.trip_key = s.trip_key
+                    WHERE s.snapshot_ts >= now() - (%s || ' hours')::interval
+                      AND s.deviation_min IS NOT NULL
+                    """,
+                    (str(lookback_hours), str(lookback_hours)),
+                )
+                silver_snaps = cur.fetchall()
+
+        if not silver_snaps:
+            return 0
+
+        eligible_trips = sorted({str(r["trip_key"]) for r in silver_snaps if r.get("trip_key")})
+        max_ts_by_trip: dict[str, datetime] = {}
+        for r in silver_snaps:
+            tk = str(r["trip_key"])
+            if tk not in max_ts_by_trip and r.get("max_ts") is not None:
+                max_ts_by_trip[tk] = r["max_ts"]
+
+        with connect_gold() as g_conn:
+            with g_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT p.input_record_id, p.model_version, p.trip_key,
+                           p.snapshot_ts, p.predicted_delay_min
+                    FROM public.model_predictions p
+                    JOIN public.trip_delay_features f
+                      ON f.trip_key = p.trip_key AND f.snapshot_ts = p.snapshot_ts
+                    WHERE p.status = 'success'
+                      AND p.trip_key = ANY(%s)
+                      AND p.snapshot_ts >= now() - (%s || ' hours')::interval
+                      AND p.snapshot_ts <= now() - interval '14 minutes'
+                      AND COALESCE(f.split, '') <> 'live_observed'
+                    ORDER BY p.snapshot_ts DESC
+                    LIMIT 20000
+                    """,
+                    (eligible_trips, str(lookback_hours)),
+                )
+                pending_preds = [
+                    r
+                    for r in cur.fetchall()
+                    if r["snapshot_ts"] <= max_ts_by_trip.get(str(r["trip_key"]), r["snapshot_ts"]) - timedelta(minutes=14)
+                ]
+
+        if not pending_preds:
+            return 0
+
+        matched = match_future_observations(pending_preds, silver_snaps)
+        if not matched:
+            return 0
+
+        pred_updates = [
+            (
+                m["input_record_id"],
+                m["model_version"],
+                m["actual_delay_min"],
+                m["abs_error"],
+                m["actual_late"],
+            )
+            for m in matched
+        ]
+        feat_updates = list(
+            {
+                (m["trip_key"], m["snapshot_ts"]): (
+                    m["trip_key"],
+                    m["snapshot_ts"],
+                    m["actual_delay_min"],
+                    m["actual_late"],
+                )
+                for m in matched
+            }.values()
+        )
+
+        with connect_gold() as g_conn:
+            with g_conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """
+                    UPDATE public.model_predictions AS p
+                    SET actual_delay_min = v.actual_delay_min,
+                        abs_error = v.abs_error,
+                        actual_late = v.actual_late
+                    FROM (VALUES %s) AS v(input_record_id, model_version, actual_delay_min, abs_error, actual_late)
+                    WHERE p.input_record_id = v.input_record_id
+                      AND p.model_version = v.model_version
+                    """,
+                    pred_updates,
+                    page_size=1000,
+                )
+                execute_values(
+                    cur,
+                    """
+                    UPDATE public.trip_delay_features AS f
+                    SET target_deviation_15m = v.target_dev,
+                        target_late_5 = v.target_late,
+                        split = 'live_observed'
+                    FROM (VALUES %s) AS v(trip_key, snapshot_ts, target_dev, target_late)
+                    WHERE f.trip_key = v.trip_key
+                      AND f.snapshot_ts = v.snapshot_ts
+                    """,
+                    feat_updates,
+                    page_size=1000,
+                )
+            g_conn.commit()
+        logger.info("Reconciled %d predictions with observed +15m ground truth", len(matched))
+        return len(matched)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ground-truth +15m reconciliation skipped/failed: %s", exc)
+        return 0
+
+
+async def run_event_driven_loop(limit: int, fallback_interval: int) -> int:
+    """Reactively run inference on NATS `realtime.silver.merged` events, with fallback timer."""
+    stop = asyncio.Event()
+    trigger = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, stop.set)
+
+    nc = None
+    if nats is not None and NATS_URL:
+        try:
+            nc = await nats.connect(
+                NATS_URL,
+                connect_timeout=5,
+                max_reconnect_attempts=-1,
+                reconnect_time_wait=2,
+            )
+
+            async def _on_silver_event(_msg) -> None:
+                trigger.set()
+
+            await nc.subscribe(SILVER_MERGED_SUBJECT, cb=_on_silver_event)
+            await nc.subscribe("wmata.realtime.silver_data.>", cb=_on_silver_event)
+            logger.info(
+                "Event-driven inference subscribed to %s & wmata.realtime.silver_data.> (fallback=%ds)",
+                SILVER_MERGED_SUBJECT,
+                fallback_interval,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("NATS reactive subscription unavailable (%s); using timer fallback", exc)
+            nc = None
+
+    write_heartbeat("started")
+    try:
+        while not stop.is_set():
+            trigger.clear()
+            try:
+                summary = await asyncio.to_thread(run_stream_inference_cycle, limit)
+                write_heartbeat(summary["status"], extra=summary)
+                logger.info("STREAM_INFERENCE_SUMMARY %s", json.dumps(summary))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Stream inference cycle failed: %s", exc)
+                write_heartbeat("error", extra={"error": str(exc)})
+
+            # Wait until a Silver merge/CDC event arrives OR fallback interval expires
+            stop_task = asyncio.create_task(stop.wait())
+            trig_task = asyncio.create_task(trigger.wait())
+            done, pending = await asyncio.wait(
+                {stop_task, trig_task},
+                timeout=max(5, fallback_interval),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            if stop.is_set():
+                break
+            if trig_task in done:
+                # Brief 1.5s debounce to coalesce rapid back-to-back merge events
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=1.5)
+    finally:
+        if nc is not None:
+            with contextlib.suppress(Exception):
+                await nc.close()
+    return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Real-time stream inference worker")
     ap.add_argument("--once", action="store_true", help="Run a single inference cycle and exit")
     ap.add_argument("--limit", type=int, default=int(os.environ.get("STREAM_INFERENCE_LIMIT", "1000")))
-    ap.add_argument("--interval", type=int, default=int(os.environ.get("STREAM_INFERENCE_INTERVAL", "20")))
+    ap.add_argument("--interval", type=int, default=int(os.environ.get("STREAM_INFERENCE_INTERVAL", "30")))
     args = ap.parse_args()
 
-    stop = False
-
-    def _sig(signum: int, _frame: Any) -> None:
-        nonlocal stop
-        logger.info("Received signal %d, stopping stream inference worker", signum)
-        stop = True
-
-    signal.signal(signal.SIGTERM, _sig)
-    signal.signal(signal.SIGINT, _sig)
-
-    write_heartbeat("started")
-
-    while not stop:
+    if args.once:
+        write_heartbeat("started")
         try:
             summary = run_stream_inference_cycle(limit=args.limit)
             write_heartbeat(summary["status"], extra=summary)
             logger.info("STREAM_INFERENCE_SUMMARY %s", json.dumps(summary))
+            return 0
         except Exception as exc:  # noqa: BLE001
             logger.exception("Stream inference cycle failed: %s", exc)
             write_heartbeat("error", extra={"error": str(exc)})
-            if args.once:
-                return 1
+            return 1
 
-        if args.once:
-            break
-
-        for _ in range(max(1, args.interval)):
-            if stop:
-                break
-            time.sleep(1)
-
-    return 0
+    return asyncio.run(run_event_driven_loop(limit=args.limit, fallback_interval=args.interval))
 
 
 if __name__ == "__main__":

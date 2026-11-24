@@ -456,6 +456,8 @@ services:
         create_stream wmata-silver    '["wmata.realtime.silver_data","wmata.realtime.silver_data.>"]'     604800000000000 5368709120
         create_stream traffic-silver  '["traffic.realtime.silver_data","traffic.realtime.silver_data.>"]' 604800000000000 5368709120
         create_stream wmata-inference '["wmata.realtime.inference","wmata.realtime.inference.>"]'         604800000000000 1073741824
+        create_stream wmata-dlq       '["wmata.dlq.>","traffic.dlq.>"]'                                   604800000000000 1073741824
+        create_stream realtime-events '["realtime.silver.merged","realtime.tombstone.>"]'                 604800000000000 536870912
         nats -s nats:4222 stream ls
         echo "NATS init complete"
     depends_on:
@@ -932,9 +934,11 @@ services:
       AWS_DEFAULT_REGION: us-east-1
       AWS_S3_FORCE_PATH_STYLE: "true"
       NATS_URL: nats://nats:4222
-      STREAM_INFERENCE_INTERVAL: "20"
+      VM_URL: http://victoriametrics:8428
+      STREAM_INFERENCE_INTERVAL: "30"
     volumes:
       - ./ml:/app
+      - ./shared:/app/shared:ro
       - ./governance:/app/governance:ro
       - ./.git:/app/.git:ro
     healthcheck:
@@ -965,6 +969,10 @@ services:
       NATS_URL: nats://nats:4222
       SPARK_MASTER: spark://spark-master:7077
       SPARK_JOB: /opt/spark/jobs/bronze_to_silver.py
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1g}
+      SPARK_SHUFFLE_PARTITIONS: ${SPARK_SHUFFLE_PARTITIONS:-8}
+      CONSUMER_SPARK_MODE: ${CONSUMER_SPARK_MODE:-persistent}
+      CONSUMER_SPARK_WARMUP: ${CONSUMER_SPARK_WARMUP:-true}
       SILVER_MERGE: /app/merge_silver.py
       CONSUMER_STATE: /work/consumer_state.json
       BRONZE_MANIFEST: /work/bronze_batch.json
@@ -973,9 +981,13 @@ services:
       CONSUMER_FETCH_TIMEOUT: "2"
       CONSUMER_ERROR_BACKOFF: "30"
       CONSUMER_BATCH_SIZE: "200"
+      CONSUMER_MAX_DELIVER: "3"
+      CONSUMER_ALLOWED_LATENESS_MIN: "20"
+      CONSUMER_DEDUP_TTL_HOURS: "72"
       WMATA_BRONZE_PREFIXES: "bronze_"
       TRAFFIC_BRONZE_PREFIX: "ddot/"
       TOMTOM_BRONZE_PREFIX: "tomtom/"
+      VM_URL: http://victoriametrics:8428
       QUALITY_REPORT_DIR: /work/quality
       AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedfs-access-key}
       AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfs-secret-key}
@@ -983,6 +995,7 @@ services:
       AWS_EC2_METADATA_DISABLED: "true"
     volumes:
       - ./consumer:/app
+      - ./shared:/app/shared:ro
       - ./quality:/app/quality:ro
       - ./governance:/app/governance:ro
       - ./.git:/app/.git:ro
@@ -994,6 +1007,8 @@ services:
       nats-init:
         condition: service_completed_successfully
       spark-master:
+        condition: service_healthy
+      spark-worker:
         condition: service_healthy
       db-ready:
         condition: service_completed_successfully
